@@ -49,6 +49,10 @@ The application requires a `.env` file with:
 - `GITLAB_URL`: GitLab instance URL (e.g., https://lab.smysl.pro)
 - `GITLAB_TOKEN`: GitLab private token for API access
 - `GEMINI_PROMPT`: Custom prompt for Gemini AI reviews (optional)
+- `GEMINI_PROMPT_RU`: Russian language prompt for Gemini AI reviews (optional)
+- `REVIEW_LANGUAGE`: Language for reviews - "en" for English, "ru" for Russian (default: en)
+- `HTTP_PROXY`: HTTP proxy URL (e.g., http://127.0.0.1:8181) (optional)
+- `SOCKS_PROXY`: SOCKS proxy address (e.g., 127.0.0.1:8180) (optional)
 - `WEBHOOK_SECRET`: Secret token for webhook verification (optional)
 
 ## Key Features
@@ -72,6 +76,14 @@ The application requires a `.env` file with:
    - Timeout protection (60 seconds)
    - Uses gemini-2.5-flash model
    - Calls Gemini CLI with `-p` parameter for prompt input
+   - Multi-language support (English/Russian)
+   - Language-specific prompts and responses
+
+4. **Network & Proxy Support**:
+   - HTTP proxy support for GitLab API connections
+   - SOCKS proxy support with PySocks
+   - Automatic proxy detection from environment variables
+   - Connection debugging and logging
 
 ## Webhook Configuration
 
@@ -84,14 +96,65 @@ Configure in GitLab project settings:
 - Trigger: Merge request events
 - Optional: Set secret token
 
+## Language Support
+
+The system supports multiple languages for code reviews:
+
+### English (Default)
+```env
+REVIEW_LANGUAGE=en
+GEMINI_PROMPT="Review this merge request and provide:
+1. Code quality assessment
+2. Potential bugs or issues
+3. Security concerns
+4. Performance considerations
+5. Best practices violations
+6. Suggestions for improvement
+
+Be concise but thorough. Focus on actionable feedback."
+```
+
+### Russian
+```env
+REVIEW_LANGUAGE=ru
+GEMINI_PROMPT_RU="Проанализируйте этот запрос на слияние и предоставьте:
+1. Оценка качества кода
+2. Потенциальные баги или проблемы
+3. Проблемы безопасности
+4. Вопросы производительности
+5. Нарушения лучших практик
+6. Предложения по улучшению
+
+Будьте лаконичными, но основательными. Сосредоточьтесь на практических рекомендациях."
+```
+
+## Proxy Configuration
+
+For environments requiring proxy connections:
+
+### HTTP Proxy
+```env
+HTTP_PROXY=http://127.0.0.1:8181
+```
+
+### SOCKS Proxy
+```env
+SOCKS_PROXY=127.0.0.1:8180
+```
+
+**Note**: HTTP proxy takes precedence over SOCKS proxy if both are configured.
+
 ## Monitoring
 
 Server logs include:
 - Webhook receipt confirmations
 - MR processing status
 - GitLab API interactions
+- Proxy connection status
+- Language configuration
 - Gemini analysis results
 - Error details with stack traces
+- UTF-8 encoding handling
 
 ## Current Implementation Status
 
@@ -99,8 +162,11 @@ Server logs include:
 - FastAPI webhook server
 - GitLab webhook parsing
 - Async task processing
-- GitLab API integration
+- GitLab API integration with proxy support (HTTP/SOCKS)
 - Gemini wrapper script with correct CLI syntax
+- Russian language support (prompts, comments, reviews)
+- Multi-language interface (English/Russian)
+- UTF-8 encoding handling
 - Error handling and logging
 - Environment configuration
 - Test utilities
@@ -114,5 +180,7 @@ Server logs include:
 - Support for multiple prompts
 - Web UI for configuration
 - CI/CD pipeline
-- Russian language translation for MR comments
-- Multiple language support
+- Additional language support (beyond English/Russian)
+- Custom review templates
+- Performance optimization for large diffs
+- Webhook authentication improvements

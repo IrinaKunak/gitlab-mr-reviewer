@@ -17,6 +17,8 @@ load_dotenv()
 # Configuration
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
+SOCKS_PROXY = os.getenv("SOCKS_PROXY")
+HTTP_PROXY = os.getenv("HTTP_PROXY")
 GEMINI_PROMPT = os.getenv("GEMINI_PROMPT",
                           "Review this merge request and provide feedback on code quality, potential issues, and suggestions for improvement.")
 GEMINI_PROMPT_RU = os.getenv("GEMINI_PROMPT_RU",
@@ -37,10 +39,38 @@ app = FastAPI(
 )
 
 
-# Initialize GitLab client
+# Initialize GitLab client with proxy support
 def get_gitlab_client():
     try:
-        gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
+        # Setup session with proxy if configured
+        session = None
+        if HTTP_PROXY or SOCKS_PROXY:
+            import requests
+            session = requests.Session()
+            
+            if HTTP_PROXY:
+                logger.debug(f"Using HTTP proxy: {HTTP_PROXY}")
+                session.proxies = {
+                    'http': HTTP_PROXY,
+                    'https': HTTP_PROXY
+                }
+            elif SOCKS_PROXY:
+                logger.debug(f"Using SOCKS proxy: {SOCKS_PROXY}")
+                # For SOCKS proxy, we need pysocks
+                try:
+                    import socks
+                    import socket
+                    
+                    proxy_host, proxy_port = SOCKS_PROXY.split(':')
+                    socks.set_default_proxy(socks.SOCKS5, proxy_host, int(proxy_port))
+                    socket.socket = socks.socksocket
+                    logger.debug(f"SOCKS proxy configured: {proxy_host}:{proxy_port}")
+                except ImportError:
+                    logger.warning("PySocks not available for SOCKS proxy support")
+                except Exception as e:
+                    logger.error(f"Failed to configure SOCKS proxy: {e}")
+        
+        gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, session=session)
         gl.auth()
         return gl
     except Exception as e:
@@ -203,9 +233,26 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             
             if result.returncode == 0:
                 # Post review results
+                logger.debug("Starting to format review comment...")
                 review_comment = format_review_comment(result.stdout)
-                mr.notes.create({'body': review_comment})
-                logger.info(f"Posted review for MR !{mr_data['mr_iid']}")
+                logger.debug(f"Formatted comment length: {len(review_comment)}")
+                logger.debug(f"Formatted comment preview: {review_comment[:200]}...")
+                
+                logger.debug("Posting review comment to GitLab...")
+                try:
+                    mr.notes.create({'body': review_comment})
+                    logger.info(f"Posted review for MR !{mr_data['mr_iid']}")
+                except Exception as e:
+                    logger.error(f"Failed to post review comment: {e}")
+                    # Try to post a shorter error message
+                    error_msg = {
+                        'en': f'❌ Failed to post review comment: {str(e)}',
+                        'ru': f'❌ Не удалось опубликовать комментарий с обзором: {str(e)}'
+                    }
+                    try:
+                        mr.notes.create({'body': error_msg.get(REVIEW_LANGUAGE, error_msg['en'])})
+                    except Exception:
+                        logger.error("Failed to post error message as well")
             else:
                 error_msg = f"Gemini analysis failed with exit code {result.returncode}"
                 logger.error(error_msg)
@@ -298,6 +345,15 @@ async def startup_event():
     logger.info("Starting GitLab MR Reviewer")
     logger.info(f"GitLab URL: {GITLAB_URL}")
     logger.info(f"Webhook endpoint: http://7820.spikerwork.keenetic.pro/webhook")
+    logger.info(f"Review language: {REVIEW_LANGUAGE}")
+    
+    # Log proxy configuration
+    if HTTP_PROXY:
+        logger.info(f"HTTP Proxy configured: {HTTP_PROXY}")
+    if SOCKS_PROXY:
+        logger.info(f"SOCKS Proxy configured: {SOCKS_PROXY}")
+    if not HTTP_PROXY and not SOCKS_PROXY:
+        logger.info("No proxy configured - using direct connection")
 
     # Verify GitLab connection
     try:
