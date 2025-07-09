@@ -3,6 +3,7 @@
 
 # Project level
 temp/
+cache/
 
 # Mac
 .DS_Store

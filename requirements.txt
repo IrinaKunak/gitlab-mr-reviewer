@@ -1,2 +1,4 @@
 python-gitlab
 fastapi
+python-dotenv
+uvicorn
