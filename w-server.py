@@ -3,6 +3,7 @@ import json
 import logging
 import subprocess
 import tempfile
+import requests
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -24,6 +25,10 @@ GEMINI_PROMPT = os.getenv("GEMINI_PROMPT",
 GEMINI_PROMPT_RU = os.getenv("GEMINI_PROMPT_RU",
                             "Проанализируйте этот запрос на слияние и предоставьте отзыв о качестве кода, потенциальных проблемах и предложения по улучшению.")
 REVIEW_LANGUAGE = os.getenv("REVIEW_LANGUAGE", "en")
+TELEGRAM_ENABLED = os.getenv("TELEGRAM", "off").lower() == "on"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REVIEW_FOR_CONFLICT = os.getenv("REVIEW_FOR_CONFLICT", "false").lower() == "true"
 
 # Logging setup
 logging.basicConfig(
@@ -76,6 +81,109 @@ def get_gitlab_client():
     except Exception as e:
         logger.error(f"Failed to initialize GitLab client: {e}")
         raise
+
+
+def send_telegram_notification(message: str) -> bool:
+    """Send notification to Telegram"""
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.debug("Telegram notifications disabled or not configured")
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        
+        # Use proxy if configured
+        proxies = None
+        if HTTP_PROXY:
+            proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
+        elif SOCKS_PROXY:
+            # For SOCKS proxy with requests, we need to use requests[socks]
+            try:
+                import socks
+                import urllib3.contrib.socks
+                proxy_host, proxy_port = SOCKS_PROXY.split(':')
+                proxies = {"http": f"socks5://{proxy_host}:{proxy_port}", "https": f"socks5://{proxy_host}:{proxy_port}"}
+            except ImportError:
+                logger.warning("PySocks not available for Telegram SOCKS proxy")
+        
+        response = requests.post(url, json=data, proxies=proxies, timeout=10)
+        response.raise_for_status()
+        
+        logger.debug(f"Telegram notification sent successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send Telegram notification: {e}")
+        return False
+
+
+def format_telegram_message(mr_data: Dict[str, Any], project_name: str, has_conflicts: bool = False, review_content: str = None) -> str:
+    """Format message for Telegram notification"""
+    # Status and emoji based on conflict and review state
+    if has_conflicts:
+        status_emoji = "⚠️"
+        status_text = "MR with CONFLICTS" if REVIEW_LANGUAGE == "en" else "MR С КОНФЛИКТАМИ"
+    else:
+        status_emoji = "✅"
+        status_text = "New MR" if REVIEW_LANGUAGE == "en" else "Новый MR"
+    
+    # Build message header
+    message_parts = [
+        f"{status_emoji} **{status_text}**",
+        f"**Project:** `{project_name}`",
+        f"**Author:** {mr_data['author']}",
+        f"**Title:** {mr_data['title']}",
+        f"**Branch:** `{mr_data['source_branch']}` → `{mr_data['target_branch']}`",
+        f"**Link:** [!{mr_data['mr_iid']}]({mr_data['url']})"
+    ]
+    
+    # Add conflict warning if present
+    if has_conflicts:
+        conflict_msg = "🚫 **BLOCKED: Merge conflicts must be resolved before merging!**" if REVIEW_LANGUAGE == "en" else "🚫 **ЗАБЛОКИРОВАН: Конфликты слияния должны быть разрешены перед слиянием!**"
+        message_parts.append("")
+        message_parts.append(conflict_msg)
+    
+    # Add review content if available and not too long
+    if review_content and len(review_content) < 2000:  # Telegram message limit consideration
+        review_header = "\n📝 **Code Review:**" if REVIEW_LANGUAGE == "en" else "\n📝 **Обзор кода:**"
+        message_parts.append(review_header)
+        # Truncate review if too long for Telegram
+        truncated_review = review_content[:1500] + "..." if len(review_content) > 1500 else review_content
+        message_parts.append(f"```\n{truncated_review}\n```")
+    elif review_content:
+        review_note = "\n📝 Code review posted to GitLab (too long for Telegram)" if REVIEW_LANGUAGE == "en" else "\n📝 Обзор кода опубликован в GitLab (слишком длинный для Telegram)"
+        message_parts.append(review_note)
+    
+    return "\n".join(message_parts)
+
+
+def check_merge_conflicts(mr) -> bool:
+    """Check if merge request has conflicts"""
+    try:
+        # Get MR details including merge status
+        mr_details = mr.manager.gitlab.http_get(f"/projects/{mr.project_id}/merge_requests/{mr.iid}")
+        
+        # Check various conflict indicators
+        merge_status = mr_details.get('merge_status', '')
+        has_conflicts = (
+            merge_status == 'cannot_be_merged' or
+            merge_status == 'cannot_be_merged_recheck' or
+            mr_details.get('has_conflicts', False) or
+            mr_details.get('blocking_discussions_resolved', True) == False  # Unresolved discussions can block
+        )
+        
+        logger.debug(f"MR !{mr.iid} merge_status: {merge_status}, has_conflicts: {has_conflicts}")
+        return has_conflicts
+        
+    except Exception as e:
+        logger.warning(f"Could not check merge conflicts for MR !{mr.iid}: {e}")
+        return False  # Assume no conflicts if we can't check
 
 
 @app.get("/")
@@ -180,12 +288,38 @@ async def process_quality_check(mr_data: Dict[str, Any]):
         except gitlab.exceptions.GitlabGetError as e:
             logger.error(f"Failed to get MR !{mr_data['mr_iid']} in project {project.path_with_namespace}: {e}")
             return
+        
+        # Check for merge conflicts
+        has_conflicts = check_merge_conflicts(mr)
+        logger.info(f"MR !{mr.iid} has conflicts: {has_conflicts}")
 
+        # Send initial Telegram notification
+        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts)
+        send_telegram_notification(telegram_message)
+        
+        # Skip review if conflicts and REVIEW_FOR_CONFLICT is False
+        if has_conflicts and not REVIEW_FOR_CONFLICT:
+            conflict_skip_message = {
+                'en': '⚠️ Merge request has conflicts. Code review skipped until conflicts are resolved.',
+                'ru': '⚠️ Запрос на слияние имеет конфликты. Обзор кода пропущен до разрешения конфликтов.'
+            }
+            mr.notes.create({
+                'body': conflict_skip_message.get(REVIEW_LANGUAGE, conflict_skip_message['en'])
+            })
+            logger.info(f"Skipped review for MR !{mr_data['mr_iid']} due to conflicts")
+            return
+        
         # Post initial comment
-        initial_message = {
-            'en': '🤖 Starting automated code review with Gemini AI...',
-            'ru': '🤖 Начинаем автоматический обзор кода с помощью Gemini AI...'
-        }
+        if has_conflicts:
+            initial_message = {
+                'en': '⚠️ 🤖 Starting automated code review with Gemini AI (conflicts detected)...',
+                'ru': '⚠️ 🤖 Начинаем автоматический обзор кода с помощью Gemini AI (обнаружены конфликты)...'
+            }
+        else:
+            initial_message = {
+                'en': '🤖 Starting automated code review with Gemini AI...',
+                'ru': '🤖 Начинаем автоматический обзор кода с помощью Gemini AI...'
+            }
         mr.notes.create({
             'body': initial_message.get(REVIEW_LANGUAGE, initial_message['en'])
         })
@@ -242,6 +376,12 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                 try:
                     mr.notes.create({'body': review_comment})
                     logger.info(f"Posted review for MR !{mr_data['mr_iid']}")
+                    
+                    # Send Telegram notification with review content
+                    if TELEGRAM_ENABLED:
+                        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts, result.stdout)
+                        send_telegram_notification(telegram_message)
+                        
                 except Exception as e:
                     logger.error(f"Failed to post review comment: {e}")
                     # Try to post a shorter error message
@@ -346,6 +486,8 @@ async def startup_event():
     logger.info(f"GitLab URL: {GITLAB_URL}")
     logger.info(f"Webhook endpoint: http://7820.spikerwork.keenetic.pro/webhook")
     logger.info(f"Review language: {REVIEW_LANGUAGE}")
+    logger.info(f"Telegram notifications: {'enabled' if TELEGRAM_ENABLED else 'disabled'}")
+    logger.info(f"Review for conflicts: {'enabled' if REVIEW_FOR_CONFLICT else 'disabled'}")
     
     # Log proxy configuration
     if HTTP_PROXY:
