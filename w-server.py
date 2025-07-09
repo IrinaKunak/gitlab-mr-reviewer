@@ -192,7 +192,9 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                 capture_output=True,
                 text=True,
                 timeout=120,  # 2 minutes timeout
-                cwd=os.path.dirname(os.path.abspath(__file__))
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                encoding='utf-8',
+                errors='replace'
             )
             
             logger.debug(f"Gemini wrapper exit code: {result.returncode}")
