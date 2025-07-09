@@ -5,7 +5,7 @@ GEMINI_CACHE_DIR="${GEMINI_CACHE_DIR:-$HOME/.gitlab-mr-reviewer/cache}"
 GEMINI_CACHE_TTL="${GEMINI_CACHE_TTL:-3600}"  # 1 hour
 GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-60}"        # 60 seconds
 GEMINI_RATE_LIMIT="${GEMINI_RATE_LIMIT:-2}"   # 2 seconds between calls
-GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.0-flash}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
 
 # Load prompts from environment or use defaults
 GEMINI_PROMPT="${GEMINI_PROMPT:-Review this code change and provide:
@@ -148,19 +148,19 @@ ${GEMINI_PROMPT}
 $(cat "$diff_file")
 EOF
     
-    # Call Gemini
+    # Call Gemini with -p parameter
     log "Calling Gemini for code review"
-    debug "Gemini command: gemini -m $GEMINI_MODEL < $temp_file"
+    debug "Gemini command: gemini -m $GEMINI_MODEL -p \"[content from temp file]\""
     debug "Temp file content (first 500 chars): $(head -c 500 "$temp_file")"
     local gemini_result=""
     local gemini_exit_code=0
     
     # Use timeout command if available
     if command -v timeout >/dev/null 2>&1; then
-        gemini_result=$(timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" < "$temp_file" 2>&1)
+        gemini_result=$(timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" -p "$(cat "$temp_file")" 2>&1)
         gemini_exit_code=$?
     else
-        gemini_result=$(gemini -m "$GEMINI_MODEL" < "$temp_file" 2>&1)
+        gemini_result=$(gemini -m "$GEMINI_MODEL" -p "$(cat "$temp_file")" 2>&1)
         gemini_exit_code=$?
     fi
     
