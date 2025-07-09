@@ -19,6 +19,9 @@ GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 GEMINI_PROMPT = os.getenv("GEMINI_PROMPT",
                           "Review this merge request and provide feedback on code quality, potential issues, and suggestions for improvement.")
+GEMINI_PROMPT_RU = os.getenv("GEMINI_PROMPT_RU",
+                            "Проанализируйте этот запрос на слияние и предоставьте отзыв о качестве кода, потенциальных проблемах и предложения по улучшению.")
+REVIEW_LANGUAGE = os.getenv("REVIEW_LANGUAGE", "en")
 
 # Logging setup
 logging.basicConfig(
@@ -149,8 +152,12 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             return
 
         # Post initial comment
+        initial_message = {
+            'en': '🤖 Starting automated code review with Gemini AI...',
+            'ru': '🤖 Начинаем автоматический обзор кода с помощью Gemini AI...'
+        }
         mr.notes.create({
-            'body': '🤖 Starting automated code review with Gemini AI...'
+            'body': initial_message.get(REVIEW_LANGUAGE, initial_message['en'])
         })
 
         # Fetch MR changes
@@ -158,8 +165,12 @@ async def process_quality_check(mr_data: Dict[str, Any]):
         diff_content = extract_diff_content(changes)
 
         if not diff_content:
+            no_changes_message = {
+                'en': '⚠️ No code changes found to review.',
+                'ru': '⚠️ Не найдено изменений кода для обзора.'
+            }
             mr.notes.create({
-                'body': '⚠️ No code changes found to review.'
+                'body': no_changes_message.get(REVIEW_LANGUAGE, no_changes_message['en'])
             })
             return
 
@@ -197,8 +208,12 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                 error_msg = f"Gemini analysis failed with exit code {result.returncode}"
                 logger.error(error_msg)
                 logger.error(f"stderr: {result.stderr}")
+                error_message = {
+                    'en': f'❌ Code review failed:\n```\n{result.stderr}\n```',
+                    'ru': f'❌ Обзор кода не удался:\n```\n{result.stderr}\n```'
+                }
                 mr.notes.create({
-                    'body': f'❌ Code review failed:\n```\n{result.stderr}\n```'
+                    'body': error_message.get(REVIEW_LANGUAGE, error_message['en'])
                 })
 
         finally:
@@ -210,16 +225,24 @@ async def process_quality_check(mr_data: Dict[str, Any]):
     except subprocess.TimeoutExpired:
         logger.error("Gemini analysis timed out")
         try:
+            timeout_message = {
+                'en': '⏱️ Code review timed out. The changes might be too large to analyze.',
+                'ru': '⏱️ Тайм-аут обзора кода. Возможно, изменения слишком большие для анализа.'
+            }
             mr.notes.create({
-                'body': '⏱️ Code review timed out. The changes might be too large to analyze.'
+                'body': timeout_message.get(REVIEW_LANGUAGE, timeout_message['en'])
             })
         except Exception:
             pass
     except Exception as e:
         logger.error(f"Error in quality check: {e}")
         try:
+            error_message = {
+                'en': f'❌ An error occurred during code review: {str(e)}',
+                'ru': f'❌ Произошла ошибка при обзоре кода: {str(e)}'
+            }
             mr.notes.create({
-                'body': f'❌ An error occurred during code review: {str(e)}'
+                'body': error_message.get(REVIEW_LANGUAGE, error_message['en'])
             })
         except Exception:
             pass
@@ -244,13 +267,24 @@ def format_review_comment(gemini_output: str) -> str:
     # Clean up the output
     cleaned_output = gemini_output.strip()
 
+    # Choose header and footer based on language
+    headers = {
+        'en': '## 🤖 Automated Code Review',
+        'ru': '## 🤖 Автоматический обзор кода'
+    }
+    
+    footers = {
+        'en': '*This review was generated automatically by Gemini AI. Please review the feedback and address any issues before merging.*',
+        'ru': '*Этот обзор был создан автоматически с помощью Gemini AI. Пожалуйста, изучите отзывы и устраните все проблемы перед слиянием.*'
+    }
+
     # Add header and formatting
-    formatted_comment = f"""## 🤖 Automated Code Review
+    formatted_comment = f"""{headers.get(REVIEW_LANGUAGE, headers['en'])}
 
 {cleaned_output}
 
 ---
-*This review was generated automatically by Gemini AI. Please review the feedback and address any issues before merging.*
+{footers.get(REVIEW_LANGUAGE, footers['en'])}
 """
 
     return formatted_comment

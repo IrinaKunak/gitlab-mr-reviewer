@@ -25,7 +25,10 @@ pip install -r requirements.txt
 ### Run the Server
 ```bash
 source .venv/bin/activate
-uvicorn w-server:app --host 0.0.0.0 --port 5000
+DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
+
+# Run with logging to file
+DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000 > server.log 2>&1 &
 ```
 
 ### Test the Webhook
@@ -67,7 +70,8 @@ The application requires a `.env` file with:
    - Rate limiting (2 seconds between calls)
    - Handles large diffs (up to 500KB)
    - Timeout protection (60 seconds)
-   - Uses gemini-2.0-flash model
+   - Uses gemini-2.5-flash model
+   - Calls Gemini CLI with `-p` parameter for prompt input
 
 ## Webhook Configuration
 
@@ -96,10 +100,12 @@ Server logs include:
 - GitLab webhook parsing
 - Async task processing
 - GitLab API integration
-- Gemini wrapper script
+- Gemini wrapper script with correct CLI syntax
 - Error handling and logging
 - Environment configuration
 - Test utilities
+- End-to-end webhook processing (verified working)
+- AI code reviews posted to GitLab MRs
 
 📝 Future Improvements:
 - Add unit tests
@@ -108,3 +114,5 @@ Server logs include:
 - Support for multiple prompts
 - Web UI for configuration
 - CI/CD pipeline
+- Russian language translation for MR comments
+- Multiple language support

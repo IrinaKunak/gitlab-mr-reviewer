@@ -8,6 +8,7 @@ GEMINI_RATE_LIMIT="${GEMINI_RATE_LIMIT:-2}"   # 2 seconds between calls
 GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
 
 # Load prompts from environment or use defaults
+REVIEW_LANGUAGE="${REVIEW_LANGUAGE:-en}"
 GEMINI_PROMPT="${GEMINI_PROMPT:-Review this code change and provide:
 1. Code quality assessment
 2. Potential bugs or issues
@@ -17,6 +18,23 @@ GEMINI_PROMPT="${GEMINI_PROMPT:-Review this code change and provide:
 6. Suggestions for improvement
 
 Be concise but thorough. Focus on actionable feedback.}"
+
+GEMINI_PROMPT_RU="${GEMINI_PROMPT_RU:-Проанализируйте этот запрос на слияние и предоставьте:
+1. Оценка качества кода
+2. Потенциальные баги или проблемы
+3. Проблемы безопасности
+4. Вопросы производительности
+5. Нарушения лучших практик
+6. Предложения по улучшению
+
+Будьте лаконичными, но основательными. Сосредоточьтесь на практических рекомендациях.}"
+
+# Select prompt based on language
+if [ "$REVIEW_LANGUAGE" = "ru" ]; then
+    SELECTED_PROMPT="$GEMINI_PROMPT_RU"
+else
+    SELECTED_PROMPT="$GEMINI_PROMPT"
+fi
 
 # Rate limiting file
 RATE_LIMIT_FILE="/tmp/gitlab_mr_gemini_last_call"
@@ -76,7 +94,7 @@ generate_cache_key() {
     
     if [ -f "$file" ]; then
         # Create hash from file content and prompt
-        echo "$GEMINI_PROMPT" | cat - "$file" | sha256sum | cut -d' ' -f1
+        echo "$SELECTED_PROMPT" | cat - "$file" | sha256sum | cut -d' ' -f1
     else
         echo ""
     fi
@@ -142,7 +160,7 @@ analyze_diff() {
     cat > "$temp_file" << EOF
 Please review the following merge request diff:
 
-${GEMINI_PROMPT}
+${SELECTED_PROMPT}
 
 ===== DIFF CONTENT =====
 $(cat "$diff_file")
