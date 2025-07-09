@@ -150,17 +150,17 @@ EOF
     
     # Call Gemini
     log "Calling Gemini for code review"
-    debug "Gemini command: gemini -m $GEMINI_MODEL $temp_file"
+    debug "Gemini command: gemini -m $GEMINI_MODEL < $temp_file"
     debug "Temp file content (first 500 chars): $(head -c 500 "$temp_file")"
     local gemini_result=""
     local gemini_exit_code=0
     
     # Use timeout command if available
     if command -v timeout >/dev/null 2>&1; then
-        gemini_result=$(timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" "$temp_file" 2>&1)
+        gemini_result=$(timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" < "$temp_file" 2>&1)
         gemini_exit_code=$?
     else
-        gemini_result=$(gemini -m "$GEMINI_MODEL" "$temp_file" 2>&1)
+        gemini_result=$(gemini -m "$GEMINI_MODEL" < "$temp_file" 2>&1)
         gemini_exit_code=$?
     fi
     
