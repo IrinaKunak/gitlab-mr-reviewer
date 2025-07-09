@@ -54,6 +54,10 @@ The application requires a `.env` file with:
 - `HTTP_PROXY`: HTTP proxy URL (e.g., http://127.0.0.1:8181) (optional)
 - `SOCKS_PROXY`: SOCKS proxy address (e.g., 127.0.0.1:8180) (optional)
 - `WEBHOOK_SECRET`: Secret token for webhook verification (optional)
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token for notifications (optional)
+- `TELEGRAM_CHAT_ID`: Telegram chat ID for notifications (optional)
+- `TELEGRAM`: Enable/disable Telegram notifications - "on" or "off" (default: off)
+- `REVIEW_FOR_CONFLICT`: Whether to review MRs with conflicts - "true" or "false" (default: false)
 
 ## Key Features
 
@@ -64,10 +68,13 @@ The application requires a `.env` file with:
 
 2. **Code Review Flow**:
    - Receives webhook when MR is created/updated
-   - Posts initial comment on MR
+   - Detects merge conflicts automatically
+   - Sends initial Telegram notification with MR details
+   - Posts initial comment on MR (with conflict warning if applicable)
    - Fetches MR diff content
    - Calls gemini-wrapper.sh for AI analysis
    - Posts formatted review results as MR comment
+   - Sends Telegram notification with review summary
 
 3. **Gemini Integration**:
    - Caches responses to avoid duplicate API calls (1-hour TTL)
@@ -84,6 +91,16 @@ The application requires a `.env` file with:
    - SOCKS proxy support with PySocks
    - Automatic proxy detection from environment variables
    - Connection debugging and logging
+   - Proxy support for Telegram API calls
+
+5. **Telegram Notifications**:
+   - Real-time notifications for new merge requests
+   - Conflict detection and warning alerts
+   - Project name, author, and branch information
+   - Direct links to merge requests
+   - Code review summaries (truncated if too long)
+   - Multi-language support (English/Russian)
+   - Configurable review behavior for conflicted MRs
 
 ## Webhook Configuration
 
@@ -144,6 +161,30 @@ SOCKS_PROXY=127.0.0.1:8180
 
 **Note**: HTTP proxy takes precedence over SOCKS proxy if both are configured.
 
+## Telegram Configuration
+
+For Telegram notifications:
+
+### Basic Setup
+```env
+TELEGRAM=on
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
+```
+
+### Conflict Handling
+```env
+REVIEW_FOR_CONFLICT=true   # Enable reviews for MRs with conflicts
+REVIEW_FOR_CONFLICT=false  # Skip reviews for conflicted MRs (default)
+```
+
+### Features
+- **Status Indicators**: ✅ for normal MRs, ⚠️ for conflicts
+- **Conflict Warnings**: 🚫 BLOCKED messages when conflicts detected
+- **Rich Formatting**: Markdown with project/author/branch details
+- **Review Integration**: Includes code review content or summary
+- **Proxy Support**: Uses same proxy configuration as GitLab API
+
 ## Monitoring
 
 Server logs include:
@@ -152,6 +193,8 @@ Server logs include:
 - GitLab API interactions
 - Proxy connection status
 - Language configuration
+- Telegram notification status
+- Conflict detection results
 - Gemini analysis results
 - Error details with stack traces
 - UTF-8 encoding handling
@@ -172,6 +215,10 @@ Server logs include:
 - Test utilities
 - End-to-end webhook processing (verified working)
 - AI code reviews posted to GitLab MRs
+- Telegram notifications with rich formatting
+- Merge conflict detection and warnings
+- Configurable review behavior for conflicts
+- Proxy support for Telegram API calls
 
 📝 Future Improvements:
 - Add unit tests
@@ -184,3 +231,6 @@ Server logs include:
 - Custom review templates
 - Performance optimization for large diffs
 - Webhook authentication improvements
+- Telegram notification customization
+- Multiple Telegram channels support
+- Advanced conflict resolution suggestions
