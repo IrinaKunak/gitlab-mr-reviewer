@@ -45,15 +45,25 @@ python create_test_mr.py
 
 ## Environment Configuration
 
-The application requires a `.env` file with:
-- `GITLAB_URL`: GitLab instance URL (e.g., https://lab.smysl.pro)
+The application supports multiple GitLab instances and requires a `.env` file:
+
+### Primary GitLab Instance
+- `GITLAB_URL`: Primary GitLab instance URL (e.g., https://lab.smysl.pro)
 - `GITLAB_TOKEN`: GitLab private token for API access
+- `XGITLABTOKEN`: Webhook token for primary instance (used in X-Gitlab-Token header)
+
+### Additional GitLab Instances (up to 10)
+- `GITLAB_URL_2`: Second GitLab instance URL (e.g., https://lab.catzwolf.ru)
+- `GITLAB_TOKEN_2`: GitLab private token for second instance
+- `XGITLABTOKEN_2`: Webhook token for second instance
+- ... (continue pattern for _3, _4, etc.)
+
+### Other Configuration
 - `GEMINI_PROMPT`: Custom prompt for Gemini AI reviews (optional)
 - `GEMINI_PROMPT_RU`: Russian language prompt for Gemini AI reviews (optional)
 - `REVIEW_LANGUAGE`: Language for reviews - "en" for English, "ru" for Russian (default: en)
 - `HTTP_PROXY`: HTTP proxy URL (e.g., http://127.0.0.1:8181) (optional)
 - `SOCKS_PROXY`: SOCKS proxy address (e.g., 127.0.0.1:8180) (optional)
-- `WEBHOOK_SECRET`: Secret token for webhook verification (optional)
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token for notifications (optional)
 - `TELEGRAM_CHAT_ID`: Telegram chat ID for notifications (optional)
 - `TELEGRAM`: Enable/disable Telegram notifications - "on" or "off" (default: off)
@@ -63,7 +73,8 @@ The application requires a `.env` file with:
 
 1. **Webhook Processing**: 
    - Handles GitLab merge request events (open, update, reopen)
-   - Validates webhook tokens if configured
+   - Supports multiple GitLab instances via X-Gitlab-Token header matching
+   - Automatically detects which GitLab instance to use based on webhook token
    - Processes events asynchronously
 
 2. **Code Review Flow**:
@@ -71,18 +82,20 @@ The application requires a `.env` file with:
    - Detects merge conflicts automatically
    - Sends initial Telegram notification with MR details
    - Posts initial comment on MR (with conflict warning if applicable)
-   - Fetches MR diff content
-   - Calls gemini-wrapper.sh for AI analysis
+   - Fetches MR diff content AND original file contents for better context
+   - Calls gemini-wrapper.sh for AI analysis with full context
    - Posts formatted review results as MR comment
    - Sends Telegram notification with review summary
+   - Sends error notifications to Telegram for any failures
 
 3. **Gemini Integration**:
    - Caches responses to avoid duplicate API calls (1-hour TTL)
    - Rate limiting (2 seconds between calls)
-   - Handles large diffs (up to 500KB)
+   - Handles large review content (up to 1MB with file contents)
    - Timeout protection (60 seconds)
    - Uses gemini-2.5-flash model
    - Calls Gemini CLI with `-p` parameter for prompt input
+   - Reviews include both diffs and original file content for better context
    - Multi-language support (English/Russian)
    - Language-specific prompts and responses
 
@@ -101,6 +114,12 @@ The application requires a `.env` file with:
    - Code review summaries (truncated if too long)
    - Multi-language support (English/Russian)
    - Configurable review behavior for conflicted MRs
+   - **Error notifications** for:
+     - Gemini AI failures
+     - GitLab API errors
+     - Webhook processing errors
+     - Timeout errors
+     - General failures
 
 ## Webhook Configuration
 
@@ -108,10 +127,17 @@ The webhook endpoint is available at:
 - Local: `http://localhost:5000/webhook`
 - External: `http://7820.spikerwork.keenetic.pro/webhook`
 
-Configure in GitLab project settings:
-- URL: Your webhook endpoint
-- Trigger: Merge request events
-- Optional: Set secret token
+### Multi-Instance Setup
+1. For each GitLab instance, configure webhook in project settings:
+   - URL: Your webhook endpoint (same for all instances)
+   - Secret Token: Use the corresponding `XGITLABTOKEN` value
+   - Trigger: Merge request events
+
+2. Example configuration:
+   - Instance 1 (lab.smysl.pro): Use `XGITLABTOKEN` value as secret token
+   - Instance 2 (lab.catzwolf.ru): Use `XGITLABTOKEN_2` value as secret token
+
+The system will automatically route webhooks to the correct GitLab instance based on the X-Gitlab-Token header.
 
 ## Language Support
 
@@ -189,15 +215,25 @@ REVIEW_FOR_CONFLICT=false  # Skip reviews for conflicted MRs (default)
 
 Server logs include:
 - Webhook receipt confirmations
+- GitLab instance detection and routing
 - MR processing status
 - GitLab API interactions
 - Proxy connection status
 - Language configuration
-- Telegram notification status
+- Telegram notification status (including error notifications)
 - Conflict detection results
 - Gemini analysis results
+- File content fetching status
 - Error details with stack traces
 - UTF-8 encoding handling
+
+### Error Notification Details
+When errors occur, Telegram notifications include:
+- Error type (Gemini failure, GitLab API, webhook, timeout, general)
+- Error details and description
+- Project ID and MR number (if available)
+- GitLab instance name
+- Timestamp of the error
 
 ## Current Implementation Status
 
@@ -205,12 +241,15 @@ Server logs include:
 - FastAPI webhook server
 - GitLab webhook parsing
 - Async task processing
+- **Multi-instance GitLab support** (up to 10 instances)
 - GitLab API integration with proxy support (HTTP/SOCKS)
 - Gemini wrapper script with correct CLI syntax
+- **Enhanced code reviews** with original file content for context
 - Russian language support (prompts, comments, reviews)
 - Multi-language interface (English/Russian)
 - UTF-8 encoding handling
 - Error handling and logging
+- **Error notifications to Telegram** for all failure scenarios
 - Environment configuration
 - Test utilities
 - End-to-end webhook processing (verified working)

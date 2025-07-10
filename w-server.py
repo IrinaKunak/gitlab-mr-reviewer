@@ -16,8 +16,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
-GITLAB_URL = os.getenv("GITLAB_URL")
-GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 SOCKS_PROXY = os.getenv("SOCKS_PROXY")
 HTTP_PROXY = os.getenv("HTTP_PROXY")
 GEMINI_PROMPT = os.getenv("GEMINI_PROMPT",
@@ -29,6 +27,41 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM", "off").lower() == "on"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 REVIEW_FOR_CONFLICT = os.getenv("REVIEW_FOR_CONFLICT", "false").lower() == "true"
+
+# Multi-instance GitLab configuration
+GITLAB_INSTANCES = {}
+
+# Load all GitLab instances from environment
+def load_gitlab_instances():
+    """Load GitLab instances configuration from environment variables"""
+    instances = {}
+    
+    # Load primary instance
+    if os.getenv("GITLAB_URL") and os.getenv("GITLAB_TOKEN"):
+        webhook_token = os.getenv("XGITLABTOKEN")
+        if webhook_token:
+            instances[webhook_token] = {
+                "url": os.getenv("GITLAB_URL"),
+                "token": os.getenv("GITLAB_TOKEN"),
+                "name": "primary"
+            }
+    
+    # Load additional instances (up to 10)
+    for i in range(2, 11):
+        url_key = f"GITLAB_URL_{i}"
+        token_key = f"GITLAB_TOKEN_{i}"
+        webhook_key = f"XGITLABTOKEN_{i}"
+        
+        if os.getenv(url_key) and os.getenv(token_key) and os.getenv(webhook_key):
+            instances[os.getenv(webhook_key)] = {
+                "url": os.getenv(url_key),
+                "token": os.getenv(token_key),
+                "name": f"instance_{i}"
+            }
+    
+    return instances
+
+GITLAB_INSTANCES = load_gitlab_instances()
 
 # Logging setup
 logging.basicConfig(
@@ -45,7 +78,8 @@ app = FastAPI(
 
 
 # Initialize GitLab client with proxy support
-def get_gitlab_client():
+def get_gitlab_client(gitlab_config: Dict[str, str]):
+    """Get GitLab client for a specific instance configuration"""
     try:
         # Setup session with proxy if configured
         session = None
@@ -75,21 +109,26 @@ def get_gitlab_client():
                 except Exception as e:
                     logger.error(f"Failed to configure SOCKS proxy: {e}")
         
-        gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, session=session)
+        gl = gitlab.Gitlab(gitlab_config["url"], private_token=gitlab_config["token"], session=session)
         gl.auth()
         return gl
     except Exception as e:
-        logger.error(f"Failed to initialize GitLab client: {e}")
+        logger.error(f"Failed to initialize GitLab client for {gitlab_config.get('name', 'unknown')}: {e}")
         raise
 
 
-def send_telegram_notification(message: str) -> bool:
+def send_telegram_notification(message: str, is_error: bool = False) -> bool:
     """Send notification to Telegram"""
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.debug("Telegram notifications disabled or not configured")
         return False
     
     try:
+        # Add error prefix if it's an error notification
+        if is_error:
+            error_prefix = "🚨 **ERROR** 🚨\n" if REVIEW_LANGUAGE == "en" else "🚨 **ОШИБКА** 🚨\n"
+            message = error_prefix + message
+        
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -121,6 +160,50 @@ def send_telegram_notification(message: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to send Telegram notification: {e}")
         return False
+
+
+def send_error_notification(error_type: str, error_details: str, context: Dict[str, Any] = None) -> bool:
+    """Send error notification to Telegram"""
+    if not TELEGRAM_ENABLED:
+        return False
+    
+    # Format error message
+    if REVIEW_LANGUAGE == "ru":
+        error_messages = {
+            "gemini_failure": "Ошибка Gemini AI",
+            "gitlab_api_error": "Ошибка GitLab API",
+            "webhook_error": "Ошибка обработки webhook",
+            "timeout": "Превышено время ожидания",
+            "general": "Общая ошибка"
+        }
+    else:
+        error_messages = {
+            "gemini_failure": "Gemini AI Error",
+            "gitlab_api_error": "GitLab API Error",
+            "webhook_error": "Webhook Processing Error",
+            "timeout": "Timeout Error",
+            "general": "General Error"
+        }
+    
+    error_title = error_messages.get(error_type, error_messages["general"])
+    
+    message_parts = [
+        f"**{error_title}**",
+        f"**Details:** {error_details}"
+    ]
+    
+    if context:
+        if "project_id" in context:
+            message_parts.append(f"**Project ID:** {context['project_id']}")
+        if "mr_iid" in context:
+            message_parts.append(f"**MR:** !{context['mr_iid']}")
+        if "gitlab_instance" in context:
+            message_parts.append(f"**Instance:** {context['gitlab_instance']}")
+    
+    message_parts.append(f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    message = "\n".join(message_parts)
+    return send_telegram_notification(message, is_error=True)
 
 
 def format_telegram_message(mr_data: Dict[str, Any], project_name: str, has_conflicts: bool = False, review_content: str = None) -> str:
@@ -199,10 +282,19 @@ async def handle_gitlab_webhook(request: Request, background_tasks: BackgroundTa
         event_type = request.headers.get("X-Gitlab-Event")
         gitlab_token = request.headers.get("X-Gitlab-Token")
 
-        # Verify webhook token if configured
-        expected_token = os.getenv("WEBHOOK_SECRET")
-        if expected_token and gitlab_token != expected_token:
-            logger.warning("Invalid webhook token received")
+        # Find matching GitLab instance by webhook token
+        gitlab_config = None
+        if gitlab_token and gitlab_token in GITLAB_INSTANCES:
+            gitlab_config = GITLAB_INSTANCES[gitlab_token]
+            logger.info(f"Matched webhook token to GitLab instance: {gitlab_config['name']} ({gitlab_config['url']})")
+        else:
+            logger.warning(f"No GitLab instance found for webhook token: {gitlab_token}")
+            # Send error notification
+            send_error_notification(
+                "webhook_error",
+                f"Unknown webhook token received: {gitlab_token[:10]}...",
+                {"event_type": event_type}
+            )
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
         # Parse webhook payload
@@ -219,17 +311,31 @@ async def handle_gitlab_webhook(request: Request, background_tasks: BackgroundTa
         if not mr_data:
             return {"status": "ignored", "reason": "Invalid or unsupported MR action"}
 
+        # Add GitLab instance config to mr_data
+        mr_data["gitlab_config"] = gitlab_config
+
         # Add background task for code quality check
-        logger.info(f"Queuing quality check for MR !{mr_data['mr_iid']} in project {mr_data['project_id']}")
+        logger.info(f"Queuing quality check for MR !{mr_data['mr_iid']} in project {mr_data['project_id']} on {gitlab_config['name']}")
         background_tasks.add_task(process_quality_check, mr_data)
 
-        return {"status": "accepted", "merge_request": mr_data['mr_iid']}
+        return {"status": "accepted", "merge_request": mr_data['mr_iid'], "instance": gitlab_config['name']}
 
     except json.JSONDecodeError:
         logger.error("Invalid JSON in webhook payload")
+        send_error_notification(
+            "webhook_error",
+            "Invalid JSON in webhook payload"
+        )
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error handling webhook: {e}")
+        send_error_notification(
+            "webhook_error",
+            str(e),
+            {"event_type": event_type}
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -267,11 +373,16 @@ def parse_merge_request_webhook(payload: Dict[str, Any]) -> Optional[Dict[str, A
 async def process_quality_check(mr_data: Dict[str, Any]):
     """Process quality check for a merge request"""
     try:
-        logger.info(f"Starting quality check for MR !{mr_data['mr_iid']} in project {mr_data['project_id']}")
-        logger.debug(f"MR data: {json.dumps(mr_data, indent=2)}")
+        gitlab_config = mr_data.get("gitlab_config")
+        if not gitlab_config:
+            logger.error("No GitLab configuration found in mr_data")
+            return
+            
+        logger.info(f"Starting quality check for MR !{mr_data['mr_iid']} in project {mr_data['project_id']} on {gitlab_config['name']}")
+        logger.debug(f"MR data: {json.dumps({k: v for k, v in mr_data.items() if k != 'gitlab_config'}, indent=2)}")
 
-        # Get GitLab client
-        gl = get_gitlab_client()
+        # Get GitLab client for the specific instance
+        gl = get_gitlab_client(gitlab_config)
         
         # Get project with debug info
         try:
@@ -279,6 +390,11 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             logger.info(f"Found project: {project.path_with_namespace}")
         except gitlab.exceptions.GitlabGetError as e:
             logger.error(f"Failed to get project {mr_data['project_id']}: {e}")
+            send_error_notification(
+                "gitlab_api_error",
+                f"Failed to get project {mr_data['project_id']}: {str(e)}",
+                {"project_id": mr_data['project_id'], "gitlab_instance": gitlab_config['name']}
+            )
             return
             
         # Get MR with debug info
@@ -287,6 +403,11 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             logger.info(f"Found MR: !{mr.iid} - {mr.title}")
         except gitlab.exceptions.GitlabGetError as e:
             logger.error(f"Failed to get MR !{mr_data['mr_iid']} in project {project.path_with_namespace}: {e}")
+            send_error_notification(
+                "gitlab_api_error",
+                f"Failed to get MR !{mr_data['mr_iid']}: {str(e)}",
+                {"project_id": mr_data['project_id'], "mr_iid": mr_data['mr_iid'], "gitlab_instance": gitlab_config['name']}
+            )
             return
         
         # Check for merge conflicts
@@ -326,9 +447,10 @@ async def process_quality_check(mr_data: Dict[str, Any]):
 
         # Fetch MR changes
         changes = mr.changes()
-        diff_content = extract_diff_content(changes)
+        # Extract diff content with file contents for better context
+        review_content = extract_review_content(project, mr, changes, gitlab_config)
 
-        if not diff_content:
+        if not review_content:
             no_changes_message = {
                 'en': '⚠️ No code changes found to review.',
                 'ru': '⚠️ Не найдено изменений кода для обзора.'
@@ -338,12 +460,12 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             })
             return
 
-        # Save diff to temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.diff', delete=False) as tmp_file:
+        # Save review content to temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
             tmp_file.write(f"Merge Request: {mr_data['title']}\n")
             tmp_file.write(f"Author: {mr_data['author']}\n")
             tmp_file.write(f"Source: {mr_data['source_branch']} -> {mr_data['target_branch']}\n\n")
-            tmp_file.write(diff_content)
+            tmp_file.write(review_content)
             tmp_file_path = tmp_file.name
 
         try:
@@ -384,6 +506,11 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                         
                 except Exception as e:
                     logger.error(f"Failed to post review comment: {e}")
+                    send_error_notification(
+                        "gitlab_api_error",
+                        f"Failed to post review comment: {str(e)}",
+                        {"project_id": mr_data['project_id'], "mr_iid": mr_data['mr_iid'], "gitlab_instance": gitlab_config['name']}
+                    )
                     # Try to post a shorter error message
                     error_msg = {
                         'en': f'❌ Failed to post review comment: {str(e)}',
@@ -397,6 +524,11 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                 error_msg = f"Gemini analysis failed with exit code {result.returncode}"
                 logger.error(error_msg)
                 logger.error(f"stderr: {result.stderr}")
+                send_error_notification(
+                    "gemini_failure",
+                    f"Exit code {result.returncode}: {result.stderr[:200]}...",
+                    {"project_id": mr_data['project_id'], "mr_iid": mr_data['mr_iid'], "gitlab_instance": gitlab_config['name']}
+                )
                 error_message = {
                     'en': f'❌ Code review failed:\n```\n{result.stderr}\n```',
                     'ru': f'❌ Обзор кода не удался:\n```\n{result.stderr}\n```'
@@ -411,8 +543,18 @@ async def process_quality_check(mr_data: Dict[str, Any]):
 
     except gitlab.exceptions.GitlabError as e:
         logger.error(f"GitLab API error: {e}")
+        send_error_notification(
+            "gitlab_api_error",
+            str(e),
+            {"project_id": mr_data.get('project_id'), "mr_iid": mr_data.get('mr_iid'), "gitlab_instance": gitlab_config.get('name') if gitlab_config else 'unknown'}
+        )
     except subprocess.TimeoutExpired:
         logger.error("Gemini analysis timed out")
+        send_error_notification(
+            "timeout",
+            "Gemini analysis exceeded timeout limit",
+            {"project_id": mr_data.get('project_id'), "mr_iid": mr_data.get('mr_iid'), "gitlab_instance": gitlab_config.get('name') if gitlab_config else 'unknown'}
+        )
         try:
             timeout_message = {
                 'en': '⏱️ Code review timed out. The changes might be too large to analyze.',
@@ -425,6 +567,11 @@ async def process_quality_check(mr_data: Dict[str, Any]):
             pass
     except Exception as e:
         logger.error(f"Error in quality check: {e}")
+        send_error_notification(
+            "general",
+            str(e),
+            {"project_id": mr_data.get('project_id'), "mr_iid": mr_data.get('mr_iid'), "gitlab_instance": gitlab_config.get('name') if gitlab_config else 'unknown'}
+        )
         try:
             error_message = {
                 'en': f'❌ An error occurred during code review: {str(e)}',
@@ -449,6 +596,68 @@ def extract_diff_content(changes: Dict[str, Any]) -> str:
             diff_parts.append(f"\n--- {file_path} ---\n{diff}")
 
     return "\n".join(diff_parts)
+
+
+def extract_review_content(project, mr, changes: Dict[str, Any], gitlab_config: Dict[str, str]) -> str:
+    """Extract review content including diffs and original files for context"""
+    review_parts = []
+    file_count = 0
+    
+    for change in changes.get("changes", []):
+        file_path = change.get("new_path", change.get("old_path", "unknown"))
+        diff = change.get("diff", "")
+        
+        if not diff:
+            continue
+            
+        file_count += 1
+        review_parts.append(f"\n{'='*80}\nFILE #{file_count}: {file_path}\n{'='*80}")
+        
+        # Check if file was deleted
+        if change.get("deleted_file"):
+            review_parts.append("\n[FILE DELETED]\n")
+            review_parts.append("\n--- DIFF ---\n")
+            review_parts.append(diff)
+            continue
+        
+        # Try to get the current file content from the source branch
+        try:
+            # For new files, only show the diff
+            if change.get("new_file"):
+                review_parts.append("\n[NEW FILE]\n")
+                review_parts.append("\n--- DIFF ---\n")
+                review_parts.append(diff)
+            else:
+                # Get file content from source branch for context
+                try:
+                    file_content = project.files.get(file_path, ref=mr.source_branch)
+                    decoded_content = file_content.decode().decode('utf-8', errors='replace')
+                    
+                    # Limit file content to reasonable size (first 200 lines)
+                    content_lines = decoded_content.split('\n')
+                    if len(content_lines) > 200:
+                        truncated_content = '\n'.join(content_lines[:200])
+                        review_parts.append(f"\n--- CURRENT FILE CONTENT (first 200 lines of {len(content_lines)} total) ---\n")
+                        review_parts.append(truncated_content)
+                        review_parts.append("\n... [truncated] ...\n")
+                    else:
+                        review_parts.append("\n--- CURRENT FILE CONTENT ---\n")
+                        review_parts.append(decoded_content)
+                except Exception as e:
+                    logger.debug(f"Could not fetch file content for {file_path}: {e}")
+                    review_parts.append(f"\n--- CURRENT FILE CONTENT ---\n[Unable to fetch: {str(e)}]\n")
+                
+                # Add the diff
+                review_parts.append("\n--- DIFF ---\n")
+                review_parts.append(diff)
+                
+        except Exception as e:
+            logger.warning(f"Error processing file {file_path}: {e}")
+            # Fall back to just the diff
+            review_parts.append("\n--- DIFF ---\n")
+            review_parts.append(diff)
+    
+    return "\n".join(review_parts)
 
 
 def format_review_comment(gemini_output: str) -> str:
@@ -483,7 +692,6 @@ def format_review_comment(gemini_output: str) -> str:
 async def startup_event():
     """Initialize on startup"""
     logger.info("Starting GitLab MR Reviewer")
-    logger.info(f"GitLab URL: {GITLAB_URL}")
     logger.info(f"Webhook endpoint: http://7820.spikerwork.keenetic.pro/webhook")
     logger.info(f"Review language: {REVIEW_LANGUAGE}")
     logger.info(f"Telegram notifications: {'enabled' if TELEGRAM_ENABLED else 'disabled'}")
@@ -497,12 +705,26 @@ async def startup_event():
     if not HTTP_PROXY and not SOCKS_PROXY:
         logger.info("No proxy configured - using direct connection")
 
-    # Verify GitLab connection
-    try:
-        gl = get_gitlab_client()
-        logger.info("Successfully connected to GitLab")
-    except Exception as e:
-        logger.error(f"Failed to connect to GitLab: {e}")
+    # Log configured GitLab instances
+    if GITLAB_INSTANCES:
+        logger.info(f"Configured GitLab instances:")
+        for webhook_token, config in GITLAB_INSTANCES.items():
+            logger.info(f"  - {config['name']}: {config['url']} (webhook token: {webhook_token[:10]}...)")
+    else:
+        logger.warning("No GitLab instances configured!")
+    
+    # Verify GitLab connections
+    for webhook_token, config in GITLAB_INSTANCES.items():
+        try:
+            gl = get_gitlab_client(config)
+            logger.info(f"Successfully connected to GitLab instance {config['name']} ({config['url']})")
+        except Exception as e:
+            logger.error(f"Failed to connect to GitLab instance {config['name']}: {e}")
+            send_error_notification(
+                "gitlab_api_error",
+                f"Failed to connect to {config['url']}: {str(e)}",
+                {"gitlab_instance": config['name']}
+            )
 
 
 if __name__ == "__main__":

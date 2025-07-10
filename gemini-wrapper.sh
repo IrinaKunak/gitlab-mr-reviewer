@@ -128,10 +128,10 @@ analyze_diff() {
         return 1
     fi
     
-    # Check file size (max 500KB for diffs)
+    # Check file size (max 1MB for review content with files)
     local file_size=$(stat -c%s "$diff_file" 2>/dev/null || stat -f%z "$diff_file" 2>/dev/null || echo "0")
-    if [ "$file_size" -gt 512000 ]; then
-        error "Diff file too large: ${file_size} bytes (max 500KB)"
+    if [ "$file_size" -gt 1048576 ]; then
+        error "Review content too large: ${file_size} bytes (max 1MB)"
         echo "The merge request is too large to analyze automatically. Please break it into smaller changes."
         return 1
     fi
@@ -155,14 +155,14 @@ analyze_diff() {
     # Rate limiting
     enforce_rate_limit
     
-    # Create a temporary file with context and diff
+    # Create a temporary file with context and content
     local temp_file=$(mktemp)
     cat > "$temp_file" << EOF
-Please review the following merge request diff:
+Please review the following merge request. I'm providing both the current file contents and the diffs to help you understand the context better.
 
 ${SELECTED_PROMPT}
 
-===== DIFF CONTENT =====
+===== MERGE REQUEST CONTENT =====
 $(cat "$diff_file")
 EOF
     
