@@ -261,7 +261,6 @@ When errors occur, Telegram notifications include:
 
 📝 Future Improvements:
 - Add unit tests
-- Create Docker deployment
 - Add metrics/monitoring
 - Support for multiple prompts
 - Web UI for configuration
@@ -269,7 +268,8 @@ When errors occur, Telegram notifications include:
 - Additional language support (beyond English/Russian)
 - Custom review templates
 - Performance optimization for large diffs
-- Webhook authentication improvements
-- Telegram notification customization
-- Multiple Telegram channels support
 - Advanced conflict resolution suggestions
+- **Docker Swarm/Kubernetes deployment guides**
+- **Custom notification templates**
+- **Metrics and monitoring dashboard**
+- **Backup and restore functionality**

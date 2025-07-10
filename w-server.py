@@ -25,7 +25,15 @@ GEMINI_PROMPT_RU = os.getenv("GEMINI_PROMPT_RU",
 REVIEW_LANGUAGE = os.getenv("REVIEW_LANGUAGE", "en")
 TELEGRAM_ENABLED = os.getenv("TELEGRAM", "off").lower() == "on"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Support multiple Telegram channels
+TELEGRAM_CHAT_IDS = []
+if os.getenv("TELEGRAM_CHAT_ID"):
+    TELEGRAM_CHAT_IDS.append(os.getenv("TELEGRAM_CHAT_ID"))
+for i in range(1, 11):  # Support up to 10 additional channels
+    chat_id = os.getenv(f"TELEGRAM_CHAT_ID_{i}")
+    if chat_id:
+        TELEGRAM_CHAT_IDS.append(chat_id)
+
 REVIEW_FOR_CONFLICT = os.getenv("REVIEW_FOR_CONFLICT", "false").lower() == "true"
 
 # Multi-instance GitLab configuration
@@ -118,48 +126,53 @@ def get_gitlab_client(gitlab_config: Dict[str, str]):
 
 
 def send_telegram_notification(message: str, is_error: bool = False) -> bool:
-    """Send notification to Telegram"""
-    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    """Send notification to all configured Telegram channels"""
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
         logger.debug("Telegram notifications disabled or not configured")
         return False
     
-    try:
-        # Add error prefix if it's an error notification
-        if is_error:
-            error_prefix = "🚨 **ERROR** 🚨\n" if REVIEW_LANGUAGE == "en" else "🚨 **ОШИБКА** 🚨\n"
-            message = error_prefix + message
-        
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }
-        
-        # Use proxy if configured
-        proxies = None
-        if HTTP_PROXY:
-            proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
-        elif SOCKS_PROXY:
-            # For SOCKS proxy with requests, we need to use requests[socks]
-            try:
-                import socks
-                import urllib3.contrib.socks
-                proxy_host, proxy_port = SOCKS_PROXY.split(':')
-                proxies = {"http": f"socks5://{proxy_host}:{proxy_port}", "https": f"socks5://{proxy_host}:{proxy_port}"}
-            except ImportError:
-                logger.warning("PySocks not available for Telegram SOCKS proxy")
-        
-        response = requests.post(url, json=data, proxies=proxies, timeout=10)
-        response.raise_for_status()
-        
-        logger.debug(f"Telegram notification sent successfully")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to send Telegram notification: {e}")
-        return False
+    success_count = 0
+    
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            # Add error prefix if it's an error notification
+            formatted_message = message
+            if is_error:
+                error_prefix = "🚨 **ERROR** 🚨\n" if REVIEW_LANGUAGE == "en" else "🚨 **ОШИБКА** 🚨\n"
+                formatted_message = error_prefix + message
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": formatted_message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            }
+            
+            # Use proxy if configured
+            proxies = None
+            if HTTP_PROXY:
+                proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
+            elif SOCKS_PROXY:
+                # For SOCKS proxy with requests, we need to use requests[socks]
+                try:
+                    import socks
+                    import urllib3.contrib.socks
+                    proxy_host, proxy_port = SOCKS_PROXY.split(':')
+                    proxies = {"http": f"socks5://{proxy_host}:{proxy_port}", "https": f"socks5://{proxy_host}:{proxy_port}"}
+                except ImportError:
+                    logger.warning("PySocks not available for Telegram SOCKS proxy")
+            
+            response = requests.post(url, json=data, proxies=proxies, timeout=10)
+            response.raise_for_status()
+            
+            logger.debug(f"Telegram notification sent successfully to chat {chat_id}")
+            success_count += 1
+            
+        except Exception as e:
+            logger.error(f"Failed to send Telegram notification to chat {chat_id}: {e}")
+    
+    return success_count > 0
 
 
 def send_error_notification(error_type: str, error_details: str, context: Dict[str, Any] = None) -> bool:
@@ -206,7 +219,7 @@ def send_error_notification(error_type: str, error_details: str, context: Dict[s
     return send_telegram_notification(message, is_error=True)
 
 
-def format_telegram_message(mr_data: Dict[str, Any], project_name: str, has_conflicts: bool = False, review_content: str = None) -> str:
+def format_telegram_message(mr_data: Dict[str, Any], project_name: str, has_conflicts: bool = False, review_content: str = None, gitlab_instance: str = None) -> str:
     """Format message for Telegram notification"""
     # Status and emoji based on conflict and review state
     if has_conflicts:
@@ -216,9 +229,19 @@ def format_telegram_message(mr_data: Dict[str, Any], project_name: str, has_conf
         status_emoji = "✅"
         status_text = "New MR" if REVIEW_LANGUAGE == "en" else "Новый MR"
     
+    # Get instance info
+    instance_info = ""
+    if gitlab_instance:
+        instance_parts = gitlab_instance.split('://')
+        if len(instance_parts) > 1:
+            instance_domain = instance_parts[1].rstrip('/')
+        else:
+            instance_domain = gitlab_instance
+        instance_info = f" from `{instance_domain}`"
+    
     # Build message header
     message_parts = [
-        f"{status_emoji} **{status_text}**",
+        f"{status_emoji} **{status_text}{instance_info}**",
         f"**Project:** `{project_name}`",
         f"**Author:** {mr_data['author']}",
         f"**Title:** {mr_data['title']}",
@@ -271,7 +294,7 @@ def check_merge_conflicts(mr) -> bool:
 
 @app.get("/")
 async def root():
-    return {"status": "GitLab MR Reviewer is running", "version": "1.0.0"}
+    return {"status": "GitLab MR Reviewer is running", "version": "1.0.2"}
 
 
 @app.post("/webhook")
@@ -415,7 +438,7 @@ async def process_quality_check(mr_data: Dict[str, Any]):
         logger.info(f"MR !{mr.iid} has conflicts: {has_conflicts}")
 
         # Send initial Telegram notification
-        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts)
+        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts, gitlab_instance=gitlab_config['url'])
         send_telegram_notification(telegram_message)
         
         # Skip review if conflicts and REVIEW_FOR_CONFLICT is False
@@ -501,7 +524,7 @@ async def process_quality_check(mr_data: Dict[str, Any]):
                     
                     # Send Telegram notification with review content
                     if TELEGRAM_ENABLED:
-                        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts, result.stdout)
+                        telegram_message = format_telegram_message(mr_data, project.path_with_namespace, has_conflicts, result.stdout, gitlab_config['url'])
                         send_telegram_notification(telegram_message)
                         
                 except Exception as e:
@@ -694,7 +717,12 @@ async def startup_event():
     logger.info("Starting GitLab MR Reviewer")
     logger.info(f"Webhook endpoint: http://7820.spikerwork.keenetic.pro/webhook")
     logger.info(f"Review language: {REVIEW_LANGUAGE}")
-    logger.info(f"Telegram notifications: {'enabled' if TELEGRAM_ENABLED else 'disabled'}")
+    if TELEGRAM_ENABLED:
+        logger.info(f"Telegram notifications: enabled for {len(TELEGRAM_CHAT_IDS)} channel(s)")
+        for i, chat_id in enumerate(TELEGRAM_CHAT_IDS):
+            logger.info(f"  - Channel {i+1}: {chat_id}")
+    else:
+        logger.info("Telegram notifications: disabled")
     logger.info(f"Review for conflicts: {'enabled' if REVIEW_FOR_CONFLICT else 'disabled'}")
     
     # Log proxy configuration

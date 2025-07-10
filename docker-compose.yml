@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  gitlab-mr-reviewer:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      # GitLab Configuration
+      - GITLAB_URL=${GITLAB_URL}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      - XGITLABTOKEN=${XGITLABTOKEN}
+      
+      # Additional GitLab Instances
+      - GITLAB_URL_2=${GITLAB_URL_2:-}
+      - GITLAB_TOKEN_2=${GITLAB_TOKEN_2:-}
+      - XGITLABTOKEN_2=${XGITLABTOKEN_2:-}
+      
+      # Telegram Configuration
+      - TELEGRAM=${TELEGRAM:-off}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_CHAT_ID_2=${TELEGRAM_CHAT_ID_2:-}
+      - TELEGRAM_CHAT_ID_3=${TELEGRAM_CHAT_ID_3:-}
+      
+      # Proxy Configuration
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - SOCKS_PROXY=${SOCKS_PROXY:-}
+      
+      # Review Configuration
+      - REVIEW_LANGUAGE=${REVIEW_LANGUAGE:-en}
+      - REVIEW_FOR_CONFLICT=${REVIEW_FOR_CONFLICT:-false}
+      - GEMINI_PROMPT=${GEMINI_PROMPT:-}
+      - GEMINI_PROMPT_RU=${GEMINI_PROMPT_RU:-}
+      
+      # Debug Configuration
+      - DEBUG=${DEBUG:-false}
+      - GEMINI_DEBUG=${GEMINI_DEBUG:-false}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      
+    volumes:
+      # Mount .env file if it exists
+      - ./.env:/app/.env:ro
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      # Mount cache directory for Gemini cache
+      - ./cache:/app/cache
+      
+    restart: unless-stopped
+    
+    networks:
+      - gitlab-reviewer-network
+      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  gitlab-reviewer-network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
+  cache:
+    driver: local

@@ -7,6 +7,11 @@ GEMINI_TIMEOUT="${GEMINI_TIMEOUT:-60}"        # 60 seconds
 GEMINI_RATE_LIMIT="${GEMINI_RATE_LIMIT:-2}"   # 2 seconds between calls
 GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
 
+# Debug logging configuration
+GEMINI_DEBUG="${GEMINI_DEBUG:-false}"
+GEMINI_LOG_DIR="${GEMINI_LOG_DIR:-$HOME/.gitlab-mr-reviewer/logs}"
+GEMINI_LOG_FILE="$GEMINI_LOG_DIR/gemini-debug.log"
+
 # Load prompts from environment or use defaults
 REVIEW_LANGUAGE="${REVIEW_LANGUAGE:-en}"
 GEMINI_PROMPT="${GEMINI_PROMPT:-Review this code change and provide:
@@ -54,9 +59,48 @@ debug() {
     fi
 }
 
+# Gemini-specific debug logging
+gemini_debug() {
+    if [ "$GEMINI_DEBUG" = "true" ]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] GEMINI-DEBUG: $1" >&2
+        if [ -n "$GEMINI_LOG_FILE" ]; then
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] GEMINI-DEBUG: $1" >> "$GEMINI_LOG_FILE"
+        fi
+    fi
+}
+
+# Log request/response to separate debug file
+log_gemini_request() {
+    local content="$1"
+    if [ "$GEMINI_DEBUG" = "true" ] && [ -n "$GEMINI_LOG_FILE" ]; then
+        echo "" >> "$GEMINI_LOG_FILE"
+        echo "================== GEMINI REQUEST $(date +'%Y-%m-%d %H:%M:%S') ==================" >> "$GEMINI_LOG_FILE"
+        echo "MODEL: $GEMINI_MODEL" >> "$GEMINI_LOG_FILE"
+        echo "CONTENT LENGTH: $(echo "$content" | wc -c) characters" >> "$GEMINI_LOG_FILE"
+        echo "CONTENT:" >> "$GEMINI_LOG_FILE"
+        echo "$content" >> "$GEMINI_LOG_FILE"
+        echo "=================================================================" >> "$GEMINI_LOG_FILE"
+    fi
+}
+
+log_gemini_response() {
+    local response="$1"
+    local exit_code="$2"
+    if [ "$GEMINI_DEBUG" = "true" ] && [ -n "$GEMINI_LOG_FILE" ]; then
+        echo "" >> "$GEMINI_LOG_FILE"
+        echo "================== GEMINI RESPONSE $(date +'%Y-%m-%d %H:%M:%S') ==================" >> "$GEMINI_LOG_FILE"
+        echo "EXIT CODE: $exit_code" >> "$GEMINI_LOG_FILE"
+        echo "RESPONSE LENGTH: $(echo "$response" | wc -c) characters" >> "$GEMINI_LOG_FILE"
+        echo "RESPONSE:" >> "$GEMINI_LOG_FILE"
+        echo "$response" >> "$GEMINI_LOG_FILE"
+        echo "===================================================================" >> "$GEMINI_LOG_FILE"
+    fi
+}
+
 # Initialize
 init_gemini_wrapper() {
     mkdir -p "$GEMINI_CACHE_DIR"
+    mkdir -p "$GEMINI_LOG_DIR"
     
     # Test if Gemini is available
     if ! command -v gemini >/dev/null 2>&1; then
@@ -67,6 +111,7 @@ init_gemini_wrapper() {
     log "Gemini wrapper initialized"
     debug "Cache directory: $GEMINI_CACHE_DIR"
     debug "Using model: $GEMINI_MODEL"
+    gemini_debug "Debug logging enabled, log file: $GEMINI_LOG_FILE"
     return 0
 }
 
@@ -157,19 +202,24 @@ analyze_diff() {
     
     # Create a temporary file with context and content
     local temp_file=$(mktemp)
-    cat > "$temp_file" << EOF
-Please review the following merge request. I'm providing both the current file contents and the diffs to help you understand the context better.
+    local request_content="Please review the following merge request. I'm providing both the current file contents and the diffs to help you understand the context better.
 
 ${SELECTED_PROMPT}
 
 ===== MERGE REQUEST CONTENT =====
-$(cat "$diff_file")
-EOF
+$(cat "$diff_file")"
+    
+    echo "$request_content" > "$temp_file"
+    
+    # Log the request if debug is enabled
+    log_gemini_request "$request_content"
     
     # Call Gemini with -p parameter
     log "Calling Gemini for code review"
     debug "Gemini command: gemini -m $GEMINI_MODEL -p \"[content from temp file]\""
-    debug "Temp file content (first 500 chars): $(head -c 500 "$temp_file")"
+    gemini_debug "Request content length: $(echo "$request_content" | wc -c) characters"
+    gemini_debug "Temp file: $temp_file"
+    
     local gemini_result=""
     local gemini_exit_code=0
     
@@ -182,6 +232,9 @@ EOF
         gemini_exit_code=$?
     fi
     
+    # Log the response if debug is enabled
+    log_gemini_response "$gemini_result" "$gemini_exit_code"
+    
     # Clean up temp file
     rm -f "$temp_file"
     
@@ -190,15 +243,19 @@ EOF
         # Cache successful response
         echo "$gemini_result" > "$cache_file"
         log "Gemini analysis completed successfully"
+        gemini_debug "Response length: $(echo "$gemini_result" | wc -c) characters"
         echo "$gemini_result"
         return 0
     elif [ "$gemini_exit_code" -eq 124 ]; then
         error "Gemini call timed out after ${GEMINI_TIMEOUT}s"
+        gemini_debug "Timeout occurred after ${GEMINI_TIMEOUT}s"
         echo "The analysis timed out. The changes might be too complex to analyze within the time limit."
         return 1
     else
         error "Gemini call failed (exit code: $gemini_exit_code)"
         error "Output: $gemini_result"
+        gemini_debug "Gemini failed with exit code $gemini_exit_code"
+        gemini_debug "Error output: $gemini_result"
         echo "Failed to analyze the merge request. Please check the logs for details."
         return 1
     fi
