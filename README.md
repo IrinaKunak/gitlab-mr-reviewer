@@ -12,6 +12,8 @@ A comprehensive GitLab Merge Request reviewer service that provides automated co
 - 🌐 **Proxy Support** - HTTP/SOCKS proxy compatibility
 - 🔒 **Security Focus** - Identifies security vulnerabilities and best practices
 - 🌍 **Multi-Language** - English and Russian support
+- 🔧 **Bulk Webhook Management** - Automated webhook setup for all projects
+- 🧪 **Testing Utilities** - Comprehensive webhook and integration testing
 
 ## 🚀 Quick Start
 
@@ -88,12 +90,37 @@ SOCKS_PROXY=proxy.example.com:1080
 
 ## 🔧 Webhook Setup
 
+### Manual Setup
 Configure webhooks in each GitLab instance:
 
 1. Go to Project Settings > Webhooks
-2. URL: `http://your-server:5000/webhook`
+2. URL: `https://r.smysl.pro/webhook`
 3. Secret Token: Use the corresponding `XGITLABTOKEN` value
 4. Triggers: ✅ Merge request events
+
+### Automated Bulk Setup
+Use the bulk webhook management script:
+
+```bash
+# Preview what webhooks would be added
+python add_webhooks_to_all_projects.py --dry-run
+
+# Add webhooks to all projects in all instances
+python add_webhooks_to_all_projects.py
+
+# Add webhooks to specific instance only
+python add_webhooks_to_all_projects.py --instance primary
+
+# Test webhook endpoint connectivity
+python add_webhooks_to_all_projects.py --test-endpoint
+```
+
+**Features:**
+- ✅ Adds webhooks to all projects across multiple GitLab instances
+- ✅ Detects and skips existing webhooks
+- ✅ Supports proxy configurations
+- ✅ Provides detailed progress and error reporting
+- ✅ Includes dry-run mode for safe testing
 
 ## 📊 Features Overview
 
@@ -158,6 +185,13 @@ python create_test_mr_multi.py
 
 # Test Docker features
 python test_docker_features.py
+
+# Add webhooks to all projects (bulk setup)
+python add_webhooks_to_all_projects.py --dry-run
+python add_webhooks_to_all_projects.py
+
+# Test webhook integration end-to-end
+python test_webhooks.py
 ```
 
 ### Debug Mode
@@ -216,7 +250,22 @@ curl -X POST -H "Content-Type: application/json" \
   -H "X-Gitlab-Event: Merge Request Hook" \
   -H "X-Gitlab-Token: your_webhook_token" \
   -d '{"test": "data"}' \
-  http://localhost:5000/webhook
+  https://r.smysl.pro/webhook
+
+# Test with actual merge requests
+python test_webhooks.py
+
+# Check webhook configuration
+python add_webhooks_to_all_projects.py --dry-run
+```
+
+#### Permission Issues
+```bash
+# If bulk webhook setup fails with permission errors
+# Ensure your GitLab tokens have:
+# - Maintainer/Owner role on projects
+# - API access enabled
+# - Webhook creation permissions
 ```
 
 ## 📞 Support
@@ -226,7 +275,29 @@ For issues and questions:
 - Review the configuration in CLAUDE.md
 - Verify Docker container health: `docker ps | grep gitlab-mr-reviewer`
 - Test Gemini CLI: `docker exec <container> gemini -p "test"`
+- Run webhook tests: `python test_webhooks.py`
+- Check webhook setup: `python add_webhooks_to_all_projects.py --dry-run`
 - Create an issue in the repository
+
+## 🧪 Testing
+
+The project includes comprehensive testing utilities:
+
+### Test Repositories
+- **Primary Instance**: `spikerwork/test-repo` (https://lab.smysl.pro)
+- **Secondary Instance**: `gitlab-instance-0d55f60d/max-test` (https://lab.catzwolf.ru)
+
+### Test Workflow
+1. Run `python test_webhooks.py` to create test merge requests
+2. Check GitLab projects for AI code review comments
+3. Verify Telegram notifications are received
+4. Confirm multi-instance routing works correctly
+
+### Webhook Management
+- **Bulk Setup**: `python add_webhooks_to_all_projects.py`
+- **Test Connectivity**: `python add_webhooks_to_all_projects.py --test-endpoint`
+- **Dry Run**: `python add_webhooks_to_all_projects.py --dry-run`
+- **Instance Specific**: `python add_webhooks_to_all_projects.py --instance primary`
 
 ---
 

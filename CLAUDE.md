@@ -58,6 +58,13 @@ python create_test_mr.py
 
 # Test Docker features
 python test_docker_features.py
+
+# Add webhooks to all projects in GitLab instances
+python add_webhooks_to_all_projects.py --dry-run  # Preview changes
+python add_webhooks_to_all_projects.py  # Add webhooks to all instances
+
+# Test webhook functionality with test MRs
+python test_webhooks.py
 ```
 
 ## Environment Configuration
@@ -145,7 +152,7 @@ The application supports multiple GitLab instances and requires a `.env` file:
 
 The webhook endpoint is available at:
 - Local: `http://localhost:5000/webhook`
-- External: `http://7820.spikerwork.keenetic.pro/webhook`
+- External: `https://r.smysl.pro/webhook`
 
 ### Multi-Instance Setup
 1. For each GitLab instance, configure webhook in project settings:
@@ -344,6 +351,8 @@ docker exec gitlab-mr-reviewer-test cat /app/.env
 - **Permission fixes** for Docker container Gemini CLI access
 - **Caching system** for Gemini responses
 - **Health checks** and container monitoring
+- **Bulk webhook management** for adding webhooks to all projects across instances
+- **Webhook testing utilities** for verifying integration functionality
 
 📝 Future Improvements:
 - Add unit tests
@@ -362,3 +371,79 @@ docker exec gitlab-mr-reviewer-test cat /app/.env
 - **Automated testing pipeline**
 - **Container orchestration examples**
 - **Scalability improvements**
+
+## Webhook Management
+
+### Bulk Webhook Setup
+
+The project includes a comprehensive script to add webhooks to all projects across multiple GitLab instances:
+
+```bash
+# Add webhooks to all projects in all instances
+python add_webhooks_to_all_projects.py
+
+# Preview what would be done (dry run)
+python add_webhooks_to_all_projects.py --dry-run
+
+# Add webhooks to specific instance only
+python add_webhooks_to_all_projects.py --instance primary
+python add_webhooks_to_all_projects.py --instance instance_2
+
+# Test webhook endpoint connectivity
+python add_webhooks_to_all_projects.py --test-endpoint
+```
+
+### Webhook Script Features
+- **Multi-Instance Support**: Automatically configures webhooks for all GitLab instances
+- **Duplicate Detection**: Checks for existing webhooks to avoid duplicates
+- **Proxy Support**: Uses configured HTTP/SOCKS proxy settings
+- **Error Handling**: Detailed logging and error reporting
+- **Progress Tracking**: Real-time progress with success/failure counts
+- **Dry Run Mode**: Preview changes without making actual modifications
+- **Instance Filtering**: Target specific GitLab instances
+
+### Testing Webhook Integration
+
+Use the webhook test script to verify functionality:
+
+```bash
+# Create test merge requests in configured test repositories
+python test_webhooks.py
+```
+
+This script:
+- Creates test branches with sample code
+- Opens merge requests in test repositories
+- Triggers webhook processing
+- Allows verification of:
+  - Webhook reception
+  - AI code reviews
+  - Telegram notifications
+  - Multi-instance routing
+
+### Webhook Configuration Requirements
+
+For each GitLab instance:
+1. **Project Access**: Token must have sufficient permissions to:
+   - List all projects
+   - Create webhooks
+   - Read project details
+
+2. **Webhook Settings**:
+   - URL: `https://r.smysl.pro/webhook`
+   - Secret Token: Corresponding `XGITLABTOKEN` value
+   - Triggers: Merge request events only
+   - SSL Verification: Enabled
+
+3. **Permission Requirements**:
+   - **Maintainer** or **Owner** role on projects
+   - **Developer** role minimum for webhook creation
+   - **API access** enabled for the token
+
+### Test Repositories
+
+The following test repositories are configured for webhook testing:
+- **Primary Instance**: `spikerwork/test-repo` (https://lab.smysl.pro)
+- **Secondary Instance**: `gitlab-instance-0d55f60d/max-test` (https://lab.catzwolf.ru)
+
+Both repositories have webhooks configured and can be used to test the complete workflow.
