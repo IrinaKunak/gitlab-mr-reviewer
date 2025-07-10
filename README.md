@@ -121,22 +121,29 @@ Configure webhooks in each GitLab instance:
 ## 🐳 Docker Features
 
 - **Base Image**: Node.js 20 with Python 3.11
-- **Security**: Non-root user execution
+- **Security**: Non-root user execution with proper permissions
 - **Health Checks**: Built-in container health monitoring
 - **Volumes**: Persistent logs and cache storage
 - **Auto-reload**: Environment changes require rebuild
+- **Gemini CLI**: Properly configured with permission fixes
+- **Permission Management**: Automated creation of required directories
 
 ## 🔍 Monitoring
 
 ### Logs
 - **Application**: Standard uvicorn/FastAPI logs
 - **Gemini Debug**: `/app/logs/gemini-debug.log` (when `GEMINI_DEBUG=true`)
-- **Docker**: `docker logs gitlab-mr-reviewer`
+- **Docker**: `docker logs gitlab-mr-reviewer-test`
+- **Cache**: `/app/cache/` directory for Gemini response caching
 
 ### Health Check
 ```bash
 curl http://localhost:5000/
-# Response: {"status":"GitLab MR Reviewer is running","version":"1.0.0"}
+# Response: {"status":"GitLab MR Reviewer is running","version":"1.0.2"}
+
+# Docker container health
+docker ps | grep gitlab-mr-reviewer
+# Should show "healthy" status
 ```
 
 ## 🛠️ Development
@@ -159,7 +166,10 @@ python test_docker_features.py
 export DEBUG=true
 export GEMINI_DEBUG=true
 
-# Check debug logs
+# Check debug logs (Docker)
+docker exec gitlab-mr-reviewer-test tail -f /app/logs/gemini-debug.log
+
+# Check debug logs (local)
 tail -f logs/gemini-debug.log
 ```
 
@@ -175,11 +185,47 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 4. Test thoroughly
 5. Submit a pull request
 
+## 🔧 Troubleshooting
+
+### Common Issues
+
+#### Gemini CLI Permission Errors
+If you see `EACCES: permission denied, mkdir '/home/appuser/.gemini'`:
+```bash
+# This is fixed in the latest Docker image
+docker pull gitlab-mr-reviewer:latest
+docker stop gitlab-mr-reviewer-test
+docker rm gitlab-mr-reviewer-test
+docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
+```
+
+#### Container Health Issues
+```bash
+# Check container status
+docker ps | grep gitlab-mr-reviewer
+docker logs gitlab-mr-reviewer-test
+
+# Test Gemini CLI inside container
+docker exec gitlab-mr-reviewer-test gemini -p "test"
+```
+
+#### Webhook Not Working
+```bash
+# Verify webhook endpoint
+curl -X POST -H "Content-Type: application/json" \
+  -H "X-Gitlab-Event: Merge Request Hook" \
+  -H "X-Gitlab-Token: your_webhook_token" \
+  -d '{"test": "data"}' \
+  http://localhost:5000/webhook
+```
+
 ## 📞 Support
 
 For issues and questions:
-- Check the logs in `/app/logs/`
+- Check the logs in `/app/logs/` (Docker) or `logs/` (local)
 - Review the configuration in CLAUDE.md
+- Verify Docker container health: `docker ps | grep gitlab-mr-reviewer`
+- Test Gemini CLI: `docker exec <container> gemini -p "test"`
 - Create an issue in the repository
 
 ---

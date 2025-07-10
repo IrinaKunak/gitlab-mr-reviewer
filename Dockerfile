@@ -39,9 +39,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p /app/logs /app/cache && \
-    chown -R appuser:appuser /app
+# Create necessary directories including Gemini CLI config directory
+RUN mkdir -p /app/logs /app/cache /home/appuser/.gemini && \
+    chown -R appuser:appuser /app /home/appuser/.gemini
 
 # Make scripts executable
 RUN chmod +x gemini-wrapper.sh

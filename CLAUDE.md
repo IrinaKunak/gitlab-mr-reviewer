@@ -15,16 +15,30 @@ The project consists of:
 
 ## Development Commands
 
-### Install Dependencies
+### Docker Deployment (Recommended)
+```bash
+# Build and run Docker container
+docker build -t gitlab-mr-reviewer .
+docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
+
+# Using docker-compose
+docker-compose up -d
+
+# Check container status
+docker ps | grep gitlab-mr-reviewer
+docker logs gitlab-mr-reviewer-test
+```
+
+### Local Development
 ```bash
 # Use existing virtual environment
 source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-### Run the Server
-```bash
-source .venv/bin/activate
+# Install Gemini CLI (requires Node.js 20+)
+npm install -g @google/gemini-cli
+
+# Run the server
 DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
 
 # Run with logging to file
@@ -41,6 +55,9 @@ python test_gitlab_connection.py
 
 # Create a test merge request
 python create_test_mr.py
+
+# Test Docker features
+python test_docker_features.py
 ```
 
 ## Environment Configuration
@@ -59,13 +76,16 @@ The application supports multiple GitLab instances and requires a `.env` file:
 - ... (continue pattern for _3, _4, etc.)
 
 ### Other Configuration
+- `GEMINI_API_KEY`: Gemini API key for authentication (required)
+- `GEMINI_DEBUG`: Enable debug logging for Gemini wrapper - "true" or "false" (default: false)
 - `GEMINI_PROMPT`: Custom prompt for Gemini AI reviews (optional)
 - `GEMINI_PROMPT_RU`: Russian language prompt for Gemini AI reviews (optional)
 - `REVIEW_LANGUAGE`: Language for reviews - "en" for English, "ru" for Russian (default: en)
-- `HTTP_PROXY`: HTTP proxy URL (e.g., http://127.0.0.1:8181) (optional)
-- `SOCKS_PROXY`: SOCKS proxy address (e.g., 127.0.0.1:8180) (optional)
+- `HTTP_PROXY`: HTTP proxy URL (e.g., http://192.168.193.10:8181) (optional)
+- `SOCKS_PROXY`: SOCKS proxy address (e.g., 192.168.193.10:8180) (optional)
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token for notifications (optional)
-- `TELEGRAM_CHAT_ID`: Telegram chat ID for notifications (optional)
+- `TELEGRAM_CHAT_ID`: Primary Telegram chat ID for notifications (optional)
+- `TELEGRAM_CHAT_ID_1` through `TELEGRAM_CHAT_ID_10`: Additional Telegram channels (optional)
 - `TELEGRAM`: Enable/disable Telegram notifications - "on" or "off" (default: off)
 - `REVIEW_FOR_CONFLICT`: Whether to review MRs with conflicts - "true" or "false" (default: false)
 
@@ -204,11 +224,21 @@ REVIEW_FOR_CONFLICT=true   # Enable reviews for MRs with conflicts
 REVIEW_FOR_CONFLICT=false  # Skip reviews for conflicted MRs (default)
 ```
 
+### Multiple Telegram Channels
+```env
+TELEGRAM_CHAT_ID=-1234567890    # Primary channel
+TELEGRAM_CHAT_ID_1=123456789    # Additional channel 1
+TELEGRAM_CHAT_ID_2=987654321    # Additional channel 2
+# ... up to TELEGRAM_CHAT_ID_10
+```
+
 ### Features
 - **Status Indicators**: ✅ for normal MRs, ⚠️ for conflicts
 - **Conflict Warnings**: 🚫 BLOCKED messages when conflicts detected
 - **Rich Formatting**: Markdown with project/author/branch details
 - **Review Integration**: Includes code review content or summary
+- **Instance Information**: Shows which GitLab instance the MR is from
+- **Multi-Channel Support**: Notify up to 10 different Telegram channels
 - **Proxy Support**: Uses same proxy configuration as GitLab API
 
 ## Monitoring
@@ -235,6 +265,55 @@ When errors occur, Telegram notifications include:
 - GitLab instance name
 - Timestamp of the error
 
+## Docker Deployment
+
+### Container Architecture
+- **Base Image**: Node.js 20 slim with Python 3.11
+- **User**: Non-root `appuser` with proper permissions
+- **Directories**: 
+  - `/app/` - Application code and virtual environment
+  - `/app/logs/` - Debug and application logs
+  - `/app/cache/` - Gemini response cache
+  - `/home/appuser/.gemini/` - Gemini CLI configuration
+
+### Key Docker Features
+- **Permission Management**: Automated creation of required directories with proper ownership
+- **Gemini CLI Integration**: NPM-installed Gemini CLI with permission fixes
+- **Health Checks**: Built-in container health monitoring
+- **Virtual Environment**: Isolated Python environment to avoid system conflicts
+- **Security**: Non-root user execution
+
+### Troubleshooting Docker Issues
+
+#### Permission Errors
+```bash
+# If you see Gemini CLI permission errors, rebuild with latest image
+docker build -t gitlab-mr-reviewer .
+docker stop gitlab-mr-reviewer-test
+docker rm gitlab-mr-reviewer-test
+docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
+```
+
+#### Container Health
+```bash
+# Check container status
+docker ps | grep gitlab-mr-reviewer
+docker logs gitlab-mr-reviewer-test
+
+# Test Gemini CLI inside container
+docker exec gitlab-mr-reviewer-test gemini -p "test prompt"
+
+# Check directory permissions
+docker exec gitlab-mr-reviewer-test ls -la /home/appuser/.gemini/
+docker exec gitlab-mr-reviewer-test ls -la /app/logs/
+```
+
+#### Environment Variables
+```bash
+# Verify configuration
+docker exec gitlab-mr-reviewer-test cat /app/.env
+```
+
 ## Current Implementation Status
 
 ✅ Complete:
@@ -258,6 +337,13 @@ When errors occur, Telegram notifications include:
 - Merge conflict detection and warnings
 - Configurable review behavior for conflicts
 - Proxy support for Telegram API calls
+- **Docker deployment** with Node.js 20 + Python virtual environment
+- **Multiple Telegram channels** support (up to 10 channels)
+- **Gemini debug logging** with separate log files
+- **GitLab instance information** in Telegram notifications
+- **Permission fixes** for Docker container Gemini CLI access
+- **Caching system** for Gemini responses
+- **Health checks** and container monitoring
 
 📝 Future Improvements:
 - Add unit tests
@@ -273,3 +359,6 @@ When errors occur, Telegram notifications include:
 - **Custom notification templates**
 - **Metrics and monitoring dashboard**
 - **Backup and restore functionality**
+- **Automated testing pipeline**
+- **Container orchestration examples**
+- **Scalability improvements**
