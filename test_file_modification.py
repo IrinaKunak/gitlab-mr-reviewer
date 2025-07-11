@@ -20,24 +20,21 @@ try:
     gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token, timeout=30)
     gl.auth()
     print("✅ Connected to GitLab")
-    
+
     project = gl.projects.get(132)
     print(f"✅ Using project: {project.path_with_namespace}")
-    
+
     # Create a test branch
     test_branch = f"test-modification-{int(time.time())}"
-    
+
     # Get latest commit
     commits = project.commits.list(ref_name="master", per_page=1, get_all=False)
     latest_commit = commits[0]
-    
+
     # Create branch
-    branch = project.branches.create({
-        'branch': test_branch,
-        'ref': latest_commit.id
-    })
+    branch = project.branches.create({"branch": test_branch, "ref": latest_commit.id})
     print(f"✅ Created branch: {test_branch}")
-    
+
     # First, create an initial file with original content
     original_content = """# Configuration Manager
 import os
@@ -80,19 +77,21 @@ if __name__ == "__main__":
     manager = ConfigManager()
     print(f"Database host: {manager.get('database_host')}")
 """
-    
+
     file_path = f"config_manager_{test_branch}.py"
-    project.files.create({
-        'file_path': file_path,
-        'branch': test_branch,
-        'content': original_content,
-        'commit_message': f'Add original config manager - {test_branch}'
-    })
+    project.files.create(
+        {
+            "file_path": file_path,
+            "branch": test_branch,
+            "content": original_content,
+            "commit_message": f"Add original config manager - {test_branch}",
+        }
+    )
     print(f"✅ Created original file: {file_path}")
-    
+
     # Wait a moment to ensure the file is committed
     time.sleep(2)
-    
+
     # Now modify the file with issues
     modified_content = """# Configuration Manager - Modified with Issues
 import os
@@ -165,19 +164,23 @@ if __name__ == "__main__":
     # BUG: No error handling for missing keys
     print(f"Missing key: {manager.config['nonexistent_key']}")
 """
-    
+
     # Update the file
     file = project.files.get(file_path, ref=test_branch)
     file.content = modified_content
-    file.save(branch=test_branch, commit_message=f'Add security vulnerabilities and bugs - {test_branch}')
+    file.save(
+        branch=test_branch,
+        commit_message=f"Add security vulnerabilities and bugs - {test_branch}",
+    )
     print(f"✅ Modified file with issues: {file_path}")
-    
+
     # Create MR
-    mr = project.mergerequests.create({
-        'source_branch': test_branch,
-        'target_branch': 'master',
-        'title': f'Enhanced Review Test - File Modification - {test_branch}',
-        'description': f'''This MR tests the enhanced review system with file modifications.
+    mr = project.mergerequests.create(
+        {
+            "source_branch": test_branch,
+            "target_branch": "master",
+            "title": f"Enhanced Review Test - File Modification - {test_branch}",
+            "description": f"""This MR tests the enhanced review system with file modifications.
 
 ## What was changed:
 1. **Modified existing file**: `{file_path}`
@@ -194,17 +197,19 @@ The review should include both:
 - **Original file content** for context
 - **Diff showing changes** 
 
-This tests the enhanced review feature that provides Gemini with full file context.'''
-    })
-    
+This tests the enhanced review feature that provides Gemini with full file context.""",
+        }
+    )
+
     print(f"✅ Created MR: !{mr.iid}")
     print(f"   URL: {mr.web_url}")
-    print(f"\n📝 This MR tests enhanced file review with:")
-    print(f"   1. Original file content as context")
-    print(f"   2. Diff showing the modifications")
-    print(f"   3. Multiple security and performance issues")
-    
+    print("\n📝 This MR tests enhanced file review with:")
+    print("   1. Original file content as context")
+    print("   2. Diff showing the modifications")
+    print("   3. Multiple security and performance issues")
+
 except Exception as e:
     print(f"❌ Error: {e}")
     import traceback
+
     traceback.print_exc()
