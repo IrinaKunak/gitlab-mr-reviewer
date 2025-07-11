@@ -20,24 +20,21 @@ try:
     gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token, timeout=30)
     gl.auth()
     print("✅ Connected to GitLab")
-    
+
     project = gl.projects.get(132)
     print(f"✅ Using project: {project.path_with_namespace}")
-    
+
     # Create a test branch
     test_branch = f"test-docker-features-{int(time.time())}"
-    
+
     # Get latest commit
     commits = project.commits.list(ref_name="master", per_page=1, get_all=False)
     latest_commit = commits[0]
-    
+
     # Create branch
-    branch = project.branches.create({
-        'branch': test_branch,
-        'ref': latest_commit.id
-    })
+    branch = project.branches.create({"branch": test_branch, "ref": latest_commit.id})
     print(f"✅ Created branch: {test_branch}")
-    
+
     # Create a test file with multiple issues for comprehensive testing
     test_content = """# Docker Feature Test File
 
@@ -100,22 +97,25 @@ def add_item(item, items_list=[]):
 # 4. Gemini debug logging
 print("This file tests all new Docker deployment features!")
 """
-    
+
     file_path = f"docker_test_{test_branch}.py"
-    project.files.create({
-        'file_path': file_path,
-        'branch': test_branch,
-        'content': test_content,
-        'commit_message': f'Add Docker feature test file - {test_branch}'
-    })
+    project.files.create(
+        {
+            "file_path": file_path,
+            "branch": test_branch,
+            "content": test_content,
+            "commit_message": f"Add Docker feature test file - {test_branch}",
+        }
+    )
     print(f"✅ Created test file: {file_path}")
-    
+
     # Create MR
-    mr = project.mergerequests.create({
-        'source_branch': test_branch,
-        'target_branch': 'master',
-        'title': f'🐳 Docker Feature Test - {test_branch}',
-        'description': f'''# Docker Deployment Feature Test
+    mr = project.mergerequests.create(
+        {
+            "source_branch": test_branch,
+            "target_branch": "master",
+            "title": f"🐳 Docker Feature Test - {test_branch}",
+            "description": f"""# Docker Deployment Feature Test
 
 This MR tests the new features implemented in the Docker deployment:
 
@@ -138,19 +138,21 @@ This MR tests the new features implemented in the Docker deployment:
 - Debug logs should capture request/response details
 
 **Container**: Running in Docker on port 5000
-**Instance**: {gitlab_url}'''
-    })
-    
+**Instance**: {gitlab_url}""",
+        }
+    )
+
     print(f"✅ Created MR: !{mr.iid}")
     print(f"   URL: {mr.web_url}")
-    print(f"\n🐳 Docker Feature Test Summary:")
-    print(f"   📦 Container: Running on port 5000")
-    print(f"   🔗 Instance: {gitlab_url}")  
-    print(f"   📱 Telegram: Should notify multiple channels")
-    print(f"   🧠 Gemini: Debug logging enabled")
-    print(f"   📄 Review: Enhanced with file context")
-    
+    print("\n🐳 Docker Feature Test Summary:")
+    print("   📦 Container: Running on port 5000")
+    print(f"   🔗 Instance: {gitlab_url}")
+    print("   📱 Telegram: Should notify multiple channels")
+    print("   🧠 Gemini: Debug logging enabled")
+    print("   📄 Review: Enhanced with file context")
+
 except Exception as e:
     print(f"❌ Error: {e}")
     import traceback
+
     traceback.print_exc()

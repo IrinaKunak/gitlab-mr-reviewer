@@ -6,7 +6,6 @@ in configured GitLab instances.
 
 import os
 import sys
-import json
 import logging
 import time
 from typing import Dict, List, Any, Optional
@@ -24,8 +23,7 @@ HTTP_PROXY = os.getenv("HTTP_PROXY")
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -42,7 +40,7 @@ def load_gitlab_instances() -> Dict[str, Dict[str, str]]:
                 "url": os.getenv("GITLAB_URL"),
                 "token": os.getenv("GITLAB_TOKEN"),
                 "webhook_token": webhook_token,
-                "name": "primary"
+                "name": "primary",
             }
 
     # Load additional instances (up to 10)
@@ -56,7 +54,7 @@ def load_gitlab_instances() -> Dict[str, Dict[str, str]]:
                 "url": os.getenv(url_key),
                 "token": os.getenv(token_key),
                 "webhook_token": os.getenv(webhook_key),
-                "name": f"instance_{i}"
+                "name": f"instance_{i}",
             }
 
     return instances
@@ -72,17 +70,14 @@ def get_gitlab_client(instance_config: Dict[str, str]) -> gitlab.Gitlab:
 
             if HTTP_PROXY:
                 logger.debug(f"Using HTTP proxy: {HTTP_PROXY}")
-                session.proxies = {
-                    'http': HTTP_PROXY,
-                    'https': HTTP_PROXY
-                }
+                session.proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
             elif SOCKS_PROXY:
                 logger.debug(f"Using SOCKS proxy: {SOCKS_PROXY}")
                 try:
                     import socks
                     import socket
 
-                    proxy_host, proxy_port = SOCKS_PROXY.split(':')
+                    proxy_host, proxy_port = SOCKS_PROXY.split(":")
                     socks.set_default_proxy(socks.SOCKS5, proxy_host, int(proxy_port))
                     socket.socket = socks.socksocket
                     logger.debug(f"SOCKS proxy configured: {proxy_host}:{proxy_port}")
@@ -91,11 +86,17 @@ def get_gitlab_client(instance_config: Dict[str, str]) -> gitlab.Gitlab:
                 except Exception as e:
                     logger.error(f"Failed to configure SOCKS proxy: {e}")
 
-        gl = gitlab.Gitlab(instance_config["url"], private_token=instance_config["token"], session=session)
+        gl = gitlab.Gitlab(
+            instance_config["url"],
+            private_token=instance_config["token"],
+            session=session,
+        )
         gl.auth()
         return gl
     except Exception as e:
-        logger.error(f"Failed to initialize GitLab client for {instance_config['name']}: {e}")
+        logger.error(
+            f"Failed to initialize GitLab client for {instance_config['name']}: {e}"
+        )
         raise
 
 
@@ -120,7 +121,9 @@ def check_existing_webhook(project, webhook_url: str) -> Optional[Any]:
                 return hook
         return None
     except Exception as e:
-        logger.debug(f"Failed to check existing webhooks for project {project.path_with_namespace}: {e}")
+        logger.debug(
+            f"Failed to check existing webhooks for project {project.path_with_namespace}: {e}"
+        )
         return None
 
 
@@ -130,34 +133,40 @@ def add_webhook_to_project(project, webhook_url: str, webhook_token: str) -> boo
         # Check if webhook already exists
         existing_hook = check_existing_webhook(project, webhook_url)
         if existing_hook:
-            logger.info(f"Webhook already exists for {project.path_with_namespace} (ID: {existing_hook.id})")
+            logger.info(
+                f"Webhook already exists for {project.path_with_namespace} (ID: {existing_hook.id})"
+            )
             return True
 
         # Create webhook
         hook_data = {
-            'url': webhook_url,
-            'merge_requests_events': True,
-            'push_events': False,
-            'issues_events': False,
-            'confidential_issues_events': False,
-            'tag_push_events': False,
-            'note_events': False,
-            'job_events': False,
-            'pipeline_events': False,
-            'wiki_page_events': False,
-            'deployment_events': False,
-            'releases_events': False,
-            'subgroup_events': False,
-            'enable_ssl_verification': True,
-            'token': webhook_token
+            "url": webhook_url,
+            "merge_requests_events": True,
+            "push_events": False,
+            "issues_events": False,
+            "confidential_issues_events": False,
+            "tag_push_events": False,
+            "note_events": False,
+            "job_events": False,
+            "pipeline_events": False,
+            "wiki_page_events": False,
+            "deployment_events": False,
+            "releases_events": False,
+            "subgroup_events": False,
+            "enable_ssl_verification": True,
+            "token": webhook_token,
         }
 
         hook = project.hooks.create(hook_data)
-        logger.info(f"✅ Added webhook to {project.path_with_namespace} (ID: {hook.id})")
+        logger.info(
+            f"✅ Added webhook to {project.path_with_namespace} (ID: {hook.id})"
+        )
         return True
 
     except gitlab.exceptions.GitlabCreateError as e:
-        logger.error(f"❌ Failed to create webhook for {project.path_with_namespace}: {e}")
+        logger.error(
+            f"❌ Failed to create webhook for {project.path_with_namespace}: {e}"
+        )
         return False
     except Exception as e:
         logger.error(f"❌ Error adding webhook to {project.path_with_namespace}: {e}")
@@ -175,26 +184,34 @@ def test_webhook_endpoint() -> bool:
             try:
                 import socks
                 import urllib3.contrib.socks
-                proxy_host, proxy_port = SOCKS_PROXY.split(':')
-                proxies = {"http": f"socks5://{proxy_host}:{proxy_port}",
-                           "https": f"socks5://{proxy_host}:{proxy_port}"}
+
+                proxy_host, proxy_port = SOCKS_PROXY.split(":")
+                proxies = {
+                    "http": f"socks5://{proxy_host}:{proxy_port}",
+                    "https": f"socks5://{proxy_host}:{proxy_port}",
+                }
             except ImportError:
                 logger.warning("PySocks not available for webhook endpoint test")
 
-        response = requests.get(WEBHOOK_ENDPOINT.replace('/webhook', '/'), proxies=proxies, timeout=10)
+        response = requests.get(
+            WEBHOOK_ENDPOINT.replace("/webhook", "/"), proxies=proxies, timeout=10
+        )
         if response.status_code == 200:
             logger.info(f"✅ Webhook endpoint is reachable: {WEBHOOK_ENDPOINT}")
             return True
         else:
-            logger.warning(f"⚠️ Webhook endpoint returned status {response.status_code}: {WEBHOOK_ENDPOINT}")
+            logger.warning(
+                f"⚠️ Webhook endpoint returned status {response.status_code}: {WEBHOOK_ENDPOINT}"
+            )
             return False
     except Exception as e:
         logger.error(f"❌ Failed to test webhook endpoint {WEBHOOK_ENDPOINT}: {e}")
         return False
 
 
-def process_gitlab_instance(instance_name: str, instance_config: Dict[str, str], dry_run: bool = False) -> Dict[
-    str, Any]:
+def process_gitlab_instance(
+    instance_name: str, instance_config: Dict[str, str], dry_run: bool = False
+) -> Dict[str, Any]:
     """Process all projects in a GitLab instance"""
     results = {
         "instance": instance_name,
@@ -203,11 +220,13 @@ def process_gitlab_instance(instance_name: str, instance_config: Dict[str, str],
         "successful_webhooks": 0,
         "failed_webhooks": 0,
         "existing_webhooks": 0,
-        "errors": []
+        "errors": [],
     }
 
     try:
-        logger.info(f"\n🔗 Processing GitLab instance: {instance_name} ({instance_config['url']})")
+        logger.info(
+            f"\n🔗 Processing GitLab instance: {instance_name} ({instance_config['url']})"
+        )
 
         # Get GitLab client
         gl = get_gitlab_client(instance_config)
@@ -226,7 +245,9 @@ def process_gitlab_instance(instance_name: str, instance_config: Dict[str, str],
                 logger.info(f"Processing project: {project.path_with_namespace}")
 
                 if dry_run:
-                    logger.info(f"[DRY RUN] Would add webhook to {project.path_with_namespace}")
+                    logger.info(
+                        f"[DRY RUN] Would add webhook to {project.path_with_namespace}"
+                    )
                     results["successful_webhooks"] += 1
                     continue
 
@@ -237,7 +258,9 @@ def process_gitlab_instance(instance_name: str, instance_config: Dict[str, str],
                     continue
 
                 # Add webhook
-                if add_webhook_to_project(project, WEBHOOK_ENDPOINT, instance_config["webhook_token"]):
+                if add_webhook_to_project(
+                    project, WEBHOOK_ENDPOINT, instance_config["webhook_token"]
+                ):
                     results["successful_webhooks"] += 1
                     # Small delay to avoid rate limiting
                     time.sleep(0.5)
@@ -245,7 +268,9 @@ def process_gitlab_instance(instance_name: str, instance_config: Dict[str, str],
                     results["failed_webhooks"] += 1
 
             except Exception as e:
-                error_msg = f"Error processing project {project.path_with_namespace}: {str(e)}"
+                error_msg = (
+                    f"Error processing project {project.path_with_namespace}: {str(e)}"
+                )
                 logger.error(error_msg)
                 results["errors"].append(error_msg)
                 results["failed_webhooks"] += 1
@@ -262,10 +287,22 @@ def main():
     """Main function"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Add webhooks to all projects in GitLab instances")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without actually doing it")
-    parser.add_argument("--test-endpoint", action="store_true", help="Test webhook endpoint reachability")
-    parser.add_argument("--instance", help="Process only specific instance (primary, instance_2, etc.)")
+    parser = argparse.ArgumentParser(
+        description="Add webhooks to all projects in GitLab instances"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without actually doing it",
+    )
+    parser.add_argument(
+        "--test-endpoint",
+        action="store_true",
+        help="Test webhook endpoint reachability",
+    )
+    parser.add_argument(
+        "--instance", help="Process only specific instance (primary, instance_2, etc.)"
+    )
     args = parser.parse_args()
 
     logger.info("🚀 GitLab Webhook Integration Script")
@@ -318,17 +355,17 @@ def main():
         logger.info(f"  Failed webhooks: {results['failed_webhooks']}")
         logger.info(f"  Existing webhooks: {results['existing_webhooks']}")
 
-        if results['errors']:
+        if results["errors"]:
             logger.info(f"  Errors: {len(results['errors'])}")
-            for error in results['errors']:
+            for error in results["errors"]:
                 logger.error(f"    - {error}")
 
-        total_projects += results['total_projects']
-        total_successful += results['successful_webhooks']
-        total_failed += results['failed_webhooks']
-        total_existing += results['existing_webhooks']
+        total_projects += results["total_projects"]
+        total_successful += results["successful_webhooks"]
+        total_failed += results["failed_webhooks"]
+        total_existing += results["existing_webhooks"]
 
-    logger.info(f"\n🎯 TOTAL ACROSS ALL INSTANCES:")
+    logger.info("\n🎯 TOTAL ACROSS ALL INSTANCES:")
     logger.info(f"  Total projects: {total_projects}")
     logger.info(f"  Successful webhooks: {total_successful}")
     logger.info(f"  Failed webhooks: {total_failed}")
