@@ -374,6 +374,12 @@ def parse_merge_request_webhook(payload: Dict[str, Any]) -> Optional[Dict[str, A
         object_attributes = payload["object_attributes"]
         project = payload["project"]
 
+        # Construct correct GitLab URL format (using merge_requests with underscores)
+        gitlab_url = object_attributes.get("url", "")
+        if "/-/mergerequests/" in gitlab_url:
+            # Fix the URL format to use merge_requests instead of mergerequests
+            gitlab_url = gitlab_url.replace("/-/mergerequests/", "/-/merge_requests/")
+        
         return {
             "project_id": project["id"],
             "project_path": project["path_with_namespace"],
@@ -385,7 +391,7 @@ def parse_merge_request_webhook(payload: Dict[str, Any]) -> Optional[Dict[str, A
             "description": object_attributes.get("description", ""),
             "author": payload["user"]["username"],
             "action": action,
-            "url": object_attributes["url"],
+            "url": gitlab_url,
             "last_commit": object_attributes.get("last_commit", {}).get("id")
         }
     except KeyError as e:
