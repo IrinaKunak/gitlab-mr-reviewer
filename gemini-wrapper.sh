@@ -225,10 +225,10 @@ $(cat "$diff_file")"
     
     # Use timeout command if available
     if command -v timeout >/dev/null 2>&1; then
-        gemini_result=$(timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" -p "$(cat "$temp_file")" 2>&1)
+        gemini_result=$(cat "$temp_file" | timeout "$GEMINI_TIMEOUT" gemini -m "$GEMINI_MODEL" -p "" 2>&1)
         gemini_exit_code=$?
     else
-        gemini_result=$(gemini -m "$GEMINI_MODEL" -p "$(cat "$temp_file")" 2>&1)
+        gemini_result=$(cat "$temp_file" | gemini -m "$GEMINI_MODEL" -p "" 2>&1)
         gemini_exit_code=$?
     fi
     
