@@ -125,13 +125,14 @@ The application supports multiple GitLab instances and requires a `.env` file:
 3. **Gemini Integration**:
    - Caches responses to avoid duplicate API calls (1-hour TTL)
    - Rate limiting (2 seconds between calls)
-   - Handles large review content (up to 1MB with file contents)
+   - Handles large review content (no size limit - uses stdin piping)
    - Timeout protection (60 seconds)
    - Uses gemini-2.5-flash model
    - Calls Gemini CLI with `-p` parameter for prompt input
    - Reviews include both diffs and original file content for better context
    - Multi-language support (English/Russian)
    - Language-specific prompts and responses
+   - **Large diff support**: Uses stdin piping to avoid "Argument list too long" errors
 
 4. **Network & Proxy Support**:
    - HTTP proxy support for GitLab API connections
@@ -364,6 +365,7 @@ docker exec gitlab-mr-reviewer-test cat /app/.env
 - **Code quality improvements** - All PyCharm warnings and highlights resolved
 - **URL format correction** - Automatic fix for GitLab merge request URLs
 - **Local testing tools** - Direct API testing capabilities
+- **Large diff handling** - Fixed "Argument list too long" error by using stdin piping
 
 📝 Future Improvements:
 - Add unit tests

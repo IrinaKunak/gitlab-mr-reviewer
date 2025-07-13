@@ -134,7 +134,7 @@ python add_webhooks_to_all_projects.py --test-endpoint
 ### Enhanced Code Reviews
 - Reviews include both diffs AND original file content
 - Better context for AI analysis
-- Handles up to 1MB of review content
+- Handles large diffs without size limits (uses stdin piping)
 - Identifies security vulnerabilities, performance issues, and code quality problems
 
 ### Multiple Telegram Channels
@@ -234,6 +234,12 @@ docker stop gitlab-mr-reviewer-test
 docker rm gitlab-mr-reviewer-test
 docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
 ```
+
+#### Large Diff Handling
+If you see `Argument list too long` error in Gemini wrapper:
+- This has been fixed in the latest version
+- The script now uses stdin piping instead of command-line arguments
+- No size limit for merge request diffs
 
 #### Container Health Issues
 ```bash
