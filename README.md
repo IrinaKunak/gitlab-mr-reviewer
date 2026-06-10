@@ -1,6 +1,13 @@
 # GitLab MR Reviewer 🚀
 
-A comprehensive GitLab Merge Request reviewer service that provides automated code quality analysis using Gemini AI, with multi-instance support, enhanced notifications, and Docker deployment.
+A comprehensive GitLab Merge Request reviewer service that provides automated code quality analysis, with multi-instance support, enhanced notifications, and Docker deployment.
+
+> **v2 (this branch):** reviews are powered by **Claude via Cloudflare AI Gateway** with an
+> **OpenRouter fallback** (the Gemini CLI wrapper is retired; `AI_PROVIDER=gemini` remains as a
+> rollback hatch). New feature-flagged stages: Haiku triage → Sonnet review → Opus investigator
+> (whole-repo analysis + AIManager Q&A via the Review Bridge) → Russian tester reports delivered
+> to the MR and the bridge chat. Design doc: `plans/2026-06-11-v2-architecture.md`.
+> The webhook contract, env names, port and endpoints are unchanged from v1.
 
 ## ✨ Features
 

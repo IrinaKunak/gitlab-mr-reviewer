@@ -6,12 +6,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a GitLab Merge Request Reviewer service - a FastAPI-based webhook receiver that performs automated code quality checks on GitLab merge requests using Gemini AI.
 
-## Architecture
+## Architecture (v2 — branch `v2`)
 
-The project consists of:
-- **w-server.py**: FastAPI webhook server that receives GitLab webhook events and triggers code quality analysis
-- **gemini-wrapper.sh**: Bash script that wraps Gemini CLI for code review with caching and rate limiting
-- **gemini-wrapper-reference.sh**: Reference implementation that inspired the main wrapper
+Design doc: `plans/2026-06-11-v2-architecture.md`. The v1 monolith was refactored into the
+`reviewer/` package; `w-server.py` is now a thin shim so `uvicorn w-server:app` keeps working.
+
+- **reviewer/server.py**: FastAPI app — webhook endpoint (contract unchanged), asyncio queue
+  with N workers + webhook-retry dedupe, lifespan (bridge listener, startup checks)
+- **reviewer/pipeline.py**: stage orchestrator — triage (fast) → review (main) → investigator
+  (smart, agentic) → translate EN→RU → deliver; v1-parity path when `PIPELINE_V2=off`;
+  legacy `AI_PROVIDER=gemini` subprocess path as rollback hatch
+- **reviewer/ai_client.py**: Anthropic SDK via Cloudflare AI Gateway (`cfut_` token goes in the
+  `cf-aig-authorization: Bearer` header) with OpenRouter fallback (Anthropic-compatible
+  `/api/v1/messages`, `models` array failover); caching, rate limiting, agent tool loop
+- **reviewer/repo_cache.py**: lazy bare-clone cache (`refs/merge-requests/<iid>/head` fetch,
+  detached worktrees, LRU disk eviction) + sandboxed read-only repo tools for the investigator
+- **reviewer/bridge.py**: Review Bridge client — exclusive `getUpdates` long-polling, asks
+  AIManager questions per `plans/2026-06-10-review-bridge.md`, strips usage footers
+- **reviewer/gitlab_io.py / telegram_io.py**: GitLab and Telegram I/O (SOCKS via proxies dict,
+  no socket monkey-patch); **reviewer/prompts.py**: English-only prompts; **reviewer/config.py**:
+  env/flags (model tiers: `ANTHROPIC_FAST_MODEL`=haiku triage, `MAIN`=sonnet review,
+  `SMART`=opus investigator)
+- **Feature flags** (all off = v1-parity behavior): `PIPELINE_V2`, `INVESTIGATOR`, `BRIDGE`,
+  `TESTER_REPORT`
+- **Unit tests**: `.venv/bin/python -m pytest tests/ -q` (offline, no API keys needed)
+- **gemini-wrapper.sh**: legacy Gemini CLI wrapper, kept only for the rollback path
+
+Operational notes: the Telegram bot token is polled exclusively by this service (bridge
+listener) — nothing else may call `getUpdates` on it; for the bridge the bot needs group
+privacy mode disabled (or admin) in the bridge group to see AIManager's answers.
 
 ## Development Commands
 

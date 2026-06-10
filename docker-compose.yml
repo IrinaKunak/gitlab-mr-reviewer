@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   gitlab-mr-reviewer:
     build: .
@@ -10,47 +8,62 @@ services:
       - GITLAB_URL=${GITLAB_URL}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
       - XGITLABTOKEN=${XGITLABTOKEN}
-      
+
       # Additional GitLab Instances
       - GITLAB_URL_2=${GITLAB_URL_2:-}
       - GITLAB_TOKEN_2=${GITLAB_TOKEN_2:-}
       - XGITLABTOKEN_2=${XGITLABTOKEN_2:-}
-      
+
+      # AI Provider (Anthropic via Cloudflare AI Gateway + OpenRouter fallback)
+      - AI_PROVIDER=${AI_PROVIDER:-anthropic}
+      - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-}
+      - ANTHROPIC_API_KEY_GATEWAY=${ANTHROPIC_API_KEY_GATEWAY:-}
+      - ANTHROPIC_FAST_MODEL=${ANTHROPIC_FAST_MODEL:-claude-haiku-4-5}
+      - ANTHROPIC_MAIN_MODEL=${ANTHROPIC_MAIN_MODEL:-claude-sonnet-4-6}
+      - ANTHROPIC_SMART_MODEL=${ANTHROPIC_SMART_MODEL:-claude-opus-4-8}
+      - OPENROUTER_API_TOKEN=${OPENROUTER_API_TOKEN:-}
+
+      # Feature flags (rollout phases)
+      - PIPELINE_V2=${PIPELINE_V2:-off}
+      - INVESTIGATOR=${INVESTIGATOR:-off}
+      - BRIDGE=${BRIDGE:-off}
+      - TESTER_REPORT=${TESTER_REPORT:-off}
+
+      # Review Bridge
+      - REVIEW_BRIDGE_CHAT_ID=${REVIEW_BRIDGE_CHAT_ID:-}
+
       # Telegram Configuration
       - TELEGRAM=${TELEGRAM:-off}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_CHAT_ID_2=${TELEGRAM_CHAT_ID_2:-}
       - TELEGRAM_CHAT_ID_3=${TELEGRAM_CHAT_ID_3:-}
-      
+
       # Proxy Configuration
       - HTTP_PROXY=${HTTP_PROXY:-}
       - SOCKS_PROXY=${SOCKS_PROXY:-}
-      
+
       # Review Configuration
       - REVIEW_LANGUAGE=${REVIEW_LANGUAGE:-en}
       - REVIEW_FOR_CONFLICT=${REVIEW_FOR_CONFLICT:-false}
-      - GEMINI_PROMPT=${GEMINI_PROMPT:-}
-      - GEMINI_PROMPT_RU=${GEMINI_PROMPT_RU:-}
-      
+
       # Debug Configuration
       - DEBUG=${DEBUG:-false}
-      - GEMINI_DEBUG=${GEMINI_DEBUG:-false}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      
+      - AI_DEBUG=${AI_DEBUG:-false}
+
     volumes:
-      # Mount .env file if it exists
+      # Mount .env file if it exists (full config incl. instances 3..10)
       - ./.env:/app/.env:ro
-      # Mount logs directory for persistent logging
       - ./logs:/app/logs
-      # Mount cache directory for Gemini cache
       - ./cache:/app/cache
-      
+      # Repo clone cache for the investigator (size it via REPO_CACHE_MAX_GB)
+      - ./repos:/app/repos
+
     restart: unless-stopped
-    
+
     networks:
       - gitlab-reviewer-network
-      
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]
       interval: 30s
@@ -61,9 +74,3 @@ services:
 networks:
   gitlab-reviewer-network:
     driver: bridge
-
-volumes:
-  logs:
-    driver: local
-  cache:
-    driver: local

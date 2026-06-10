@@ -1,0 +1,407 @@
+"""Review pipeline orchestrator.
+
+Stages (PIPELINE_V2=on):
+  0 context -> 1 triage (fast) -> 2 review (main; trivial -> fast)
+  -> 3/4 investigate (smart agent loop; flag + triage-gated)
+  -> 5 translate (EN->RU) -> 6 deliver (GitLab note, report upload, bridge doc, TG)
+
+PIPELINE_V2=off: v1-parity single review (one main-tier call, output in
+REVIEW_LANGUAGE directly), same user-facing strings as v1.
+AI_PROVIDER=gemini: legacy gemini-wrapper.sh subprocess path (rollback hatch).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import subprocess
+import tempfile
+from typing import Any
+
+import gitlab as gitlab_lib
+
+from . import gitlab_io, prompts, telegram_io
+from .ai_client import AIClient, AIError, AIInputTooLargeError, AITimeoutError, ToolDef, ai_client
+from .bridge import bridge
+from .config import settings
+from .repo_cache import repo_cache, repo_grep, repo_list_tree, repo_read_file
+
+logger = logging.getLogger(__name__)
+
+CONFLICT_SKIP_MSG = {
+    "en": "⚠️ Merge request has conflicts. Code review skipped until conflicts are resolved.",
+    "ru": "⚠️ Запрос на слияние имеет конфликты. Обзор кода пропущен до разрешения конфликтов.",
+}
+INITIAL_MSG = {
+    "en": "🤖 Starting automated code review...",
+    "ru": "🤖 Начинаем автоматический обзор кода...",
+}
+INITIAL_MSG_CONFLICT = {
+    "en": "⚠️ 🤖 Starting automated code review (conflicts detected)...",
+    "ru": "⚠️ 🤖 Начинаем автоматический обзор кода (обнаружены конфликты)...",
+}
+NO_CHANGES_MSG = {
+    "en": "⚠️ No code changes found to review.",
+    "ru": "⚠️ Не найдено изменений кода для обзора.",
+}
+TOO_LARGE_MSG = {
+    "en": "⚠️ The merge request is too large to analyze. Please break it into smaller changes.",
+    "ru": "⚠️ Запрос на слияние слишком большой для анализа. Пожалуйста, разбейте его на меньшие изменения.",
+}
+TIMEOUT_MSG = {
+    "en": "⏱️ Code review timed out. The changes might be too large to analyze.",
+    "ru": "⏱️ Тайм-аут обзора кода. Возможно, изменения слишком большие для анализа.",
+}
+FAILED_MSG = {
+    "en": "❌ Code review failed: {error}",
+    "ru": "❌ Обзор кода не удался: {error}",
+}
+GENERAL_ERROR_MSG = {
+    "en": "❌ An error occurred during code review: {error}",
+    "ru": "❌ Произошла ошибка при обзоре кода: {error}",
+}
+TESTER_REPORT_COMMENT = {
+    "en": "## 🧪 Tester Report\n\nA verification guide for this MR is attached: {link}",
+    "ru": "## 🧪 Отчёт для тестировщика\n\nИнструкция по проверке этого MR во вложении: {link}",
+}
+
+
+def _msg(table: dict[str, str], **kwargs) -> str:
+    template = table.get(settings.review_language, table["en"])
+    return template.format(**kwargs) if kwargs else template
+
+
+class Pipeline:
+    def __init__(self, client: AIClient | None = None):
+        self.ai = client or ai_client
+
+    # --- entry point ---
+
+    async def process(self, mr_data: dict[str, Any]) -> None:
+        gitlab_config = mr_data.get("gitlab_config")
+        if not gitlab_config:
+            logger.error("No GitLab configuration found in mr_data")
+            return
+        ctx = {"project_id": mr_data.get("project_id"), "mr_iid": mr_data.get("mr_iid"),
+               "gitlab_instance": gitlab_config.get("name", "unknown")}
+        try:
+            await self._process_inner(mr_data, gitlab_config, ctx)
+        except gitlab_lib.exceptions.GitlabError as exc:
+            logger.error("GitLab API error: %s", exc)
+            await telegram_io.notify_error("gitlab_api_error", str(exc), ctx)
+        except AIInputTooLargeError:
+            await telegram_io.notify_error("ai_failure", "MR too large to analyze", ctx)
+            await self._safe_note(mr_data, gitlab_config, _msg(TOO_LARGE_MSG))
+        except AITimeoutError:
+            logger.error("AI analysis timed out")
+            await telegram_io.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
+            await self._safe_note(mr_data, gitlab_config, _msg(TIMEOUT_MSG))
+        except AIError as exc:
+            logger.error("AI analysis failed: %s", exc)
+            await telegram_io.notify_error("ai_failure", str(exc)[:300], ctx)
+            await self._safe_note(mr_data, gitlab_config,
+                                  _msg(FAILED_MSG, error=str(exc)[:300]))
+        except Exception as exc:  # noqa: BLE001 — top-level pipeline guard
+            logger.exception("Error in quality check")
+            await telegram_io.notify_error("general", str(exc), ctx)
+            await self._safe_note(mr_data, gitlab_config,
+                                  _msg(GENERAL_ERROR_MSG, error=str(exc)))
+
+    async def _safe_note(self, mr_data: dict, gitlab_config: dict, body: str) -> None:
+        """Best-effort MR comment on error paths (v1 behavior)."""
+        try:
+            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, gitlab_config)
+            project = await asyncio.to_thread(gl.projects.get, mr_data["project_id"])
+            mr = await asyncio.to_thread(project.mergerequests.get, mr_data["mr_iid"])
+            await gitlab_io.post_note(mr, body)
+        except Exception:  # noqa: BLE001
+            logger.error("Failed to post error message to MR")
+
+    # --- main flow ---
+
+    async def _process_inner(self, mr_data: dict, gitlab_config: dict, ctx: dict) -> None:
+        logger.info("Starting quality check for MR !%s in project %s on %s",
+                    mr_data["mr_iid"], mr_data["project_id"], gitlab_config["name"])
+
+        gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, gitlab_config)
+        try:
+            project = await asyncio.to_thread(gl.projects.get, mr_data["project_id"])
+        except gitlab_lib.exceptions.GitlabGetError as exc:
+            await telegram_io.notify_error(
+                "gitlab_api_error", f"Failed to get project {mr_data['project_id']}: {exc}", ctx)
+            return
+        try:
+            mr = await asyncio.to_thread(project.mergerequests.get, mr_data["mr_iid"])
+        except gitlab_lib.exceptions.GitlabGetError as exc:
+            await telegram_io.notify_error(
+                "gitlab_api_error", f"Failed to get MR !{mr_data['mr_iid']}: {exc}", ctx)
+            return
+
+        has_conflicts = await asyncio.to_thread(gitlab_io.check_merge_conflicts, mr)
+        await telegram_io.notify(telegram_io.format_mr_message(
+            mr_data, project.path_with_namespace, has_conflicts,
+            gitlab_instance=gitlab_config["url"]))
+
+        if has_conflicts and not settings.review_for_conflict:
+            await gitlab_io.post_note(mr, _msg(CONFLICT_SKIP_MSG))
+            logger.info("Skipped review for MR !%s due to conflicts", mr_data["mr_iid"])
+            return
+
+        await gitlab_io.post_note(
+            mr, _msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
+
+        changes = await asyncio.to_thread(mr.changes)
+        review_content = await asyncio.to_thread(
+            gitlab_io.extract_review_content, project, mr, changes)
+        if not review_content:
+            await gitlab_io.post_note(mr, _msg(NO_CHANGES_MSG))
+            return
+
+        if settings.ai_provider == "gemini":
+            review_ru = await self._legacy_gemini_review(mr_data, review_content)
+            await self._deliver_review(mr, mr_data, project, gitlab_config,
+                                       has_conflicts, review_ru)
+            return
+
+        if not settings.pipeline_v2:
+            review_text = await self._parity_review(mr_data, review_content)
+            await self._deliver_review(mr, mr_data, project, gitlab_config,
+                                       has_conflicts, review_text)
+            return
+
+        # ---- tiered pipeline ----
+        triage = await self._triage(mr_data, changes)
+        review_en = await self._review(mr_data, review_content, triage)
+
+        investigation = None
+        if (settings.investigator and triage.get("needs_investigation")
+                and triage.get("complexity") == "complex"):
+            investigation = await self._investigate(
+                mr_data, gitlab_config, review_content, triage, review_en)
+
+        review_out = await self._translate_if_needed(review_en, tier="fast")
+        await self._deliver_review(mr, mr_data, project, gitlab_config,
+                                   has_conflicts, review_out)
+
+        if investigation and settings.tester_report and investigation.get("tester_report"):
+            report_ru = await self._translate_if_needed(
+                investigation["tester_report"], tier="main")
+            await self._deliver_tester_report(project, mr, mr_data, report_ru)
+
+    # --- stages ---
+
+    async def _triage(self, mr_data: dict, changes: dict) -> dict:
+        diff_summary = gitlab_io.extract_diff_only(changes)[:60_000]
+        fallback = {"complexity": "normal", "risk_areas": [],
+                    "jira_keys": gitlab_io.extract_jira_keys(mr_data),
+                    "needs_investigation": False, "summary": mr_data.get("title", "")}
+        try:
+            parsed = await self.ai.complete_json(
+                "fast", prompts.TRIAGE_SYSTEM,
+                prompts.triage_user_prompt(mr_data, diff_summary),
+                prompts.TRIAGE_SCHEMA)
+        except AIError as exc:
+            logger.warning("triage failed (%s) — defaulting to normal", exc)
+            return fallback
+        if not parsed or "complexity" not in parsed:
+            logger.warning("triage returned unparseable output — defaulting to normal")
+            return fallback
+        # merge regex-found keys the model may have missed
+        for key in fallback["jira_keys"]:
+            if key not in parsed.setdefault("jira_keys", []):
+                parsed["jira_keys"].append(key)
+        logger.info("triage: complexity=%s investigate=%s jira=%s",
+                    parsed.get("complexity"), parsed.get("needs_investigation"),
+                    parsed.get("jira_keys"))
+        return parsed
+
+    async def _review(self, mr_data: dict, review_content: str, triage: dict) -> str:
+        user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
+        if triage.get("complexity") == "trivial":
+            result = await self.ai.complete(
+                "fast", prompts.TRIVIAL_REVIEW_SYSTEM, user, max_tokens=1024)
+        else:
+            system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
+            hints = ""
+            if triage.get("risk_areas"):
+                hints = "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
+            result = await self.ai.complete(
+                "main", system + hints, user, max_tokens=4096, effort="high")
+        return result.text
+
+    async def _parity_review(self, mr_data: dict, review_content: str) -> str:
+        """PIPELINE_V2=off: one main-tier call writing directly in REVIEW_LANGUAGE (v1 shape)."""
+        if settings.review_language == "ru":
+            system = settings.review_prompt_ru or (
+                prompts.REVIEW_SYSTEM.replace("Write in English.", "Пиши по-русски."))
+        else:
+            system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
+        user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
+        result = await self.ai.complete("main", system, user, max_tokens=4096)
+        return result.text
+
+    async def _investigate(self, mr_data: dict, gitlab_config: dict,
+                           review_content: str, triage: dict, review_en: str) -> dict | None:
+        worktree = None
+        try:
+            worktree = await repo_cache.checkout_mr(
+                gitlab_config, mr_data["project_path"], mr_data["mr_iid"],
+                mr_data.get("last_commit"))
+        except Exception as exc:  # noqa: BLE001 — investigation degrades, review still ships
+            logger.error("repo checkout failed, investigating without repo tools: %s", exc)
+
+        tools: list[ToolDef] = []
+        if worktree is not None:
+            wt = worktree
+            tools += [
+                ToolDef("repo_grep",
+                        "Search the project for a regex pattern. Returns file:line: text matches.",
+                        {"type": "object", "properties": {
+                            "pattern": {"type": "string", "description": "Python regex"},
+                            "glob": {"type": "string", "description": "optional path glob, e.g. **/*.py"},
+                            "max_results": {"type": "integer"}},
+                         "required": ["pattern"]},
+                        handler=lambda **kw: asyncio.to_thread(repo_grep, wt, **kw)),
+                ToolDef("repo_read_file",
+                        "Read a file from the project at the MR head commit (line-numbered).",
+                        {"type": "object", "properties": {
+                            "path": {"type": "string"},
+                            "start_line": {"type": "integer"},
+                            "end_line": {"type": "integer"}},
+                         "required": ["path"]},
+                        handler=lambda **kw: asyncio.to_thread(repo_read_file, wt, **kw)),
+                ToolDef("repo_list_tree",
+                        "List files/directories under a path.",
+                        {"type": "object", "properties": {
+                            "path": {"type": "string"}, "depth": {"type": "integer"}},
+                         "required": []},
+                        handler=lambda **kw: asyncio.to_thread(repo_list_tree, wt, **kw)),
+            ]
+
+        questions_left = settings.bridge_max_questions_per_mr
+
+        async def ask_aimanager(question: str) -> str:
+            nonlocal questions_left
+            if not bridge.enabled:
+                return "AIManager is not available in this deployment."
+            if questions_left <= 0:
+                return "Question budget for this MR is exhausted."
+            questions_left -= 1
+            answer = await bridge.ask(question)
+            return answer or "No answer received (timeout or not found)."
+
+        if bridge.enabled:
+            tools.append(ToolDef(
+                "ask_aimanager",
+                "Ask the company knowledge bot (Jira corpus + project chats) one focused "
+                "plain-text question. Include the Jira issue key when known. 15-60s latency. "
+                + prompts.BRIDGE_QUESTION_HINT.format(key="<KEY>"),
+                {"type": "object", "properties": {"question": {"type": "string"}},
+                 "required": ["question"]},
+                handler=ask_aimanager))
+
+        system = prompts.INVESTIGATOR_SYSTEM.format(
+            max_iterations=settings.investigator_max_iterations)
+        user = prompts.investigator_user_prompt(mr_data, review_content, triage, review_en)
+        try:
+            result = await self.ai.agent_loop(
+                "smart", system, user, tools,
+                max_iterations=settings.investigator_max_iterations,
+                max_tokens=16000, effort="high")
+        except AIError as exc:
+            logger.error("investigation failed: %s", exc)
+            return None
+        finally:
+            if worktree is not None:
+                await repo_cache.release(worktree)
+
+        text = result.text
+        report = None
+        if "## TESTER REPORT" in text:
+            report = text.split("## TESTER REPORT", 1)[1].strip()
+            report = f"## TESTER REPORT\n\n{report}"
+        logger.info("investigation done: %d chars, tester_report=%s, tokens in=%d out=%d",
+                    len(text), bool(report), result.input_tokens, result.output_tokens)
+        return {"full_text": text, "tester_report": report}
+
+    async def _translate_if_needed(self, text: str, tier: str) -> str:
+        if settings.review_language != "ru" or not text:
+            return text
+        try:
+            result = await self.ai.complete(
+                tier, prompts.TRANSLATE_SYSTEM, text,
+                max_tokens=max(2048, min(16000, len(text))), use_cache=True)
+            return result.text or text
+        except AIError as exc:
+            logger.error("translation failed, delivering English original: %s", exc)
+            return text
+
+    # --- delivery ---
+
+    async def _deliver_review(self, mr, mr_data: dict, project, gitlab_config: dict,
+                              has_conflicts: bool, review_text: str) -> None:
+        comment = gitlab_io.format_review_comment(review_text)
+        try:
+            await gitlab_io.post_note(mr, comment)
+            logger.info("Posted review for MR !%s", mr_data["mr_iid"])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to post review comment: %s", exc)
+            await telegram_io.notify_error(
+                "gitlab_api_error", f"Failed to post review comment: {exc}",
+                {"project_id": mr_data["project_id"], "mr_iid": mr_data["mr_iid"],
+                 "gitlab_instance": gitlab_config["name"]})
+            error_msg = {
+                "en": f"❌ Failed to post review comment: {exc}",
+                "ru": f"❌ Не удалось опубликовать комментарий с обзором: {exc}",
+            }
+            try:
+                await gitlab_io.post_note(mr, _msg(error_msg))
+            except Exception:  # noqa: BLE001
+                logger.error("Failed to post error message as well")
+            return
+        if settings.telegram_enabled:
+            await telegram_io.notify(telegram_io.format_mr_message(
+                mr_data, project.path_with_namespace, has_conflicts,
+                review_text, gitlab_config["url"]))
+
+    async def _deliver_tester_report(self, project, mr, mr_data: dict,
+                                     report_ru: str) -> None:
+        filename = (f"tester-report-{mr_data['project_path'].replace('/', '-')}"
+                    f"-MR{mr_data['mr_iid']}.md")
+        link = await gitlab_io.upload_tester_report(project, filename, report_ru)
+        if link:
+            await gitlab_io.post_note(mr, _msg(TESTER_REPORT_COMMENT, link=link))
+        else:  # upload failed — inline the report so it isn't lost
+            await gitlab_io.post_note(mr, report_ru[:60_000])
+
+        if settings.bridge_chat_id:
+            caption = (f"🧪 Tester report: {mr_data['project_path']} "
+                       f"!{mr_data['mr_iid']}\n{mr_data['url']}")
+            await telegram_io.send_document(
+                settings.bridge_chat_id, filename, report_ru.encode("utf-8"), caption)
+
+    # --- legacy gemini path (rollback hatch) ---
+
+    async def _legacy_gemini_review(self, mr_data: dict, review_content: str) -> str:
+        payload = f"{gitlab_io.mr_header(mr_data)}\n\n{review_content}"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                         encoding="utf-8") as tmp:
+            tmp.write(payload)
+            tmp_path = tmp.name
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, ["./gemini-wrapper.sh", tmp_path],
+                capture_output=True, text=True, timeout=120,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                encoding="utf-8", errors="replace")
+            if result.returncode != 0:
+                raise AIError(f"gemini-wrapper exit {result.returncode}: {result.stderr[:300]}")
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired as exc:
+            raise AITimeoutError("gemini-wrapper timed out") from exc
+        finally:
+            os.unlink(tmp_path)
+
+
+pipeline = Pipeline()
