@@ -67,6 +67,7 @@ class Settings:
     # --- AI provider ---
     ai_provider: str = field(default_factory=lambda: os.getenv("AI_PROVIDER", "anthropic").lower())
     anthropic_api_url: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_URL", ""))
+    anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     anthropic_gateway_key: str = field(
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY_GATEWAY", ""))
     openrouter_token: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_TOKEN", ""))

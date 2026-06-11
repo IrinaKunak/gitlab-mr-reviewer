@@ -147,25 +147,29 @@ class AIClient:
 
     @property
     def primary(self) -> AsyncAnthropic:
+        """Cloudflare AI Gateway auth modes (developers.cloudflare.com, verified 2026-06):
+
+        1. real key + cfut_ token  -> x-api-key + cf-aig-authorization
+           (key-in-request through an authenticated gateway)
+        2. cfut_ token only        -> cf-aig-authorization, dummy x-api-key
+           (BYOK / Unified Billing: the gateway injects the provider credential)
+        3. real key only           -> plain x-api-key (unauthenticated gateway / direct API)
+        """
         if self._primary is None:
-            key = self.cfg.anthropic_gateway_key
-            if key.startswith("cfut_"):
-                # Unified Billing / BYOK: gateway injects the provider credential.
-                # SDK requires a non-empty api_key — send a placeholder.
-                self._primary = AsyncAnthropic(
-                    base_url=self.cfg.anthropic_api_url,
-                    api_key="gateway",
-                    default_headers={"cf-aig-authorization": f"Bearer {key}"},
-                    http_client=self._http_client(self.cfg.ai_timeout),
-                    max_retries=2,
-                )
-            else:  # real Anthropic key passed through the gateway (or direct API)
-                self._primary = AsyncAnthropic(
-                    base_url=self.cfg.anthropic_api_url or None,
-                    api_key=key or None,
-                    http_client=self._http_client(self.cfg.ai_timeout),
-                    max_retries=2,
-                )
+            real_key = self.cfg.anthropic_api_key
+            gateway_key = self.cfg.anthropic_gateway_key
+            if not real_key and gateway_key and not gateway_key.startswith("cfut_"):
+                # legacy single-var setup: a real key stored in the GATEWAY var
+                real_key, gateway_key = gateway_key, ""
+            headers = ({"cf-aig-authorization": f"Bearer {gateway_key}"}
+                       if gateway_key.startswith("cfut_") else None)
+            self._primary = AsyncAnthropic(
+                base_url=self.cfg.anthropic_api_url or None,
+                api_key=real_key or ("gateway" if headers else None),
+                default_headers=headers,
+                http_client=self._http_client(self.cfg.ai_timeout),
+                max_retries=2,
+            )
         return self._primary
 
     @property

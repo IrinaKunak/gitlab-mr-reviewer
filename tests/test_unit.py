@@ -80,20 +80,32 @@ def test_cache_roundtrip(tmp_path):
 
 
 def test_gateway_auth_modes():
+    # mode 1: real key + cfut token -> both x-api-key and cf-aig-authorization
     cfg = Settings()
     cfg.anthropic_api_url = "https://gateway.example/anthropic"
+    cfg.anthropic_api_key = "sk-ant-real"
     cfg.anthropic_gateway_key = "cfut_abc123"
-    client = AIClient(cfg)
-    primary = client.primary
-    # cfut_ token must ride the cf-aig-authorization header, not x-api-key
-    assert primary.api_key == "gateway"
+    primary = AIClient(cfg).primary
+    assert primary.api_key == "sk-ant-real"
     assert primary.default_headers.get("cf-aig-authorization") == "Bearer cfut_abc123"
 
+    # mode 2: cfut only (Unified Billing) -> header + dummy x-api-key
     cfg2 = Settings()
     cfg2.anthropic_api_url = "https://gateway.example/anthropic"
-    cfg2.anthropic_gateway_key = "sk-ant-real"
-    client2 = AIClient(cfg2)
-    assert client2.primary.api_key == "sk-ant-real"
+    cfg2.anthropic_api_key = ""
+    cfg2.anthropic_gateway_key = "cfut_abc123"
+    primary2 = AIClient(cfg2).primary
+    assert primary2.api_key == "gateway"
+    assert primary2.default_headers.get("cf-aig-authorization") == "Bearer cfut_abc123"
+
+    # mode 3 / legacy: real key stored in the GATEWAY var -> plain x-api-key
+    cfg3 = Settings()
+    cfg3.anthropic_api_url = "https://gateway.example/anthropic"
+    cfg3.anthropic_api_key = ""
+    cfg3.anthropic_gateway_key = "sk-ant-real"
+    primary3 = AIClient(cfg3).primary
+    assert primary3.api_key == "sk-ant-real"
+    assert primary3.default_headers.get("cf-aig-authorization") is None
 
 
 def test_primary_params_per_tier():
