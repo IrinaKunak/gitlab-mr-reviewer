@@ -4,3 +4,5 @@ python-dotenv
 uvicorn
 pysocks
 requests
+anthropic~=0.109
+httpx[socks]~=0.28

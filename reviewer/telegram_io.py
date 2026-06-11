@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 _API = "https://api.telegram.org"
 
 
+def redact_token(text: str) -> str:
+    """httpx exceptions embed the request URL, which contains the bot token."""
+    if settings.telegram_token:
+        return text.replace(settings.telegram_token, "***TOKEN***")
+    return text
+
+
 def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     kwargs: dict[str, Any] = {"timeout": timeout}
     if settings.proxy_url:
@@ -45,7 +52,7 @@ async def send_message(chat_id: str, text: str, *, parse_mode: str | None = "Mar
             response.raise_for_status()
         return True
     except Exception as exc:  # noqa: BLE001 — notifications must never break the pipeline
-        logger.error("Telegram sendMessage to %s failed: %s", chat_id, exc)
+        logger.error("Telegram sendMessage to %s failed: %s", chat_id, redact_token(str(exc)))
         return False
 
 
@@ -62,7 +69,7 @@ async def send_document(chat_id: str, filename: str, content: bytes, caption: st
             response.raise_for_status()
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.error("Telegram sendDocument to %s failed: %s", chat_id, exc)
+        logger.error("Telegram sendDocument to %s failed: %s", chat_id, redact_token(str(exc)))
         return False
 
 

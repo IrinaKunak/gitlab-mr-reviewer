@@ -158,6 +158,8 @@ class Pipeline:
             await gitlab_io.post_note(mr, _msg(NO_CHANGES_MSG))
             return
 
+        diff_only = gitlab_io.extract_diff_only(changes)
+
         if settings.ai_provider == "gemini":
             review_ru = await self._legacy_gemini_review(mr_data, review_content)
             await self._deliver_review(mr, mr_data, project, gitlab_config,
@@ -165,14 +167,14 @@ class Pipeline:
             return
 
         if not settings.pipeline_v2:
-            review_text = await self._parity_review(mr_data, review_content)
+            review_text = await self._parity_review(mr_data, review_content, diff_only)
             await self._deliver_review(mr, mr_data, project, gitlab_config,
                                        has_conflicts, review_text)
             return
 
         # ---- tiered pipeline ----
         triage = await self._triage(mr_data, changes)
-        review_en = await self._review(mr_data, review_content, triage)
+        review_en = await self._review(mr_data, review_content, triage, diff_only)
 
         investigation = None
         if (settings.investigator and triage.get("needs_investigation")
@@ -207,39 +209,60 @@ class Pipeline:
         if not parsed or "complexity" not in parsed:
             logger.warning("triage returned unparseable output — defaulting to normal")
             return fallback
-        # merge regex-found keys the model may have missed
+        # merge regex-found keys the model may have missed (lenient fallback parse
+        # may return a non-list here — normalize instead of crashing the review)
+        if not isinstance(parsed.get("jira_keys"), list):
+            parsed["jira_keys"] = []
         for key in fallback["jira_keys"]:
-            if key not in parsed.setdefault("jira_keys", []):
+            if key not in parsed["jira_keys"]:
                 parsed["jira_keys"].append(key)
         logger.info("triage: complexity=%s investigate=%s jira=%s",
                     parsed.get("complexity"), parsed.get("needs_investigation"),
                     parsed.get("jira_keys"))
         return parsed
 
-    async def _review(self, mr_data: dict, review_content: str, triage: dict) -> str:
-        user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
+    async def _review(self, mr_data: dict, review_content: str, triage: dict,
+                      diff_only: str = "") -> str:
         if triage.get("complexity") == "trivial":
+            user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
             result = await self.ai.complete(
                 "fast", prompts.TRIVIAL_REVIEW_SYSTEM, user, max_tokens=1024)
-        else:
-            system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
-            hints = ""
-            if triage.get("risk_areas"):
-                hints = "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
-            result = await self.ai.complete(
-                "main", system + hints, user, max_tokens=4096, effort="high")
+            return result.text
+        system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
+        if triage.get("risk_areas"):
+            system += "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
+        result = await self._complete_with_degradation(
+            "main", system, mr_data, review_content, diff_only, effort="high")
         return result.text
 
-    async def _parity_review(self, mr_data: dict, review_content: str) -> str:
+    async def _parity_review(self, mr_data: dict, review_content: str,
+                             diff_only: str = "") -> str:
         """PIPELINE_V2=off: one main-tier call writing directly in REVIEW_LANGUAGE (v1 shape)."""
         if settings.review_language == "ru":
             system = settings.review_prompt_ru or (
                 prompts.REVIEW_SYSTEM.replace("Write in English.", "Пиши по-русски."))
         else:
             system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
-        user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
-        result = await self.ai.complete("main", system, user, max_tokens=4096)
+        result = await self._complete_with_degradation(
+            "main", system, mr_data, review_content, diff_only)
         return result.text
+
+    async def _complete_with_degradation(self, tier: str, system: str, mr_data: dict,
+                                         review_content: str, diff_only: str,
+                                         effort: str | None = None):
+        """Review with file context; if too large, retry diff-only before refusing."""
+        try:
+            user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
+            return await self.ai.complete(tier, system, user, max_tokens=4096, effort=effort)
+        except AIInputTooLargeError:
+            if not diff_only:
+                raise
+            logger.warning("MR !%s too large with file context — retrying diff-only",
+                           mr_data["mr_iid"])
+            user = prompts.review_user_prompt(
+                gitlab_io.mr_header(mr_data)
+                + "\n(file context omitted — MR too large; diffs only)", diff_only)
+            return await self.ai.complete(tier, system, user, max_tokens=4096, effort=effort)
 
     async def _investigate(self, mr_data: dict, gitlab_config: dict,
                            review_content: str, triage: dict, review_en: str) -> dict | None:

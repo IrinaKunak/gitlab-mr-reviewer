@@ -28,6 +28,14 @@ def _int(name: str, default: int, legacy: str | None = None) -> int:
         return default
 
 
+def _float(name: str, default: float, legacy: str | None = None) -> float:
+    raw = os.getenv(name) or (os.getenv(legacy) if legacy else None)
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
 def _csv(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
@@ -81,8 +89,8 @@ class Settings:
         "AI_CACHE_DIR", os.getenv("GEMINI_CACHE_DIR", "cache")))
     ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 120, "GEMINI_TIMEOUT"))
     ai_agent_timeout: int = field(default_factory=lambda: _int("AI_AGENT_TIMEOUT", 600))
-    ai_rate_limit: float = field(default_factory=lambda: float(
-        os.getenv("AI_RATE_LIMIT", os.getenv("GEMINI_RATE_LIMIT", "2"))))
+    ai_rate_limit: float = field(default_factory=lambda: _float(
+        "AI_RATE_LIMIT", 2.0, "GEMINI_RATE_LIMIT"))
     ai_debug: bool = field(default_factory=lambda: _bool("AI_DEBUG", _bool("GEMINI_DEBUG")))
     ai_log_dir: str = field(default_factory=lambda: os.getenv(
         "AI_LOG_DIR", os.getenv("GEMINI_LOG_DIR", "logs")))
@@ -102,7 +110,7 @@ class Settings:
 
     # --- repo cache ---
     repo_cache_dir: str = field(default_factory=lambda: os.getenv("REPO_CACHE_DIR", "repos"))
-    repo_cache_max_gb: float = field(default_factory=lambda: float(os.getenv("REPO_CACHE_MAX_GB", "30")))
+    repo_cache_max_gb: float = field(default_factory=lambda: _float("REPO_CACHE_MAX_GB", 30.0))
     investigator_max_iterations: int = field(
         default_factory=lambda: _int("INVESTIGATOR_MAX_ITERATIONS", 30))
 
@@ -118,7 +126,7 @@ class Settings:
     # --- Review Bridge ---
     bridge_chat_id: str = field(default_factory=lambda: os.getenv("REVIEW_BRIDGE_CHAT_ID", ""))
     bridge_question_timeout: int = field(default_factory=lambda: _int("BRIDGE_QUESTION_TIMEOUT", 90))
-    bridge_answer_grace: float = field(default_factory=lambda: float(os.getenv("BRIDGE_ANSWER_GRACE", "6")))
+    bridge_answer_grace: float = field(default_factory=lambda: _float("BRIDGE_ANSWER_GRACE", 6.0))
     bridge_max_questions_per_mr: int = field(
         default_factory=lambda: _int("BRIDGE_MAX_QUESTIONS_PER_MR", 10))
     bridge_rate_per_hour: int = field(default_factory=lambda: _int("BRIDGE_RATE_PER_HOUR", 25))

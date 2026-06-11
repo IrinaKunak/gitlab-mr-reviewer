@@ -103,7 +103,8 @@ class ReviewBridge:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 — keep polling through blips
-                    logger.warning("bridge getUpdates error: %s", exc)
+                    from .telegram_io import redact_token
+                    logger.warning("bridge getUpdates error: %s", redact_token(str(exc)))
                     await asyncio.sleep(5)
 
     def _dispatch(self, update: dict) -> None:
@@ -117,8 +118,11 @@ class ReviewBridge:
         sender_id = str(sender.get("id", ""))
         if sender_id == self._bot_id:
             return  # our own question echoed back
-        if settings.bridge_answer_bot_id and sender_id != settings.bridge_answer_bot_id:
-            return  # restricted to AIManager when configured
+        if settings.bridge_answer_bot_id:
+            if sender_id != settings.bridge_answer_bot_id:
+                return  # restricted to AIManager when configured
+        elif not sender.get("is_bot"):
+            return  # unconfigured: accept bot answers only (humans in the group are observers)
         text = message.get("text") or message.get("caption") or ""
         if text:
             self._inbox.put_nowait({"from_id": sender_id, "text": text,
@@ -138,6 +142,9 @@ class ReviewBridge:
         if not self._rate.allow():
             logger.warning("bridge hourly rate window exhausted; skipping question")
             return None
+        # one focused question — also caps the prompt-injection blast radius
+        # (repo/MR content cannot be exfiltrated wholesale through the bridge)
+        question = question.strip()[:800]
 
         async with self._ask_lock:
             # drain stale inbox entries from previous interactions

@@ -41,6 +41,36 @@ _RETRYABLE = (
 )
 
 
+def _should_fallback(exc: Exception) -> bool:
+    """Fail over only on availability problems (429/5xx/529/network/timeout).
+
+    4xx errors are OUR bug or gateway misconfiguration — falling back would
+    mask them and double-bill; surface them instead.
+    """
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code == 429 or exc.status_code >= 500
+    return False
+
+
+def _strip_thinking(messages: list[dict]) -> list[dict]:
+    """Drop thinking blocks from assistant turns for cross-vendor fallback requests
+    (non-Claude models can reject replayed thinking blocks with no thinking param)."""
+    cleaned: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list):
+            content = [block for block in content
+                       if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
+                       and (not isinstance(block, dict)
+                            or block.get("type") not in ("thinking", "redacted_thinking"))]
+            cleaned.append({**message, "content": content})
+        else:
+            cleaned.append(message)
+    return cleaned
+
+
 class AIError(Exception):
     """All providers failed."""
 
@@ -274,6 +304,8 @@ class AIClient:
             response = await self._call(self.primary, request, timeout)
             result = self._to_result(response, "gateway")
         except _RETRYABLE + (anthropic.APIStatusError,) as exc:
+            if not _should_fallback(exc):
+                raise self._wrap(exc)
             logger.warning("primary failed (%s) -> openrouter fallback", type(exc).__name__)
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout, cause=exc)
@@ -321,8 +353,14 @@ class AIClient:
         return await opts.messages.create(**request)
 
     def _to_result(self, response: Any, provider: str) -> AIResult:
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "refusal":
+            raise AIError("model refused the request (stop_reason=refusal)")
         text = "".join(block.text for block in response.content
                        if getattr(block, "type", "") == "text")
+        if stop_reason == "max_tokens":
+            logger.warning("response truncated at max_tokens (provider=%s)", provider)
+            text += "\n\n*[response truncated at the output limit]*"
         usage = getattr(response, "usage", None)
         return AIResult(
             text=text.strip(),
@@ -374,13 +412,16 @@ class AIClient:
                 response = await self._call(self.primary, request, self.cfg.ai_agent_timeout)
                 provider = "gateway"
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
+                if not _should_fallback(exc):
+                    raise self._wrap(exc)
                 logger.warning("agent_loop primary failed (%s), trying openrouter",
                                type(exc).__name__)
                 client = self.fallback
                 if client is None:
                     raise self._wrap(exc)
                 chain = self.cfg.fallback_chain(tier)
-                request = {"model": chain[0], "system": system, "messages": messages,
+                request = {"model": chain[0], "system": system,
+                           "messages": _strip_thinking(messages),
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": chain}}
                 try:
@@ -396,8 +437,13 @@ class AIClient:
                                 if getattr(block, "type", "") == "text") or last_text
 
             if response.stop_reason == "pause_turn":
-                messages = messages[:1] + [{"role": "assistant", "content": response.content}]
+                # Resume a paused turn: keep the FULL history and echo the paused
+                # assistant content verbatim (thinking blocks included) — truncating
+                # to messages[:1] would drop all prior tool_use/tool_result context.
+                messages.append({"role": "assistant", "content": response.content})
                 continue
+            if response.stop_reason == "refusal":
+                raise AIError("model refused during investigation (stop_reason=refusal)")
             if response.stop_reason != "tool_use":
                 logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
                             iteration + 1, response.stop_reason, total_in, total_out)

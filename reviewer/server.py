@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -80,6 +81,20 @@ class ReviewQueue:
 
 review_queue = ReviewQueue(settings.ai_workers, settings.dedupe_ttl)
 
+_last_unknown_token_alert = 0.0
+_UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
+
+
+async def _alert_unknown_token(event_type: str | None, token: str | None) -> None:
+    global _last_unknown_token_alert
+    now = time.monotonic()
+    if now - _last_unknown_token_alert < _UNKNOWN_TOKEN_ALERT_INTERVAL:
+        return
+    _last_unknown_token_alert = now
+    await telegram_io.notify_error(
+        "webhook_error", f"Unknown webhook token received: {(token or '')[:10]}...",
+        {"event_type": event_type})
+
 
 async def _verify_instances() -> None:
     """Startup connectivity check (non-fatal, v1 behavior)."""
@@ -101,6 +116,9 @@ async def lifespan(app: FastAPI):
     logger.info("Flags: pipeline_v2=%s investigator=%s bridge=%s tester_report=%s "
                 "provider=%s", settings.pipeline_v2, settings.investigator,
                 settings.bridge_enabled, settings.tester_report, settings.ai_provider)
+    if settings.ai_provider == "gemini" and not shutil.which("gemini"):
+        logger.error("AI_PROVIDER=gemini but the gemini CLI is not installed — "
+                     "this rollback path requires the v1 Docker image (master branch)")
     if settings.proxy_url:
         logger.info("Proxy: %s", settings.proxy_url)
     await review_queue.start()
@@ -138,9 +156,7 @@ async def handle_gitlab_webhook(request: Request):
     if not gitlab_config:
         logger.warning("No GitLab instance found for webhook token: %s",
                        (gitlab_token or "")[:10])
-        await telegram_io.notify_error(
-            "webhook_error", f"Unknown webhook token received: {(gitlab_token or '')[:10]}...",
-            {"event_type": event_type})
+        await _alert_unknown_token(event_type, gitlab_token)
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     try:

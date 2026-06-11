@@ -30,7 +30,9 @@ Design doc: `plans/2026-06-11-v2-architecture.md`. The v1 monolith was refactore
 - **Feature flags** (all off = v1-parity behavior): `PIPELINE_V2`, `INVESTIGATOR`, `BRIDGE`,
   `TESTER_REPORT`
 - **Unit tests**: `.venv/bin/python -m pytest tests/ -q` (offline, no API keys needed)
-- **gemini-wrapper.sh**: legacy Gemini CLI wrapper, kept only for the rollback path
+- **gemini-wrapper.sh**: legacy Gemini CLI wrapper, kept only for the rollback path.
+  ⚠ The v2 Docker image does NOT ship Node/Gemini CLI — `AI_PROVIDER=gemini` works only
+  with a local Gemini CLI install or the v1 image (master branch); full rollback = deploy master.
 
 Operational notes: the Telegram bot token is polled exclusively by this service (bridge
 listener) — nothing else may call `getUpdates` on it; for the bridge the bot needs group
@@ -41,8 +43,11 @@ privacy mode disabled (or admin) in the bridge group to see AIManager's answers.
 ### Docker Deployment (Recommended)
 ```bash
 # Build and run Docker container
+# v2: .env is NOT baked into the image — pass it explicitly (compose mounts it for you)
 docker build -t gitlab-mr-reviewer .
-docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
+docker run -d -p 5000:5000 --env-file .env \
+  -v ./logs:/app/logs -v ./cache:/app/cache -v ./repos:/app/repos \
+  --name gitlab-mr-reviewer-test gitlab-mr-reviewer
 
 # Using docker-compose
 docker-compose up -d

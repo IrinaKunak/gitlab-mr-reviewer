@@ -47,9 +47,9 @@ services:
       - REVIEW_LANGUAGE=${REVIEW_LANGUAGE:-en}
       - REVIEW_FOR_CONFLICT=${REVIEW_FOR_CONFLICT:-false}
 
-      # Debug Configuration
+      # Debug Configuration (AI_DEBUG intentionally not pinned here so the
+      # mounted .env / legacy GEMINI_DEBUG alias can provide it)
       - DEBUG=${DEBUG:-false}
-      - AI_DEBUG=${AI_DEBUG:-false}
 
     volumes:
       # Mount .env file if it exists (full config incl. instances 3..10)

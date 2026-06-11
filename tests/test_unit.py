@@ -195,6 +195,95 @@ def test_format_review_comment_language(monkeypatch):
     assert "Automated Code Review" in gitlab_io.format_review_comment("review")
 
 
+# --- review-fix regressions ---
+
+def test_should_fallback_gating():
+    import httpx as _httpx
+
+    def status_error(code):
+        request = _httpx.Request("POST", "https://x")
+        response = _httpx.Response(code, request=request)
+        cls = {429: __import__("anthropic").RateLimitError}.get(code)
+        if cls:
+            return cls("e", response=response, body=None)
+        import anthropic as _a
+        return _a.APIStatusError("e", response=response, body=None)
+
+    assert ai_mod._should_fallback(status_error(429)) is True
+    assert ai_mod._should_fallback(status_error(500)) is True
+    assert ai_mod._should_fallback(status_error(529)) is True
+    assert ai_mod._should_fallback(status_error(400)) is False  # our bug — surface it
+    assert ai_mod._should_fallback(status_error(401)) is False
+    assert ai_mod._should_fallback(ValueError("x")) is False
+
+
+def test_strip_thinking_blocks():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "text", "text": "a"},
+            {"type": "tool_use", "id": "1", "name": "t", "input": {}},
+        ]},
+    ]
+    cleaned = ai_mod._strip_thinking(messages)
+    types = [b["type"] for b in cleaned[1]["content"]]
+    assert types == ["text", "tool_use"]
+    assert messages[1]["content"][0]["type"] == "thinking"  # original untouched
+
+
+def test_safe_path_rejects_sibling_prefix(tmp_path):
+    # /x/repo must not authorize /x/repo-evil (startswith-prefix traversal)
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    sibling = tmp_path / "repo-evil"
+    sibling.mkdir()
+    (sibling / "secret").write_text("s")
+    with pytest.raises(ValueError):
+        _safe_path(worktree, "../repo-evil/secret")
+
+
+def test_repo_tools_skip_symlinks(tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("LEAKED_TOKEN=abc")
+    (worktree / "link.txt").symlink_to(secret)
+    (worktree / "ok.py").write_text("LEAKED_TOKEN nope, just code")
+    hits = repo_grep(worktree, "LEAKED_TOKEN")
+    assert "link.txt" not in hits and "ok.py" in hits
+    # reading through the symlink must fail (resolve+sandbox check or symlink check)
+    assert "LEAKED" not in repo_read_file(worktree, "link.txt")
+    assert "link.txt" not in repo_list_tree(worktree)
+
+
+def test_repo_read_file_edges(tmp_path):
+    (tmp_path / "f.txt").write_text("a\nb\n")
+    assert "beyond end of file" in repo_read_file(tmp_path, "f.txt", start_line=10)
+    assert "before start_line" in repo_read_file(tmp_path, "f.txt", start_line=2, end_line=1)
+
+
+def test_float_env_empty_string(monkeypatch):
+    monkeypatch.setenv("AI_RATE_LIMIT", "")
+    monkeypatch.setenv("REPO_CACHE_MAX_GB", "")
+    cfg = Settings()
+    assert cfg.ai_rate_limit == 2.0
+    assert cfg.repo_cache_max_gb == 30.0
+
+
+def test_redact_credentials_in_git_errors():
+    from reviewer.repo_cache import _redact
+    msg = "fatal: unable to access 'https://oauth2:glpat-SECRET@lab.x/p.git/'"
+    assert "glpat-SECRET" not in _redact(msg)
+    assert "https://***@lab.x" in _redact(msg)
+
+
+def test_requirements_declare_runtime_deps():
+    reqs = open("requirements.txt").read()
+    for dep in ("anthropic", "httpx[socks]"):
+        assert dep in reqs, f"{dep} missing from requirements.txt"
+
+
 # --- server queue dedupe ---
 
 def test_review_queue_dedupe():
