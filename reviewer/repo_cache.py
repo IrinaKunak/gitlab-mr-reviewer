@@ -132,7 +132,18 @@ class RepoCache:
 
     async def release(self, worktree: Path) -> None:
         repo_dir = worktree.parent / f"{worktree.name.rsplit('-mr', 1)[0]}.git"
-        await asyncio.to_thread(self._remove_worktree_sync, repo_dir, worktree)
+        # same lock as checkout_mr: never drop a bare repo mid-checkout of another MR
+        async with self._locks[str(repo_dir)]:
+            await asyncio.to_thread(self._remove_worktree_sync, repo_dir, worktree)
+            if settings.repo_cache_ephemeral:
+                await asyncio.to_thread(self._drop_repo, repo_dir)
+
+    def _drop_repo(self, repo_dir: Path) -> None:
+        """Ephemeral mode (small disks): clone -> investigate -> remove."""
+        if any(repo_dir.parent.glob(f"{repo_dir.stem}-mr*-wt")):
+            return  # another investigation of this project is still running
+        logger.info("Ephemeral mode: dropping %s after investigation", repo_dir)
+        shutil.rmtree(repo_dir, ignore_errors=True)
 
     def _remove_worktree_sync(self, repo_dir: Path, worktree: Path) -> None:
         try:

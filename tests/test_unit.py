@@ -296,6 +296,49 @@ def test_requirements_declare_runtime_deps():
         assert dep in reqs, f"{dep} missing from requirements.txt"
 
 
+def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):
+    """release() keeps the bare repo by default; REPO_CACHE_EPHEMERAL drops it."""
+    import shutil as _shutil
+    import subprocess as _sp
+    if _shutil.which("git") is None:
+        pytest.skip("git not available")
+    from reviewer import repo_cache as rc
+
+    def git(*args):
+        _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                check=True, capture_output=True)
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "-q", str(origin))
+    (origin / "f.txt").write_text("x")
+    git("-C", str(origin), "add", ".")
+    git("-C", str(origin), "commit", "-qm", "c1")
+
+    repo_dir = tmp_path / "cache" / "host" / "grp" / "app.git"
+    repo_dir.parent.mkdir(parents=True)
+    git("clone", "-q", "--bare", str(origin), str(repo_dir))
+
+    def add_worktree(name):
+        wt = repo_dir.parent / name
+        git("-C", str(repo_dir), "worktree", "add", "--detach", str(wt))
+        return wt
+
+    cache = rc.RepoCache(cache_dir=str(tmp_path / "cache"))
+
+    # default mode: worktree removed, bare repo kept for the next MR
+    monkeypatch.setattr(rc.settings, "repo_cache_ephemeral", False)
+    wt1 = add_worktree("app-mr1-aaa-wt")
+    asyncio.run(cache.release(wt1))
+    assert not wt1.exists() and repo_dir.exists()
+
+    # ephemeral mode: bare repo dropped too
+    monkeypatch.setattr(rc.settings, "repo_cache_ephemeral", True)
+    wt2 = add_worktree("app-mr2-bbb-wt")
+    asyncio.run(cache.release(wt2))
+    assert not wt2.exists() and not repo_dir.exists()
+
+
 # --- server queue dedupe ---
 
 def test_review_queue_dedupe():

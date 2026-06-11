@@ -20,7 +20,9 @@ Design doc: `plans/2026-06-11-v2-architecture.md`. The v1 monolith was refactore
   `cf-aig-authorization: Bearer` header) with OpenRouter fallback (Anthropic-compatible
   `/api/v1/messages`, `models` array failover); caching, rate limiting, agent tool loop
 - **reviewer/repo_cache.py**: lazy bare-clone cache (`refs/merge-requests/<iid>/head` fetch,
-  detached worktrees, LRU disk eviction) + sandboxed read-only repo tools for the investigator
+  detached worktrees, LRU disk eviction via `REPO_CACHE_MAX_GB`; `REPO_CACHE_EPHEMERAL=true`
+  switches to clone→investigate→remove for small disks) + sandboxed read-only repo tools
+  for the investigator
 - **reviewer/bridge.py**: Review Bridge client — exclusive `getUpdates` long-polling, asks
   AIManager questions per `plans/2026-06-10-review-bridge.md`, strips usage footers
 - **reviewer/gitlab_io.py / telegram_io.py**: GitLab and Telegram I/O (SOCKS via proxies dict,

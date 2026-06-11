@@ -112,6 +112,8 @@ class Settings:
     # --- repo cache ---
     repo_cache_dir: str = field(default_factory=lambda: os.getenv("REPO_CACHE_DIR", "repos"))
     repo_cache_max_gb: float = field(default_factory=lambda: _float("REPO_CACHE_MAX_GB", 30.0))
+    # clone -> investigate -> remove (for small disks); off = LRU cache within the budget
+    repo_cache_ephemeral: bool = field(default_factory=lambda: _bool("REPO_CACHE_EPHEMERAL"))
     investigator_max_iterations: int = field(
         default_factory=lambda: _int("INVESTIGATOR_MAX_ITERATIONS", 30))
 
