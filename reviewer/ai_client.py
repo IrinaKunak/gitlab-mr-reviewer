@@ -204,8 +204,11 @@ class AIClient:
             params["thinking"] = {"type": "adaptive"}
             if effort:
                 params["output_config"] = {"effort": effort}
-        # main = sonnet review: thinking off — direct, predictable-cost output
-        # fast = haiku-4-5: no thinking param, no effort (effort 400s on Haiku)
+        elif tier == "main":
+            # sonnet-5 runs ADAPTIVE thinking when the param is omitted (changed
+            # from sonnet-4-6!) — disabling must be explicit for predictable cost
+            params["thinking"] = {"type": "disabled"}
+        # fast = haiku-4-5: omitted param = no thinking; no effort (400s on Haiku)
         return params
 
     # --- cache (success-only, sha256 key, TTL) ---

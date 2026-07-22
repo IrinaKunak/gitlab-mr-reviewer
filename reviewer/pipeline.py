@@ -334,7 +334,9 @@ class Pipeline:
             result = await self.ai.agent_loop(
                 "smart", system, user, tools,
                 max_iterations=settings.investigator_max_iterations,
-                max_tokens=16000, effort="high")
+                # 32k: adaptive thinking bills against max_tokens on the smart
+                # tier — 16k could be consumed before any visible text
+                max_tokens=32000, effort="high")
         except AIError as exc:
             logger.error("investigation failed: %s", exc)
             return None

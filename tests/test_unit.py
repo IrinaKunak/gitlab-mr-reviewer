@@ -168,10 +168,11 @@ def test_primary_params_per_tier():
     smart = client._primary_params("smart", "high")
     assert smart["thinking"] == {"type": "adaptive"}
     assert smart["output_config"] == {"effort": "high"}
-    # main tier: thinking OFF — on big diffs adaptive thinking consumed the whole
-    # max_tokens budget before any text (prod 2026-07-22); review needs no thinking
-    assert client._primary_params("main", None) == {}
-    assert client._primary_params("main", "high") == {}
+    # main tier: thinking EXPLICITLY disabled — sonnet-5 runs adaptive thinking
+    # when the param is omitted (changed from sonnet-4-6), and it consumed the
+    # whole max_tokens budget before any text on big diffs (prod 2026-07-22)
+    assert client._primary_params("main", None) == {"thinking": {"type": "disabled"}}
+    assert client._primary_params("main", "high") == {"thinking": {"type": "disabled"}}
 
 
 def test_input_size_guard():
