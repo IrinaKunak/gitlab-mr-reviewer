@@ -1,6 +1,9 @@
 # GitLab MR Reviewer v2 — AI Gateway + Tiered Intelligence + Review Bridge (2026-06-11)
 
 > Status: APPROVED 2026-06-11 — all owner decisions made (see § Decisions at the bottom).
+> Model refresh 2026-07-23 (owner): main → `claude-sonnet-5` ($2/$10, cheaper than 4.6);
+> fallbacks → `gemini-3.5-flash-lite` (fast), `gemini-3.6-flash` (main),
+> `gpt-5.6-terra` + `kimi-k3` replacing `gpt-5.5` + `gemini-3.1-pro-preview` (smart).
 > Companion doc: `plans/2026-06-10-review-bridge.md` (AIManager side, already designed).
 
 ## Goals
@@ -31,7 +34,7 @@ KPI "100% feature parity with the current system" is retained.
 | Tier (env var) | Model | Price in/out per MTok | Used for |
 |---|---|---|---|
 | `ANTHROPIC_FAST_MODEL` | `claude-haiku-4-5` | $1 / $5 | Triage/classification, issue-key extraction, short-string translation (Telegram texts, comment headers), formatting |
-| `ANTHROPIC_MAIN_MODEL` | `claude-sonnet-4-6` | $3 / $15 | Standard code review (diff + file context), tester-report translation EN→RU |
+| `ANTHROPIC_MAIN_MODEL` | `claude-sonnet-5` | $2 / $10 | Standard code review (diff + file context), tester-report translation EN→RU |
 | `ANTHROPIC_SMART_MODEL` | `claude-opus-4-8` | $5 / $25 | **Decider + Investigator**: agentic loop over repo + bridge Q&A, tester-report authoring, deep review of complex MRs |
 
 Notes:
@@ -75,9 +78,9 @@ Fallback chains (verified slugs + prices, June 2026):
 
 | Tier | Chain (first = same-class Claude, then cross-vendor) |
 |---|---|
-| fast | `anthropic/claude-haiku-4.5` → `google/gemini-3.1-flash-lite` ($0.25/$1.50) → `deepseek/deepseek-v4-flash` ($0.10/$0.20) |
-| main | `anthropic/claude-sonnet-4.6` → `google/gemini-3.5-flash` ($1.50/$9) → `deepseek/deepseek-v4-pro` ($0.44/$0.87) |
-| smart | `anthropic/claude-opus-4.8` → `openai/gpt-5.5` ($5/$30) → `google/gemini-3.1-pro-preview` ($2/$12) |
+| fast | `anthropic/claude-haiku-4.5` → `google/gemini-3.5-flash-lite` ($0.30/$2.50) → `deepseek/deepseek-v4-flash` ($0.10/$0.20) |
+| main | `anthropic/claude-sonnet-5` → `google/gemini-3.6-flash` ($1.50/$7.50) → `deepseek/deepseek-v4-pro` ($0.44/$0.87) |
+| smart | `anthropic/claude-opus-4.8` → `openai/gpt-5.6-terra` ($2.50/$15) → `moonshotai/kimi-k3` ($3/$15) |
 
 Caveat: `anthropic/*` via OpenRouter hits the same Anthropic upstream — the cross-vendor
 entries are the real availability hedge. Chains are env-configurable
@@ -300,16 +303,16 @@ repo cache eviction; replay a corpus of past MR webhooks against a staging gatew
 AI_PROVIDER=anthropic
 ANTHROPIC_API_URL=https://gateway.ai.cloudflare.com/v1/<acct>/mr-reviewer/anthropic
 ANTHROPIC_API_KEY_GATEWAY=cfut_...        # sent as cf-aig-authorization: Bearer
-ANTHROPIC_MAIN_MODEL=claude-sonnet-4-6
+ANTHROPIC_MAIN_MODEL=claude-sonnet-5
 ANTHROPIC_FAST_MODEL=claude-haiku-4-5
 ANTHROPIC_SMART_MODEL=claude-opus-4-8
 OPENROUTER_API_TOKEN=sk-or-...
 REVIEW_BRIDGE_CHAT_ID=-5288630456
 
 # new
-OPENROUTER_FALLBACK_FAST=anthropic/claude-haiku-4.5,google/gemini-3.1-flash-lite,deepseek/deepseek-v4-flash
-OPENROUTER_FALLBACK_MAIN=anthropic/claude-sonnet-4.6,google/gemini-3.5-flash,deepseek/deepseek-v4-pro
-OPENROUTER_FALLBACK_SMART=anthropic/claude-opus-4.8,openai/gpt-5.5,google/gemini-3.1-pro-preview
+OPENROUTER_FALLBACK_FAST=anthropic/claude-haiku-4.5,google/gemini-3.5-flash-lite,deepseek/deepseek-v4-flash
+OPENROUTER_FALLBACK_MAIN=anthropic/claude-sonnet-5,google/gemini-3.6-flash,deepseek/deepseek-v4-pro
+OPENROUTER_FALLBACK_SMART=anthropic/claude-opus-4.8,openai/gpt-5.6-terra,moonshotai/kimi-k3
 AI_CACHE_TTL=3600            AI_TIMEOUT=120
 AI_DEBUG=true                AI_MAX_INPUT_TOKENS=150000
 REPO_CACHE_DIR=/app/repos    REPO_CACHE_MAX_GB=30
