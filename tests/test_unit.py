@@ -442,7 +442,8 @@ def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):
 
 def test_review_queue_dedupe():
     async def run():
-        queue = ReviewQueue(workers=0, dedupe_ttl=600)
+        # burst_window=0 isolates sha-keyed dedupe (burst collapsing has its own test)
+        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0)
         mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
               "mr_iid": 7, "last_commit": "abc"}
         assert queue.submit(dict(mr)) is True
