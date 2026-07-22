@@ -17,7 +17,9 @@ Classification rules:
 needs_investigation must be true only for `complex` MRs where whole-project impact analysis
 or business context (Jira) would materially improve the review and tester guidance.
 
-Extract Jira issue keys (patterns like ABC-123) from branch names, MR title and description."""
+Extract Jira issue keys (patterns like ABC-123) ONLY from the branch name, MR title and
+MR description fields. NEVER extract keys from the diff content — diffs routinely contain
+example keys in docs, tests and fixtures that do not belong to this MR."""
 
 TRIAGE_SCHEMA = {
     "type": "object",
