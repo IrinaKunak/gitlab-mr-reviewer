@@ -173,7 +173,9 @@ class AIClient:
                 api_key=real_key or ("gateway" if headers else None),
                 default_headers=headers,
                 http_client=self._http_client(self.cfg.ai_timeout),
-                max_retries=2,
+                # 1, not 2: a timed-out big request is still billed server-side —
+                # retries multiply cost; real outages go to the OpenRouter fallback
+                max_retries=1,
             )
         return self._primary
 

@@ -151,7 +151,10 @@ class Pipeline:
         await gitlab_io.post_note(
             mr, _msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
 
-        changes = await asyncio.to_thread(mr.changes)
+        # access_raw_diffs bypasses GitLab's per-file collapse limit, which
+        # otherwise returns empty diffs for large files (silently unreviewed)
+        changes = await asyncio.to_thread(
+            lambda: mr.changes(access_raw_diffs="true"))
         review_content = await asyncio.to_thread(
             gitlab_io.extract_review_content, project, mr, changes)
         if not review_content:

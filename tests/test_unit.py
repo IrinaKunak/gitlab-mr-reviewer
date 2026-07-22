@@ -235,6 +235,32 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_review_content_handles_collapsed_diffs():
+    # regression: GitLab returns empty diffs for collapsed (too large) files —
+    # exactly the biggest files silently vanished from the review (MR !18)
+    from types import SimpleNamespace
+    from reviewer import gitlab_io
+
+    class _File:
+        def decode(self):
+            return b"def core(): ...\n"
+
+    project = SimpleNamespace(files=SimpleNamespace(get=lambda path, ref: _File()))
+    mr = SimpleNamespace(source_branch="v2")
+    changes = {"changes": [
+        {"new_path": "reviewer/ai_client.py", "diff": "", "collapsed": True, "new_file": True},
+        {"new_path": "small.py", "diff": "+ok", "new_file": True},
+        {"new_path": "unchanged.py", "diff": ""},  # genuinely empty -> still skipped
+    ]}
+    out = gitlab_io.extract_review_content(project, mr, changes)
+    assert "reviewer/ai_client.py" in out and "def core" in out
+    assert "DIFF UNAVAILABLE" in out
+    assert "unchanged.py" not in out
+
+    diff_only = gitlab_io.extract_diff_only(changes)
+    assert "[diff unavailable: file too large]" in diff_only
+
+
 def test_parse_webhook_url_fix_and_actions():
     parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD)
     assert parsed is not None

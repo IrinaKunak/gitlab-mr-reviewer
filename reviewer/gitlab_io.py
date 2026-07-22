@@ -103,11 +103,39 @@ def extract_review_content(project, mr, changes: dict[str, Any]) -> str:
     for change in changes.get("changes", []):
         file_path = change.get("new_path", change.get("old_path", "unknown"))
         diff = change.get("diff", "")
-        if not diff:
+        collapsed = not diff and (change.get("collapsed") or change.get("too_large"))
+        if not diff and not collapsed:
             continue
 
         file_count += 1
         review_parts.append(f"\n{'=' * 80}\nFILE #{file_count}: {file_path}\n{'=' * 80}")
+
+        if collapsed:
+            # GitLab withheld the diff (per-file size limit) — fall back to the
+            # current file content so the reviewer still sees the code at all
+            review_parts.append(
+                "\n[DIFF UNAVAILABLE — GitLab collapsed it (file too large); "
+                "current content below]\n")
+            if change.get("deleted_file"):
+                review_parts.append("[FILE DELETED]\n")
+                continue
+            try:
+                file_obj = project.files.get(file_path, ref=mr.source_branch)
+                content = file_obj.decode().decode("utf-8", errors="replace")
+                lines = content.split("\n")
+                if len(lines) > 1000:
+                    review_parts.append(
+                        f"\n--- CURRENT FILE CONTENT (first 1000 lines of "
+                        f"{len(lines)} total) ---\n")
+                    review_parts.append("\n".join(lines[:1000]))
+                    review_parts.append("\n... [truncated] ...\n")
+                else:
+                    review_parts.append("\n--- CURRENT FILE CONTENT ---\n")
+                    review_parts.append(content)
+            except Exception as exc:  # noqa: BLE001 — context fetch is best-effort
+                logger.debug("Could not fetch file content for %s: %s", file_path, exc)
+                review_parts.append(f"[Unable to fetch content: {exc}]\n")
+            continue
 
         if change.get("deleted_file"):
             review_parts.append("\n[FILE DELETED]\n\n--- DIFF ---\n")
@@ -149,6 +177,8 @@ def extract_diff_only(changes: dict[str, Any]) -> str:
         diff = change.get("diff", "")
         if diff:
             parts.append(f"\n--- {file_path} ---\n{diff}")
+        elif change.get("collapsed") or change.get("too_large"):
+            parts.append(f"\n--- {file_path} ---\n[diff unavailable: file too large]")
     return "\n".join(parts)
 
 

@@ -88,7 +88,7 @@ class Settings:
     ai_cache_ttl: int = field(default_factory=lambda: _int("AI_CACHE_TTL", 3600, "GEMINI_CACHE_TTL"))
     ai_cache_dir: str = field(default_factory=lambda: os.getenv(
         "AI_CACHE_DIR", os.getenv("GEMINI_CACHE_DIR", "cache")))
-    ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 120, "GEMINI_TIMEOUT"))
+    ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 300, "GEMINI_TIMEOUT"))
     ai_agent_timeout: int = field(default_factory=lambda: _int("AI_AGENT_TIMEOUT", 600))
     ai_rate_limit: float = field(default_factory=lambda: _float(
         "AI_RATE_LIMIT", 2.0, "GEMINI_RATE_LIMIT"))
