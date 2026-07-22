@@ -72,6 +72,16 @@ def _msg(table: dict[str, str], **kwargs) -> str:
     return template.format(**kwargs) if kwargs else template
 
 
+def split_investigation(text: str) -> tuple[str, str | None]:
+    """Split investigator output into (impact analysis, optional tester report)."""
+    report = None
+    impact = text
+    if "## TESTER REPORT" in text:
+        impact, rest = text.split("## TESTER REPORT", 1)
+        report = "## TESTER REPORT\n\n" + rest.strip()
+    return impact.strip(), report
+
+
 class Pipeline:
     def __init__(self, client: AIClient | None = None):
         self.ai = client or ai_client
@@ -184,6 +194,10 @@ class Pipeline:
                 and triage.get("complexity") == "complex"):
             investigation = await self._investigate(
                 mr_data, gitlab_config, review_content, triage, review_en)
+            if investigation and investigation.get("impact"):
+                # the impact analysis belongs in the review comment — only the
+                # tester report is gated behind TESTER_REPORT below
+                review_en += "\n\n---\n\n" + investigation["impact"]
 
         review_out = await self._translate_if_needed(review_en, tier="fast")
         await self._deliver_review(mr, mr_data, project, gitlab_config,
@@ -344,14 +358,10 @@ class Pipeline:
             if worktree is not None:
                 await repo_cache.release(worktree)
 
-        text = result.text
-        report = None
-        if "## TESTER REPORT" in text:
-            report = text.split("## TESTER REPORT", 1)[1].strip()
-            report = f"## TESTER REPORT\n\n{report}"
+        impact, report = split_investigation(result.text)
         logger.info("investigation done: %d chars, tester_report=%s, tokens in=%d out=%d",
-                    len(text), bool(report), result.input_tokens, result.output_tokens)
-        return {"full_text": text, "tester_report": report}
+                    len(result.text), bool(report), result.input_tokens, result.output_tokens)
+        return {"full_text": result.text, "impact": impact, "tester_report": report}
 
     async def _translate_if_needed(self, text: str, tier: str) -> str:
         if settings.review_language != "ru" or not text:

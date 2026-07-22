@@ -238,6 +238,21 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_split_investigation():
+    # regression: with TESTER_REPORT=off the whole investigation (impact analysis
+    # included) was silently discarded — only the tester report is flag-gated
+    from reviewer.pipeline import split_investigation
+
+    impact, report = split_investigation(
+        "Impact: touches auth.\n\n## TESTER REPORT\n\nVerify login.")
+    assert impact == "Impact: touches auth."
+    assert report == "## TESTER REPORT\n\nVerify login."
+
+    impact2, report2 = split_investigation("Analysis only, no report section.")
+    assert impact2 == "Analysis only, no report section."
+    assert report2 is None
+
+
 def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     # regression: Haiku answered the translate request with English commentary
     # ("you haven't provided a markdown document") and it was posted as the review
