@@ -237,6 +237,32 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
+    # regression: Haiku answered the translate request with English commentary
+    # ("you haven't provided a markdown document") and it was posted as the review
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer.config import settings
+    from reviewer.pipeline import Pipeline
+
+    monkeypatch.setattr(settings, "review_language", "ru")
+    answers = iter([
+        "I appreciate your message, but you haven't provided a document.",
+        "Обзор: всё в порядке.",
+    ])
+
+    class StubAI:
+        async def complete(self, tier, system, user, **kwargs):
+            assert "<document>" in user  # translation input is always wrapped now
+            return SimpleNamespace(text=next(answers))
+
+    p = Pipeline(client=StubAI())
+    # commentary (no Cyrillic) -> deliver the English original instead
+    assert asyncio.run(p._translate_if_needed("review text", "fast")) == "review text"
+    # real translation passes through
+    assert asyncio.run(p._translate_if_needed("review text", "fast")) == "Обзор: всё в порядке."
+
+
 def test_burst_dedupe_collapses_multi_event_actions():
     # regression: reopening an MR after new pushes makes GitLab emit reopen +
     # update events with DIFFERENT shas ~1s apart -> two parallel reviews

@@ -356,12 +356,18 @@ class Pipeline:
             return text
         try:
             result = await self.ai.complete(
-                tier, prompts.TRANSLATE_SYSTEM, text,
+                tier, prompts.TRANSLATE_SYSTEM, prompts.translate_user_prompt(text),
                 max_tokens=max(2048, min(16000, len(text))), use_cache=True)
-            return result.text or text
         except AIError as exc:
             logger.error("translation failed, delivering English original: %s", exc)
             return text
+        out = (result.text or "").strip()
+        # invariant: a RU translation contains Cyrillic; anything else is model
+        # commentary (e.g. Haiku asking for "the document") — deliver the original
+        if out and any("Ѐ" <= ch <= "ӿ" for ch in out):
+            return out
+        logger.warning("translation output had no Cyrillic — delivering English original")
+        return text
 
     # --- delivery ---
 
