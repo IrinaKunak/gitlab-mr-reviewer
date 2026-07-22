@@ -197,10 +197,14 @@ class AIClient:
     def _primary_params(self, tier: str, effort: str | None) -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
         params: dict[str, Any] = {}
-        if tier in ("main", "smart"):
+        if tier == "smart":
+            # only the investigator thinks: on big-diff reviews adaptive thinking
+            # ate the entire max_tokens budget before emitting any text (prod,
+            # 2026-07-22) while the non-thinking fallback wrote a great review
             params["thinking"] = {"type": "adaptive"}
             if effort:
                 params["output_config"] = {"effort": effort}
+        # main = sonnet review: thinking off — direct, predictable-cost output
         # fast = haiku-4-5: no thinking param, no effort (effort 400s on Haiku)
         return params
 

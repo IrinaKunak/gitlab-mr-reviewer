@@ -168,8 +168,10 @@ def test_primary_params_per_tier():
     smart = client._primary_params("smart", "high")
     assert smart["thinking"] == {"type": "adaptive"}
     assert smart["output_config"] == {"effort": "high"}
-    main = client._primary_params("main", None)
-    assert "output_config" not in main
+    # main tier: thinking OFF — on big diffs adaptive thinking consumed the whole
+    # max_tokens budget before any text (prod 2026-07-22); review needs no thinking
+    assert client._primary_params("main", None) == {}
+    assert client._primary_params("main", "high") == {}
 
 
 def test_input_size_guard():
