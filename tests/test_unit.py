@@ -235,6 +235,25 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_burst_dedupe_collapses_multi_event_actions():
+    # regression: reopening an MR after new pushes makes GitLab emit reopen +
+    # update events with DIFFERENT shas ~1s apart -> two parallel reviews
+    from reviewer.server import ReviewQueue
+
+    def mr(sha):
+        return {"gitlab_config": {"name": "primary"}, "project_id": 132,
+                "mr_iid": 18, "last_commit": sha}
+
+    q = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=30)
+    assert q.submit(mr("aaa")) is True
+    assert q.submit(mr("bbb")) is False   # different sha, same MR, same instant
+    assert q.submit(mr("aaa")) is False   # exact duplicate still deduped
+
+    q2 = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=0)
+    assert q2.submit(mr("aaa")) is True
+    assert q2.submit(mr("bbb")) is True   # window=0 disables burst collapsing
+
+
 def test_review_content_handles_collapsed_diffs():
     # regression: GitLab returns empty diffs for collapsed (too large) files —
     # exactly the biggest files silently vanished from the review (MR !18)

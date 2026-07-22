@@ -98,6 +98,7 @@ class Settings:
     ai_max_input_tokens: int = field(default_factory=lambda: _int("AI_MAX_INPUT_TOKENS", 150_000))
     ai_workers: int = field(default_factory=lambda: _int("AI_WORKERS", 2))
     dedupe_ttl: int = field(default_factory=lambda: _int("DEDUPE_TTL", 600))
+    dedupe_burst: int = field(default_factory=lambda: _int("DEDUPE_BURST_SECONDS", 30))
 
     # legacy single-model review prompt overrides (used in parity mode / checklist content)
     review_prompt_en: str = field(default_factory=lambda: os.getenv("GEMINI_PROMPT", ""))

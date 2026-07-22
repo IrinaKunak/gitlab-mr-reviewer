@@ -34,11 +34,13 @@ logger = logging.getLogger(__name__)
 class ReviewQueue:
     """Bounded-concurrency MR processing with webhook-retry dedupe."""
 
-    def __init__(self, workers: int, dedupe_ttl: int):
+    def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30):
         self.queue: asyncio.Queue[dict] = asyncio.Queue()
         self.workers = workers
         self.dedupe_ttl = dedupe_ttl
+        self.burst_window = burst_window
         self._seen: dict[tuple, float] = {}
+        self._mr_seen: dict[tuple, float] = {}
         self._tasks: list[asyncio.Task] = []
 
     def dedupe_key(self, mr_data: dict) -> tuple:
@@ -54,7 +56,18 @@ class ReviewQueue:
         if key in self._seen:
             logger.info("Duplicate webhook for %s — skipped", key)
             return False
+        # one user action can emit several events with different shas (e.g.
+        # reopen + update after new commits) — collapse the burst per MR; the
+        # queued review reads live MR state anyway, so nothing is lost
+        mr_key = key[:3]
+        last = self._mr_seen.get(mr_key)
+        if last is not None and now - last < self.burst_window:
+            logger.info("Burst duplicate for %s — skipped", mr_key)
+            return False
+        self._mr_seen = {k: s for k, s in self._mr_seen.items()
+                         if now - s < self.burst_window}
         self._seen[key] = now
+        self._mr_seen[mr_key] = now
         self.queue.put_nowait(mr_data)
         return True
 
@@ -79,7 +92,8 @@ class ReviewQueue:
                 self.queue.task_done()
 
 
-review_queue = ReviewQueue(settings.ai_workers, settings.dedupe_ttl)
+review_queue = ReviewQueue(settings.ai_workers, settings.dedupe_ttl,
+                           settings.dedupe_burst)
 
 _last_unknown_token_alert = 0.0
 _UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
