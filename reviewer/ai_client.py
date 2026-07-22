@@ -32,6 +32,10 @@ from .config import Settings, settings as default_settings
 
 logger = logging.getLogger(__name__)
 
+# appended when a response hits max_tokens; a result that is ONLY this marker
+# produced no visible text (adaptive thinking consumed the whole output budget)
+TRUNCATION_MARKER = "*[response truncated at the output limit]*"
+
 # Cross-vendor fallbacks may reject Anthropic-specific params — sent only to primary.
 _RETRYABLE = (
     anthropic.RateLimitError,
@@ -314,6 +318,14 @@ class AIClient:
         try:
             response = await self._call(self.primary, request, timeout)
             result = self._to_result(response, "gateway")
+            if result.text == TRUNCATION_MARKER and max_tokens < 64000:
+                # adaptive thinking can eat the entire budget before any text
+                # (seen with sonnet-5 on a huge diff) — one retry with 4x the room
+                logger.warning("no visible text at max_tokens=%d -> retry with %d",
+                               max_tokens, max_tokens * 4)
+                request["max_tokens"] = max_tokens * 4
+                response = await self._call(self.primary, request, timeout)
+                result = self._to_result(response, "gateway")
         except _RETRYABLE + (anthropic.APIStatusError,) as exc:
             if not _should_fallback(exc):
                 raise self._wrap(exc)
@@ -326,7 +338,8 @@ class AIClient:
             tier, result.model, result.provider, result.input_tokens,
             result.output_tokens, time.monotonic() - started)
         self._debug("response", f"provider={result.provider} text={result.text[:5000]}")
-        if use_cache and not json_schema:
+        if use_cache and not json_schema and result.text != TRUNCATION_MARKER:
+            # never cache a no-text truncation — it would poison retries for an hour
             self._cache_put(cache_key, result.text)
         return result
 
@@ -371,7 +384,7 @@ class AIClient:
                        if getattr(block, "type", "") == "text")
         if stop_reason == "max_tokens":
             logger.warning("response truncated at max_tokens (provider=%s)", provider)
-            text += "\n\n*[response truncated at the output limit]*"
+            text += "\n\n" + TRUNCATION_MARKER
         usage = getattr(response, "usage", None)
         return AIResult(
             text=text.strip(),

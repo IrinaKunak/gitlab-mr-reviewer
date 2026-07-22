@@ -92,6 +92,47 @@ def test_debug_log_failure_is_nonfatal(tmp_path):
     client._debug("response", "again")   # stays disabled, still no raise
 
 
+def test_truncated_empty_response_retries_with_larger_budget(tmp_path):
+    # regression: sonnet-5 adaptive thinking ate the whole 4096 budget on a huge
+    # diff -> zero text blocks -> a junk marker-only comment was posted AND cached
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer.ai_client import TRUNCATION_MARKER
+
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    client = AIClient(cfg)
+    budgets = []
+
+    def fake_response(texts, stop):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=t) for t in texts],
+            stop_reason=stop, model="m",
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+    async def fake_create(**kwargs):
+        budgets.append(kwargs["max_tokens"])
+        if len(budgets) == 1:
+            return fake_response([], "max_tokens")  # thinking consumed everything
+        return fake_response(["real review"], "end_turn")
+
+    client._primary = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    result = asyncio.run(client.complete("main", "sys", "user", max_tokens=4096))
+    assert budgets == [4096, 16384]
+    assert result.text == "real review"
+
+    # if the retry ALSO comes back with no text, the marker-only result must not
+    # be cached (a poisoned cache entry made every retrigger junk for an hour)
+    async def always_empty(**kwargs):
+        return fake_response([], "max_tokens")
+
+    client._primary = SimpleNamespace(messages=SimpleNamespace(create=always_empty))
+    result2 = asyncio.run(client.complete("main", "sys2", "user2", max_tokens=4096))
+    assert result2.text == TRUNCATION_MARKER
+    key = client._cache_key(cfg.model_for_tier("main"), "sys2", "user2")
+    assert client._cache_get(key) is None
+
+
 def test_gateway_auth_modes():
     # mode 1: real key + cfut token -> both x-api-key and cf-aig-authorization
     cfg = Settings()

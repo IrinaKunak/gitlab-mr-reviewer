@@ -253,7 +253,7 @@ class Pipeline:
         """Review with file context; if too large, retry diff-only before refusing."""
         try:
             user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
-            return await self.ai.complete(tier, system, user, max_tokens=4096, effort=effort)
+            return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
         except AIInputTooLargeError:
             if not diff_only:
                 raise
@@ -262,7 +262,7 @@ class Pipeline:
             user = prompts.review_user_prompt(
                 gitlab_io.mr_header(mr_data)
                 + "\n(file context omitted — MR too large; diffs only)", diff_only)
-            return await self.ai.complete(tier, system, user, max_tokens=4096, effort=effort)
+            return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
 
     async def _investigate(self, mr_data: dict, gitlab_config: dict,
                            review_content: str, triage: dict, review_en: str) -> dict | None:
