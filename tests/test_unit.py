@@ -291,6 +291,16 @@ def test_parse_webhook_url_fix_and_actions():
     assert gitlab_io.parse_merge_request_webhook(closed) is None
 
 
+def test_parse_webhook_no_review_marker():
+    tagged = {**WEBHOOK_PAYLOAD,
+              "object_attributes": {**WEBHOOK_PAYLOAD["object_attributes"],
+                                    "title": "big infra change [no-review]"}}
+    assert gitlab_io.parse_merge_request_webhook(tagged) is None
+
+    labeled = {**WEBHOOK_PAYLOAD, "labels": [{"title": "No-Review"}]}
+    assert gitlab_io.parse_merge_request_webhook(labeled) is None
+
+
 def test_extract_jira_keys():
     parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD)
     keys = gitlab_io.extract_jira_keys(parsed)

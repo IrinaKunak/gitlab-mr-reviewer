@@ -43,6 +43,14 @@ def parse_merge_request_webhook(payload: dict[str, Any]) -> dict[str, Any] | Non
         attrs = payload["object_attributes"]
         project = payload["project"]
 
+        # opt-out: [no-review] in the title/description or a "no-review" label
+        # (e.g. infra MRs where every push would re-review a huge diff for $$)
+        marker_text = f"{attrs.get('title', '')} {attrs.get('description', '')}".lower()
+        labels = {(lbl.get("title") or "").lower() for lbl in payload.get("labels", [])}
+        if "[no-review]" in marker_text or "no-review" in labels:
+            logger.info("Skipping MR !%s: no-review marker present", attrs.get("iid"))
+            return None
+
         url = attrs.get("url", "")
         if "/-/mergerequests/" in url:
             url = url.replace("/-/mergerequests/", "/-/merge_requests/")
