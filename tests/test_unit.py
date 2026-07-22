@@ -79,6 +79,19 @@ def test_cache_roundtrip(tmp_path):
     assert client._cache_get(key) is None
 
 
+def test_debug_log_failure_is_nonfatal(tmp_path):
+    # regression: unwritable logs/ mount raised Errno 13 inside _debug and killed the review
+    cfg = Settings()
+    cfg.ai_debug = True
+    blocker = tmp_path / "blocker"
+    blocker.write_text("")  # file where a directory is needed -> mkdir raises OSError
+    cfg.ai_log_dir = str(blocker / "logs")
+    client = AIClient(cfg)
+    client._debug("request", "payload")  # must not raise
+    assert client._debug_failed
+    client._debug("response", "again")   # stays disabled, still no raise
+
+
 def test_gateway_auth_modes():
     # mode 1: real key + cfut token -> both x-api-key and cf-aig-authorization
     cfg = Settings()

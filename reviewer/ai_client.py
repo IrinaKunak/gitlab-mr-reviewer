@@ -134,6 +134,7 @@ class AIClient:
         self._last_call = 0.0
         self._cache_dir = Path(self.cfg.ai_cache_dir)
         self._debug_logger: logging.Logger | None = None
+        self._debug_failed = False
         self._primary: AsyncAnthropic | None = None
         self._fallback: AsyncAnthropic | None = None
 
@@ -243,19 +244,25 @@ class AIClient:
             self._last_call = time.monotonic()
 
     def _debug(self, direction: str, payload: str) -> None:
-        if not self.cfg.ai_debug:
+        if not self.cfg.ai_debug or self._debug_failed:
             return
-        if self._debug_logger is None:
-            log_dir = Path(self.cfg.ai_log_dir)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            handler = RotatingFileHandler(
-                log_dir / "ai-debug.log", maxBytes=20_000_000, backupCount=3, encoding="utf-8")
-            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-            self._debug_logger = logging.getLogger("reviewer.ai_debug")
-            self._debug_logger.addHandler(handler)
-            self._debug_logger.setLevel(logging.DEBUG)
-            self._debug_logger.propagate = False
-        self._debug_logger.debug("%s | %s", direction, payload[:50_000])
+        try:
+            if self._debug_logger is None:
+                log_dir = Path(self.cfg.ai_log_dir)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                handler = RotatingFileHandler(
+                    log_dir / "ai-debug.log", maxBytes=20_000_000, backupCount=3, encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                self._debug_logger = logging.getLogger("reviewer.ai_debug")
+                self._debug_logger.addHandler(handler)
+                self._debug_logger.setLevel(logging.DEBUG)
+                self._debug_logger.propagate = False
+            self._debug_logger.debug("%s | %s", direction, payload[:50_000])
+        except OSError as exc:
+            # debug logging must never take down a review (e.g. unwritable
+            # bind-mounted logs/ dir) — warn once and continue without it
+            self._debug_failed = True
+            logger.warning("AI debug logging disabled (%s) — reviews continue without it", exc)
 
     # --- public API ---
 
