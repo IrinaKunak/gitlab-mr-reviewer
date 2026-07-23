@@ -1,331 +1,113 @@
 # GitLab MR Reviewer 🚀
 
-A comprehensive GitLab Merge Request reviewer service that provides automated code quality analysis, with multi-instance support, enhanced notifications, and Docker deployment.
+Automated merge-request reviews for GitLab, powered by a tiered Claude pipeline via
+Cloudflare AI Gateway (OpenRouter fallback): **Haiku triage → Sonnet review → Opus
+investigator** (whole-repo agentic analysis + Jira context through a Telegram bridge to
+AIManager) → **Russian delivery**, plus **tester reports** for complex MRs.
 
-> **v2 (this branch):** reviews are powered by **Claude via Cloudflare AI Gateway** with an
-> **OpenRouter fallback** (the Gemini CLI wrapper is retired; `AI_PROVIDER=gemini` remains as a
-> rollback hatch). New feature-flagged stages: Haiku triage → Sonnet review → Opus investigator
-> (whole-repo analysis + AIManager Q&A via the Review Bridge) → Russian tester reports delivered
-> to the MR and the bridge chat. Design doc: `plans/2026-06-11-v2-architecture.md`.
-> The webhook contract, env names, port and endpoints are unchanged from v1.
+Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bridge.md`.
+Operational guidance for AI-assisted development: `CLAUDE.md`.
 
 ## ✨ Features
 
-- 🔗 **Multi-Instance GitLab Support** - Connect up to 10 GitLab instances
-- 🤖 **AI-Powered Code Reviews** - Enhanced reviews with original file context
-- 📱 **Multi-Channel Telegram Notifications** - Support for multiple Telegram channels
-- 🐳 **Docker Ready** - Complete containerization with docker-compose
-- 🔍 **Debug Logging** - Detailed Gemini request/response tracking
-- 🌐 **Proxy Support** - HTTP/SOCKS proxy compatibility
-- 🔒 **Security Focus** - Identifies security vulnerabilities and best practices
-- 🌍 **Multi-Language** - English and Russian support
-- 🔧 **Bulk Webhook Management** - Automated webhook setup for all projects
-- 🧪 **Testing Utilities** - Comprehensive webhook and integration testing
-- ⚡ **Production Ready** - Fully tested and optimized for production use
-- 🔄 **URL Fix** - Automatic correction of GitLab URL formats
+- 🔗 **Multi-instance GitLab** — up to 10 instances, routed by webhook secret token
+- 🤖 **Tiered AI reviews** — cheap triage routes trivial MRs away from expensive models;
+  complex MRs get a full agentic investigation over a local clone of the project
+- 🧠 **Business context** — the investigator asks AIManager about Jira issues in a
+  dedicated Telegram group (Review Bridge) and folds answers into the review
+- 🧪 **Tester reports** — verification guides delivered to the MR and Telegram
+- 💰 **Cost accounting** — per-review usage footer in Telegram, `logs/usage.jsonl`
+  ledger, `GET /stats` totals; prices overridable via `MODEL_PRICES`
+- 📱 **Telegram notifications** — up to 10 channels, error alerts included
+- 🚦 **Sane webhook handling** — retry dedupe, burst collapsing (one user action = one
+  review), `[no-review]` title marker / `no-review` label opt-out
+- 🌍 **English/Russian** — prompts run in English, final output translated to Russian
+- 🐳 **Docker deployment**, HTTP/SOCKS proxy support, bulk webhook management scripts
 
 ## 🚀 Quick Start
 
-### Docker Deployment (Recommended)
-
 ```bash
-# Clone the repository
-git clone <your-repo-url>
-cd gitlab-mr-reviewer
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your GitLab and Telegram settings
-
-# Deploy with Docker Compose
-docker-compose up -d
-
-# Or build and run manually
-docker build -t gitlab-mr-reviewer .
-docker run -p 5000:5000 -d gitlab-mr-reviewer
+git clone <your-repo-url> && cd gitlab-mr-reviewer
+cp .env.example .env      # fill in GitLab tokens, Anthropic/gateway keys, Telegram
+mkdir -p logs cache repos
+docker compose up -d --build
+sudo chown -R 999:999 logs cache repos   # container runs as uid 999 (appuser)
+curl http://localhost:5000/              # health + feature flags
 ```
 
-### Manual Installation
+The service binds to `127.0.0.1:5000` — put a TLS reverse proxy (e.g. Caddy) in front
+for the public webhook URL.
 
-```bash
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+### GitLab webhook
 
-# Install dependencies
-pip install -r requirements.txt
+Per project (or bulk via `add_webhooks_to_all_projects.py`):
 
-# Install Gemini CLI
-npm install -g @google/gemini-cli
+- URL: `https://<your-domain>/webhook`
+- Secret Token: the matching `XGITLABTOKEN[_N]` value (this is how instances are routed)
+- Trigger: Merge request events
 
-# Start the server
-DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
+### Feature flags
+
+| Flag | What it enables |
+|------|-----------------|
+| `PIPELINE_V2` | tiered pipeline (triage → review → translate); off = v1-parity single pass |
+| `INVESTIGATOR` | Opus agentic analysis for complex MRs (clones the repo, read-only tools) |
+| `BRIDGE` | AIManager Q&A in the Review Bridge Telegram group |
+| `TESTER_REPORT` | tester verification guides (.md on the MR + Telegram) |
+
+Any flag can be turned off and the container restarted for instant rollback.
+
+## 🔍 Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /webhook` | GitLab merge request events (multi-instance via X-Gitlab-Token) |
+| `GET /` | health, version, active flags |
+| `GET /stats` | overall token/cost totals, per-model breakdown, last 20 reviews |
+
+## 💰 Cost visibility
+
+Every review-completion Telegram message ends with a usage footer:
+
+```
+haiku-4-5: →19448 ←446 | sonnet-5: →104634 ←7457 | 💰$0.30
 ```
 
-## ⚙️ Configuration
-
-### Environment Variables
-
-```bash
-# Primary GitLab Instance
-GITLAB_URL=https://gitlab.example.com
-GITLAB_TOKEN=your_gitlab_token
-XGITLABTOKEN=your_webhook_secret
-
-# Additional GitLab Instances (up to 10)
-GITLAB_URL_2=https://gitlab2.example.com
-GITLAB_TOKEN_2=your_second_gitlab_token
-XGITLABTOKEN_2=your_second_webhook_secret
-
-# Telegram Configuration
-TELEGRAM=on
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_primary_chat_id
-TELEGRAM_CHAT_ID_1=additional_chat_id_1
-TELEGRAM_CHAT_ID_2=additional_chat_id_2
-
-# Gemini Configuration
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_DEBUG=false
-
-# Review Settings
-REVIEW_LANGUAGE=en  # or 'ru' for Russian
-REVIEW_FOR_CONFLICT=false
-
-# Proxy Settings (optional)
-HTTP_PROXY=http://proxy.example.com:8080
-SOCKS_PROXY=proxy.example.com:1080
-```
-
-## 🔧 Webhook Setup
-
-### Manual Setup
-Configure webhooks in each GitLab instance:
-
-1. Go to Project Settings > Webhooks
-2. URL: `https://r.smysl.pro/webhook`
-3. Secret Token: Use the corresponding `XGITLABTOKEN` value
-4. Triggers: ✅ Merge request events
-
-### Automated Bulk Setup
-Use the bulk webhook management script:
-
-```bash
-# Preview what webhooks would be added
-python add_webhooks_to_all_projects.py --dry-run
-
-# Add webhooks to all projects in all instances
-python add_webhooks_to_all_projects.py
-
-# Add webhooks to specific instance only
-python add_webhooks_to_all_projects.py --instance primary
-
-# Test webhook endpoint connectivity
-python add_webhooks_to_all_projects.py --test-endpoint
-```
-
-**Features:**
-- ✅ Adds webhooks to all projects across multiple GitLab instances
-- ✅ Detects and skips existing webhooks
-- ✅ Supports proxy configurations
-- ✅ Provides detailed progress and error reporting
-- ✅ Includes dry-run mode for safe testing
-
-## 📊 Features Overview
-
-### Multi-Instance Support
-- Automatically detects GitLab instance by webhook token
-- Support for up to 10 different GitLab instances
-- Instance information included in notifications
-
-### Enhanced Code Reviews
-- Reviews include both diffs AND original file content
-- Better context for AI analysis
-- Handles large diffs without size limits (uses stdin piping)
-- Identifies security vulnerabilities, performance issues, and code quality problems
-
-### Multiple Telegram Channels
-- Notify up to 10 different Telegram channels
-- Instance-specific notifications
-- Rich formatting with project details and direct links
-
-### Debug Logging
-- Detailed Gemini request/response logging
-- Separate debug log files
-- Configurable debug levels
-
-## 🐳 Docker Features
-
-- **Base Image**: Node.js 20 with Python 3.11
-- **Security**: Non-root user execution with proper permissions
-- **Health Checks**: Built-in container health monitoring
-- **Volumes**: Persistent logs and cache storage
-- **Auto-reload**: Environment changes require rebuild
-- **Gemini CLI**: Properly configured with permission fixes
-- **Permission Management**: Automated creation of required directories
-
-## 🔍 Monitoring
-
-### Logs
-- **Application**: Standard uvicorn/FastAPI logs
-- **Gemini Debug**: `/app/logs/gemini-debug.log` (when `GEMINI_DEBUG=true`)
-- **Docker**: `docker logs gitlab-mr-reviewer-test`
-- **Cache**: `/app/cache/` directory for Gemini response caching
-
-### Health Check
-```bash
-curl http://localhost:5000/
-# Response: {"status":"GitLab MR Reviewer is running","version":"1.0.2"}
-
-# Docker container health
-docker ps | grep gitlab-mr-reviewer
-# Should show "healthy" status
-```
+Per-review entries append to `logs/usage.jsonl`; `GET /stats` aggregates them. Prices
+are list-price ceilings ($/MTok) — override via `MODEL_PRICES=model=in/out,...` when
+pricing changes.
 
 ## 🛠️ Development
 
-### Testing
 ```bash
-# Test webhook functionality
-python test_multi_instance_webhook.py
-
-# Create test MRs
-python create_test_mr_multi.py
-
-# Test Docker features
-python test_docker_features.py
-
-# Add webhooks to all projects (bulk setup)
-python add_webhooks_to_all_projects.py --dry-run
-python add_webhooks_to_all_projects.py
-
-# Test webhook integration end-to-end
-python test_webhooks.py
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m pytest tests/ -q          # offline unit tests, no API keys needed
+DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
 ```
 
-### Debug Mode
-```bash
-# Enable debug logging
-export DEBUG=true
-export GEMINI_DEBUG=true
+Testing utilities: `test_webhooks.py` (create test MRs in the configured test repos),
+`add_webhooks_to_all_projects.py --dry-run` (bulk webhook management),
+`test_gitlab_connection.py`, `test_webhook_local.py`.
 
-# Check debug logs (Docker)
-docker exec gitlab-mr-reviewer-test tail -f /app/logs/gemini-debug.log
+## 🧯 Troubleshooting
 
-# Check debug logs (local)
-tail -f logs/gemini-debug.log
-```
+- **`Errno 13 Permission denied` on logs/cache/repos** — the bind-mounted volumes must
+  be writable by uid 999: `sudo chown -R 999:999 logs cache repos`
+- **Review posted but empty / marker only** — check `logs/ai-debug.log` with
+  `AI_DEBUG=true`; the client retries no-text responses automatically
+- **Bridge questions unanswered** — the bot must be a member of the bridge group with
+  privacy mode disabled, AIManager must allowlist the bot id (`GUEST_ANSWER_BOT_IDS`),
+  and nothing else may call `getUpdates` on the bot token
+- **Duplicate reviews** — one user action can emit several webhook events; covered by
+  `DEDUPE_TTL` / `DEDUPE_BURST_SECONDS`. Same-SHA retries are suppressed for 10 min.
+- **An MR you never want reviewed** (huge infra branches): add `[no-review]` to its
+  title or a `no-review` label
+- **Full rollback to v1** — deploy the `master` branch (the v2 image has no Gemini CLI;
+  `AI_PROVIDER=gemini` works only with the v1 image)
 
-## 📄 License
+## 📊 Production status
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-#### Gemini CLI Permission Errors
-If you see `EACCES: permission denied, mkdir '/home/appuser/.gemini'`:
-```bash
-# This is fixed in the latest Docker image
-docker pull gitlab-mr-reviewer:latest
-docker stop gitlab-mr-reviewer-test
-docker rm gitlab-mr-reviewer-test
-docker run -d -p 5000:5000 --name gitlab-mr-reviewer-test gitlab-mr-reviewer
-```
-
-#### Large Diff Handling
-If you see `Argument list too long` error in Gemini wrapper:
-- This has been fixed in the latest version
-- The script now uses stdin piping instead of command-line arguments
-- No size limit for merge request diffs
-
-#### Container Health Issues
-```bash
-# Check container status
-docker ps | grep gitlab-mr-reviewer
-docker logs gitlab-mr-reviewer-test
-
-# Test Gemini CLI inside container
-docker exec gitlab-mr-reviewer-test gemini -p "test"
-```
-
-#### Webhook Not Working
-```bash
-# Verify webhook endpoint
-curl -X POST -H "Content-Type: application/json" \
-  -H "X-Gitlab-Event: Merge Request Hook" \
-  -H "X-Gitlab-Token: your_webhook_token" \
-  -d '{"test": "data"}' \
-  https://r.smysl.pro/webhook
-
-# Test with actual merge requests
-python test_webhooks.py
-
-# Check webhook configuration
-python add_webhooks_to_all_projects.py --dry-run
-```
-
-#### Permission Issues
-```bash
-# If bulk webhook setup fails with permission errors
-# Ensure your GitLab tokens have:
-# - Maintainer/Owner role on projects
-# - API access enabled
-# - Webhook creation permissions
-```
-
-## 📞 Support
-
-For issues and questions:
-- Check the logs in `/app/logs/` (Docker) or `logs/` (local)
-- Review the configuration in CLAUDE.md
-- Verify Docker container health: `docker ps | grep gitlab-mr-reviewer`
-- Test Gemini CLI: `docker exec <container> gemini -p "test"`
-- Run webhook tests: `python test_webhooks.py`
-- Check webhook setup: `python add_webhooks_to_all_projects.py --dry-run`
-- Create an issue in the repository
-
-## 🧪 Testing
-
-The project includes comprehensive testing utilities and has been fully tested in production:
-
-### Test Results ✅
-- **Server Health**: All endpoints responding correctly
-- **Multi-Instance Support**: Successfully tested with 133 projects (primary) + 245 projects (secondary)
-- **Webhook Processing**: Verified with actual GitLab merge requests
-- **Telegram Notifications**: Confirmed delivery to all configured channels
-- **Gemini Integration**: AI code reviews working with caching and rate limiting
-- **Docker Deployment**: Container health checks and proper permission handling
-- **URL Correction**: Automatic fix for GitLab URL formats (`/mergerequests/` → `/merge_requests/`)
-- **PyCharm Integration**: All IDE warnings and highlights resolved
-
-### Test Repositories
-- **Primary Instance**: `spikerwork/test-repo` (https://lab.smysl.pro)
-- **Secondary Instance**: `gitlab-instance-0d55f60d/max-test` (https://lab.catzwolf.ru)
-
-### Test Workflow
-1. Run `python test_webhooks.py` to create test merge requests
-2. Check GitLab projects for AI code review comments
-3. Verify Telegram notifications are received
-4. Confirm multi-instance routing works correctly
-5. Test webhook endpoint with `curl` or Python scripts
-
-### Webhook Management
-- **Bulk Setup**: `python add_webhooks_to_all_projects.py`
-- **Test Connectivity**: `python add_webhooks_to_all_projects.py --test-endpoint`
-- **Dry Run**: `python add_webhooks_to_all_projects.py --dry-run`
-- **Instance Specific**: `python add_webhooks_to_all_projects.py --instance primary`
-- **Local Testing**: `python test_webhook_local.py` for direct API testing
-
----
-
-**Made with ❤️ for better code reviews**
+Deployed on `r.smysl.pro` since 2026-07-23 with all flags enabled, serving two GitLab
+instances (~380 projects). Verified end-to-end: tiered reviews, repo-clone
+investigations, bridge Q&A with AIManager, tester reports, cost accounting.
