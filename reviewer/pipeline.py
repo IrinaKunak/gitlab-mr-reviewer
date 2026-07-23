@@ -21,7 +21,7 @@ from typing import Any
 
 import gitlab as gitlab_lib
 
-from . import gitlab_io, prompts, telegram_io
+from . import gitlab_io, prompts, telegram_io, usage
 from .ai_client import AIClient, AIError, AIInputTooLargeError, AITimeoutError, ToolDef, ai_client
 from .bridge import bridge
 from .config import settings
@@ -111,6 +111,8 @@ class Pipeline:
             return
         ctx = {"project_id": mr_data.get("project_id"), "mr_iid": mr_data.get("mr_iid"),
                "gitlab_instance": gitlab_config.get("name", "unknown")}
+        tracker = usage.UsageTracker()
+        tracker_token = usage.current_tracker.set(tracker)
         try:
             await self._process_inner(mr_data, gitlab_config, ctx)
         except gitlab_lib.exceptions.GitlabError as exc:
@@ -133,6 +135,9 @@ class Pipeline:
             await telegram_io.notify_error("general", str(exc), ctx)
             await self._safe_note(mr_data, gitlab_config,
                                   _msg(GENERAL_ERROR_MSG, error=str(exc)))
+        finally:
+            usage.current_tracker.reset(tracker_token)
+            usage.persist(tracker, mr_data)
 
     async def _safe_note(self, mr_data: dict, gitlab_config: dict, body: str) -> None:
         """Best-effort MR comment on error paths (v1 behavior)."""

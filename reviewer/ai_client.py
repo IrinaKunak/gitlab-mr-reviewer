@@ -28,6 +28,7 @@ from typing import Any, Awaitable, Callable
 import anthropic
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
+from . import usage
 from .config import Settings, settings as default_settings
 
 logger = logging.getLogger(__name__)
@@ -346,6 +347,9 @@ class AIClient:
             "ai ok tier=%s model=%s provider=%s in=%d out=%d %.1fs",
             tier, result.model, result.provider, result.input_tokens,
             result.output_tokens, time.monotonic() - started)
+        usage.record(tier=tier, model=result.model, provider=result.provider,
+                     input_tokens=result.input_tokens,
+                     output_tokens=result.output_tokens)
         self._debug("response", f"provider={result.provider} text={result.text[:5000]}")
         if use_cache and not json_schema and result.text != TRUNCATION_MARKER:
             # never cache a no-text truncation — it would poison retries for an hour
@@ -394,13 +398,13 @@ class AIClient:
         if stop_reason == "max_tokens":
             logger.warning("response truncated at max_tokens (provider=%s)", provider)
             text += "\n\n" + TRUNCATION_MARKER
-        usage = getattr(response, "usage", None)
+        usage_info = getattr(response, "usage", None)
         return AIResult(
             text=text.strip(),
             model=getattr(response, "model", ""),
             provider=provider,
-            input_tokens=getattr(usage, "input_tokens", 0) or 0,
-            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            input_tokens=getattr(usage_info, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage_info, "output_tokens", 0) or 0,
         )
 
     def _wrap(self, exc: Exception) -> AIError:
@@ -463,9 +467,9 @@ class AIClient:
                 except Exception as exc2:  # noqa: BLE001
                     raise self._wrap(exc2) from exc
 
-            usage = getattr(response, "usage", None)
-            total_in += getattr(usage, "input_tokens", 0) or 0
-            total_out += getattr(usage, "output_tokens", 0) or 0
+            usage_info = getattr(response, "usage", None)
+            total_in += getattr(usage_info, "input_tokens", 0) or 0
+            total_out += getattr(usage_info, "output_tokens", 0) or 0
             last_text = "".join(block.text for block in response.content
                                 if getattr(block, "type", "") == "text") or last_text
 
@@ -480,6 +484,8 @@ class AIClient:
             if response.stop_reason != "tool_use":
                 logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
                             iteration + 1, response.stop_reason, total_in, total_out)
+                usage.record(tier=tier, model=model, provider=provider,
+                             input_tokens=total_in, output_tokens=total_out)
                 return AIResult(text=last_text.strip(), model=model, provider=provider,
                                 input_tokens=total_in, output_tokens=total_out)
 

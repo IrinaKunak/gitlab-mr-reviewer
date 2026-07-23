@@ -238,6 +238,49 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_usage_cost_and_tracker(tmp_path, monkeypatch):
+    from reviewer import usage
+
+    # dated model ids normalize to the priced alias
+    assert usage.model_key("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+    assert usage.cost_usd("claude-sonnet-5", 100_000, 10_000) == (
+        100_000 * 2.0 + 10_000 * 10.0) / 1_000_000  # $0.30
+    assert usage.cost_usd("unknown/model", 1_000_000, 0) == 0.0  # unknown -> $0
+
+    tracker = usage.UsageTracker()
+    tracker.record(tier="fast", model="claude-haiku-4-5-20251001",
+                   provider="gateway", input_tokens=19_000, output_tokens=450)
+    tracker.record(tier="main", model="claude-sonnet-5", provider="gateway",
+                   input_tokens=100_000, output_tokens=7_500)
+    tracker.record(tier="smart", model="claude-opus-4-8", provider="gateway",
+                   input_tokens=300_000, output_tokens=7_000)
+    assert tracker.total_input == 419_000
+    assert set(tracker.by_model()) == {
+        "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"}
+    assert 1.9 < tracker.total_cost < 2.1  # ≈ $0.02 + $0.28 + $1.68
+    assert "$" in tracker.summary_line()
+
+    # persist + aggregate roundtrip
+    monkeypatch.setattr(usage.settings, "ai_log_dir", str(tmp_path))
+    mr = {"gitlab_config": {"name": "primary"}, "project_path": "g/p", "mr_iid": 7}
+    usage.persist(tracker, mr)
+    usage.persist(tracker, mr)
+    agg = usage.aggregate()
+    assert agg["totals"]["reviews"] == 2
+    assert agg["totals"]["input_tokens"] == 2 * 419_000
+    assert agg["by_model"]["claude-opus-4-8"]["calls"] == 2
+    assert len(agg["recent"]) == 2
+
+    # contextvar plumbing: record() is a no-op without an active tracker
+    usage.record(tier="fast", model="m", provider="p",
+                 input_tokens=1, output_tokens=1)
+    token = usage.current_tracker.set(usage.UsageTracker())
+    usage.record(tier="fast", model="claude-haiku-4-5", provider="gateway",
+                 input_tokens=5, output_tokens=5)
+    assert usage.current_tracker.get().calls[0]["input_tokens"] == 5
+    usage.current_tracker.reset(token)
+
+
 def test_tester_report_targets(monkeypatch):
     # owner request 2026-07-23: reports go to the team group(s) too, not only
     # the bridge chat where AIManager archives them

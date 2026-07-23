@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
-from . import __version__, gitlab_io, telegram_io
+from . import __version__, gitlab_io, telegram_io, usage
 from .bridge import bridge
 from .config import settings
 from .pipeline import pipeline
@@ -159,6 +159,12 @@ async def root() -> dict[str, Any]:
             "tester_report": settings.tester_report,
         },
     }
+
+
+@app.get("/stats")
+async def stats() -> dict[str, Any]:
+    """Token/cost stats: overall totals, per-model breakdown, recent reviews."""
+    return await asyncio.to_thread(usage.aggregate)
 
 
 @app.post("/webhook")
