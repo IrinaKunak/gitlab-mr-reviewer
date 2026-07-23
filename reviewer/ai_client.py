@@ -195,6 +195,15 @@ class AIClient:
 
     # --- model params per tier ---
 
+    @staticmethod
+    def _record_agent_usage(tier: str, model: str, provider: str,
+                            total_in: int, total_out: int) -> None:
+        """Record accumulated agent-loop tokens — called on EVERY exit path;
+        a failed investigation's completed turns are still real spend."""
+        if total_in or total_out:
+            usage.record(tier=tier, model=model, provider=provider,
+                         input_tokens=total_in, output_tokens=total_out)
+
     def _primary_params(self, tier: str, effort: str | None) -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
         params: dict[str, Any] = {}
@@ -307,6 +316,9 @@ class AIClient:
             cached = self._cache_get(cache_key)
             if cached is not None:
                 logger.info("ai cache hit tier=%s", tier)
+                # $0, but visible in per-review call counts
+                usage.record(tier=tier, model=model, provider="cache",
+                             input_tokens=0, output_tokens=0)
                 return AIResult(text=cached, model=model, provider="cache", cached=True)
 
         await self._rate_limit()
@@ -437,6 +449,7 @@ class AIClient:
         model = self.cfg.model_for_tier(tier)
         total_in = total_out = 0
         last_text = ""
+        provider = "gateway"
 
         for iteration in range(max_iterations):
             await self._rate_limit()
@@ -450,11 +463,13 @@ class AIClient:
                 provider = "gateway"
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
                 if not _should_fallback(exc):
+                    self._record_agent_usage(tier, model, provider, total_in, total_out)
                     raise self._wrap(exc)
                 logger.warning("agent_loop primary failed (%s), trying openrouter",
                                type(exc).__name__)
                 client = self.fallback
                 if client is None:
+                    self._record_agent_usage(tier, model, provider, total_in, total_out)
                     raise self._wrap(exc)
                 chain = self.cfg.fallback_chain(tier)
                 request = {"model": chain[0], "system": system,
@@ -465,6 +480,7 @@ class AIClient:
                     response = await self._call(client, request, self.cfg.ai_agent_timeout)
                     provider = "openrouter"
                 except Exception as exc2:  # noqa: BLE001
+                    self._record_agent_usage(tier, model, provider, total_in, total_out)
                     raise self._wrap(exc2) from exc
 
             usage_info = getattr(response, "usage", None)
@@ -480,12 +496,12 @@ class AIClient:
                 messages.append({"role": "assistant", "content": response.content})
                 continue
             if response.stop_reason == "refusal":
+                self._record_agent_usage(tier, model, provider, total_in, total_out)
                 raise AIError("model refused during investigation (stop_reason=refusal)")
             if response.stop_reason != "tool_use":
                 logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
                             iteration + 1, response.stop_reason, total_in, total_out)
-                usage.record(tier=tier, model=model, provider=provider,
-                             input_tokens=total_in, output_tokens=total_out)
+                self._record_agent_usage(tier, model, provider, total_in, total_out)
                 return AIResult(text=last_text.strip(), model=model, provider=provider,
                                 input_tokens=total_in, output_tokens=total_out)
 
@@ -508,7 +524,8 @@ class AIClient:
             messages.append({"role": "user", "content": results})
 
         logger.warning("agent_loop hit max_iterations=%d", max_iterations)
-        return AIResult(text=last_text.strip(), model=model, provider="gateway",
+        self._record_agent_usage(tier, model, provider, total_in, total_out)
+        return AIResult(text=last_text.strip(), model=model, provider=provider,
                         input_tokens=total_in, output_tokens=total_out)
 
 

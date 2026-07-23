@@ -286,6 +286,42 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     usage.current_tracker.reset(token)
 
 
+def test_agent_loop_records_usage_on_max_iterations(tmp_path):
+    # regression: only the clean end_turn exit recorded usage — investigations
+    # that hit max_iterations or died mid-loop vanished from the stats
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer import usage
+    from reviewer.ai_client import AIClient
+
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    client = AIClient(cfg)
+
+    tool_block = SimpleNamespace(type="tool_use", name="nope", input={}, id="t1")
+
+    async def fake_create(**kwargs):
+        return SimpleNamespace(
+            content=[tool_block], stop_reason="tool_use", model="m",
+            usage=SimpleNamespace(input_tokens=100, output_tokens=10))
+
+    stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    stub.with_options = lambda **kw: stub
+    client._primary = stub
+    tracker = usage.UsageTracker()
+    token = usage.current_tracker.set(tracker)
+    try:
+        result = asyncio.run(client.agent_loop(
+            "smart", "sys", "go", tools=[], max_iterations=3))
+    finally:
+        usage.current_tracker.reset(token)
+
+    assert result.input_tokens == 300 and result.output_tokens == 30
+    assert len(tracker.calls) == 1  # a single aggregate record for the loop
+    assert tracker.calls[0]["input_tokens"] == 300
+    assert tracker.calls[0]["output_tokens"] == 30
+
+
 def test_tester_report_targets(monkeypatch):
     # owner request 2026-07-23: reports go to the team group(s) too, not only
     # the bridge chat where AIManager archives them
