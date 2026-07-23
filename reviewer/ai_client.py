@@ -28,7 +28,7 @@ from typing import Any, Awaitable, Callable
 import anthropic
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
-from . import usage
+from . import overrides, usage
 from .config import Settings, settings as default_settings
 
 logger = logging.getLogger(__name__)
@@ -204,9 +204,13 @@ class AIClient:
             usage.record(tier=tier, model=model, provider=provider,
                          input_tokens=total_in, output_tokens=total_out)
 
-    def _primary_params(self, tier: str, effort: str | None) -> dict:
+    def _primary_params(self, tier: str, effort: str | None, model: str = "") -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
         params: dict[str, Any] = {}
+        if model.startswith("claude-haiku"):
+            # haiku (any tier, e.g. via runtime override): no thinking param,
+            # no effort — both 400 on it
+            return params
         if tier == "smart":
             # only the investigator thinks: on big-diff reviews adaptive thinking
             # ate the entire max_tokens budget before emitting any text (prod,
@@ -309,7 +313,7 @@ class AIClient:
     ) -> AIResult:
         """Single-shot completion with primary -> fallback failover."""
         self.guard_input_size(system, user_content)
-        model = self.cfg.model_for_tier(tier)
+        model = overrides.model_for_tier(tier, self.cfg)
 
         cache_key = self._cache_key(model, system, user_content)
         if use_cache and not json_schema:
@@ -326,9 +330,20 @@ class AIClient:
         self._debug("request", f"tier={tier} model={model} system={system[:500]} "
                                f"user={user_content[:2000]}")
 
+        started = time.monotonic()
+        if "/" in model:
+            # vendor-prefixed runtime override (e.g. openai/gpt-5.6-terra):
+            # the CF gateway can't serve it — route via OpenRouter, with the
+            # tier's regular chain behind it as backup
+            chain = [model] + [m for m in self.cfg.fallback_chain(tier) if m != model]
+            result = await self._fallback_complete(
+                tier, system, messages, max_tokens, json_schema, timeout,
+                cause=None, chain=chain)
+            return self._finish(tier, result, cache_key, use_cache, json_schema, started)
+
         request: dict[str, Any] = {
             "model": model, "system": system, "messages": messages,
-            "max_tokens": max_tokens, **self._primary_params(tier, effort),
+            "max_tokens": max_tokens, **self._primary_params(tier, effort, model),
         }
         if json_schema:
             request["output_config"] = {
@@ -336,7 +351,6 @@ class AIClient:
                 "format": {"type": "json_schema", "schema": json_schema},
             }
 
-        started = time.monotonic()
         try:
             response = await self._call(self.primary, request, timeout)
             result = self._to_result(response, "gateway")
@@ -355,6 +369,10 @@ class AIClient:
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout, cause=exc)
 
+        return self._finish(tier, result, cache_key, use_cache, json_schema, started)
+
+    def _finish(self, tier: str, result: AIResult, cache_key: str,
+                use_cache: bool, json_schema: dict | None, started: float) -> AIResult:
         logger.info(
             "ai ok tier=%s model=%s provider=%s in=%d out=%d %.1fs",
             tier, result.model, result.provider, result.input_tokens,
@@ -377,11 +395,13 @@ class AIClient:
 
     async def _fallback_complete(self, tier: str, system: str, messages: list,
                                  max_tokens: int, json_schema: dict | None,
-                                 timeout: float | None, cause: Exception) -> AIResult:
+                                 timeout: float | None, cause: Exception | None,
+                                 chain: list[str] | None = None) -> AIResult:
         client = self.fallback
         if client is None:
-            raise self._wrap(cause)
-        chain = self.cfg.fallback_chain(tier)
+            raise (self._wrap(cause) if cause is not None
+                   else AIError("cross-vendor model override requires OPENROUTER_API_TOKEN"))
+        chain = chain or self.cfg.fallback_chain(tier)
         if json_schema:
             system = (f"{system}\n\nRespond with ONLY valid JSON matching this schema, "
                       f"no prose:\n{json.dumps(json_schema)}")
@@ -446,21 +466,34 @@ class AIClient:
         handlers = {tool.name: tool.handler for tool in tools}
         api_tools = [tool.to_api() for tool in tools]
         messages: list[dict] = [{"role": "user", "content": user_content}]
-        model = self.cfg.model_for_tier(tier)
+        model = overrides.model_for_tier(tier, self.cfg)
+        via_openrouter = "/" in model  # vendor-prefixed runtime override
         total_in = total_out = 0
         last_text = ""
         provider = "gateway"
 
         for iteration in range(max_iterations):
             await self._rate_limit()
-            request = {
-                "model": model, "system": system, "messages": messages,
-                "max_tokens": max_tokens, "tools": api_tools,
-                **self._primary_params(tier, effort),
-            }
+            if via_openrouter:
+                if self.fallback is None:
+                    self._record_agent_usage(tier, model, provider, total_in, total_out)
+                    raise AIError(
+                        "cross-vendor model override requires OPENROUTER_API_TOKEN")
+                request = {"model": model, "system": system,
+                           "messages": _strip_thinking(messages),
+                           "max_tokens": max_tokens, "tools": api_tools,
+                           "extra_body": {"models": [model] + [
+                               m for m in self.cfg.fallback_chain(tier) if m != model]}}
+            else:
+                request = {
+                    "model": model, "system": system, "messages": messages,
+                    "max_tokens": max_tokens, "tools": api_tools,
+                    **self._primary_params(tier, effort, model),
+                }
             try:
-                response = await self._call(self.primary, request, self.cfg.ai_agent_timeout)
-                provider = "gateway"
+                target = self.fallback if via_openrouter else self.primary
+                response = await self._call(target, request, self.cfg.ai_agent_timeout)
+                provider = "openrouter" if via_openrouter else "gateway"
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
                 if not _should_fallback(exc):
                     self._record_agent_usage(tier, model, provider, total_in, total_out)

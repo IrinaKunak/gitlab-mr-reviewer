@@ -77,6 +77,15 @@ DASHBOARD_HTML = """<!doctype html>
          opacity: 0; transition: opacity .08s; z-index: 10; }
   #tip b { font-variant-numeric: tabular-nums; }
   .err { color: var(--ink-2); padding: 30px; text-align: center; }
+  .tierrow { display: grid; grid-template-columns: 110px 1fr 220px;
+             gap: 10px; align-items: center; padding: 4px 0; }
+  .tierrow label { font-size: 12.5px; color: var(--ink); }
+  .tierrow .hint { font-size: 11.5px; color: var(--muted); }
+  select, button { font: inherit; color: var(--ink); background: var(--page);
+                   border: 1px solid var(--border); border-radius: 7px;
+                   padding: 5px 8px; }
+  button { cursor: pointer; font-weight: 600; }
+  code { font-size: 11.5px; }
 </style>
 </head>
 <body>
@@ -87,6 +96,17 @@ DASHBOARD_HTML = """<!doctype html>
     <svg id="daily" width="100%" height="150" role="img"
          aria-label="Daily spend, last 30 days"></svg></div>
   <div class="card"><h2>Spend by model</h2><div id="models"></div></div>
+  <div class="card"><h2>Tier models (runtime override)</h2>
+    <div id="tiers"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:10px">
+      <button id="saveModels">Save</button>
+      <span class="sub" id="modelsStatus" style="margin:0"></span>
+    </div>
+    <div class="sub" style="margin:8px 0 0">
+      Plain <code>claude-*</code> ids run via the CF gateway; vendor-prefixed
+      (<code>openai/…</code>, <code>google/…</code>) run via OpenRouter.
+      Default = value from .env. Applies to new reviews immediately.</div>
+  </div>
   <div class="card"><h2>Recent reviews</h2>
     <div style="overflow-x:auto"><table id="recent"></table></div></div>
   <div id="tip"></div>
@@ -94,7 +114,11 @@ DASHBOARD_HTML = """<!doctype html>
 (async function () {
   const qs = new URLSearchParams(location.search);
   const token = qs.get("token");
-  const url = "/stats" + (token ? "?token=" + encodeURIComponent(token) : "");
+  // resolve against origin: strips any user:pass@ from the page URL, which
+  // would otherwise make relative fetch() illegal
+  const api = p => location.origin + p +
+    (token ? "?token=" + encodeURIComponent(token) : "");
+  const url = api("/stats");
   let data;
   try {
     const res = await fetch(url, {cache: "no-store"});
@@ -193,6 +217,44 @@ DASHBOARD_HTML = """<!doctype html>
       m.calls + " calls · " + fmtK(m.input_tokens) + "→" + fmtK(m.output_tokens));
   });
   document.getElementById("models").addEventListener("mouseleave", hideTip);
+
+  // --- tier model overrides (admin) ---
+  try {
+    const mm = await fetch(api("/admin/models"), {cache: "no-store"})
+      .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+    const route = m => m.includes("/") ? "OpenRouter" : "CF gateway";
+    document.getElementById("tiers").innerHTML =
+      ["fast", "main", "smart"].map(tier => {
+        const opts = ['<option value="">default — ' + mm.defaults[tier] + "</option>"]
+          .concat(mm.known_models.map(m =>
+            '<option value="' + m + '"' +
+            (mm.overrides[tier] === m ? " selected" : "") + ">" + m +
+            " · " + route(m) + "</option>")).join("");
+        return '<div class="tierrow"><label>' + tier + '</label>' +
+          '<select data-tier="' + tier + '">' + opts + "</select>" +
+          '<span class="hint">now: ' + mm.effective[tier] + " · " +
+          route(mm.effective[tier]) + "</span></div>";
+      }).join("");
+    document.getElementById("saveModels").addEventListener("click", async () => {
+      const body = {};
+      document.querySelectorAll("select[data-tier]").forEach(
+        s => body[s.dataset.tier] = s.value);
+      const st = document.getElementById("modelsStatus");
+      st.textContent = "saving…";
+      try {
+        const r = await fetch(api("/admin/models"), {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)});
+        if (!r.ok) throw new Error(r.status);
+        st.textContent = "saved — applies to the next review";
+        setTimeout(() => location.reload(), 900);
+      } catch (e) { st.textContent = "save failed (" + e.message + ")"; }
+    });
+  } catch (e) {
+    document.getElementById("tiers").innerHTML =
+      '<div class="sub">admin data unavailable (' + e.message + ")</div>";
+    document.getElementById("saveModels").style.display = "none";
+  }
 
   // --- recent reviews table ---
   const rows = (data.recent || []).slice()

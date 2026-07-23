@@ -11,6 +11,7 @@ N workers and webhook-retry dedupe; the bridge listener runs as a lifespan task.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import logging
@@ -22,7 +23,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from . import __version__, gitlab_io, telegram_io, usage
+from . import __version__, gitlab_io, overrides, telegram_io, usage
 from .bridge import bridge
 from .config import settings
 from .pipeline import pipeline
@@ -163,39 +164,94 @@ async def root() -> dict[str, Any]:
     }
 
 
+def basic_auth_ok(authorization: str) -> bool:
+    """Validate an HTTP Basic header against STATS_USER/STATS_PASSWORD."""
+    if not (settings.stats_user and settings.stats_password):
+        return False
+    scheme, _, blob = authorization.partition(" ")
+    if scheme.lower() != "basic" or not blob:
+        return False
+    try:
+        user, _, password = base64.b64decode(blob.strip()).decode().partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return (hmac.compare_digest(user, settings.stats_user)
+            and hmac.compare_digest(password, settings.stats_password))
+
+
 def stats_access_allowed(authorization: str, query_token: str,
                          forwarded_for: str | None) -> bool:
-    """STATS_TOKEN set -> require Bearer header or ?token=; unset -> only
-    direct local requests (proxied ones carry X-Forwarded-For) are allowed."""
+    """Basic creds and/or STATS_TOKEN when configured; with neither configured,
+    only direct local requests (proxied ones carry X-Forwarded-For) pass."""
+    if basic_auth_ok(authorization):
+        return True
     token = settings.stats_token
     if token:
         if hmac.compare_digest(authorization, f"Bearer {token}"):
             return True
         return bool(query_token) and hmac.compare_digest(query_token, token)
+    if settings.stats_user and settings.stats_password:
+        return False  # basic auth is configured and did not match
     return forwarded_for is None
+
+
+def _dash_guard(request: Request) -> None:
+    """Shared auth for /stats, /dashboard and /admin endpoints."""
+    if stats_access_allowed(
+            request.headers.get("authorization", ""),
+            request.query_params.get("token", ""),
+            request.headers.get("x-forwarded-for")):
+        return
+    if settings.stats_user and settings.stats_password:
+        # trigger the browser's native login prompt
+        raise HTTPException(status_code=401, detail="Unauthorized",
+                            headers={"WWW-Authenticate": 'Basic realm="mr-reviewer"'})
+    raise HTTPException(status_code=403, detail="Forbidden")
 
 
 @app.get("/stats")
 async def stats(request: Request) -> dict[str, Any]:
     """Token/cost stats: overall totals, per-model breakdown, recent reviews."""
-    if not stats_access_allowed(
-            request.headers.get("authorization", ""),
-            request.query_params.get("token", ""),
-            request.headers.get("x-forwarded-for")):
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _dash_guard(request)
     return await asyncio.to_thread(usage.aggregate)
 
 
 @app.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
     """Self-contained stats dashboard (same auth as /stats)."""
-    if not stats_access_allowed(
-            request.headers.get("authorization", ""),
-            request.query_params.get("token", ""),
-            request.headers.get("x-forwarded-for")):
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _dash_guard(request)
     from .dashboard import DASHBOARD_HTML
     return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/admin/models")
+async def get_models(request: Request) -> dict[str, Any]:
+    """Current tier models: .env defaults, runtime overrides, effective values."""
+    _dash_guard(request)
+    ov = overrides.load()
+    defaults = {"fast": settings.model_fast, "main": settings.model_main,
+                "smart": settings.model_smart}
+    return {
+        "defaults": defaults,
+        "overrides": ov,
+        "effective": {t: (ov.get(t) or d) for t, d in defaults.items()},
+        "known_models": sorted(usage.PRICES),
+    }
+
+
+@app.post("/admin/models")
+async def set_models(request: Request) -> dict[str, Any]:
+    """Set/clear per-tier model overrides (empty string = back to .env default).
+    Applies immediately to new reviews; vendor-prefixed models run via OpenRouter."""
+    _dash_guard(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected an object")
+    saved = overrides.save(body)
+    return {"overrides": saved}
 
 
 @app.post("/webhook")

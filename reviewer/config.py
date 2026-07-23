@@ -135,6 +135,9 @@ class Settings:
         default_factory=lambda: _csv("TESTER_REPORT_CHAT_IDS", ""))
     # bearer token for GET /stats; empty = direct local access only
     stats_token: str = field(default_factory=lambda: os.getenv("STATS_TOKEN", ""))
+    # HTTP Basic credentials for /stats & /dashboard (browser login prompt)
+    stats_user: str = field(default_factory=lambda: os.getenv("STATS_USER", ""))
+    stats_password: str = field(default_factory=lambda: os.getenv("STATS_PASSWORD", ""))
     bridge_question_timeout: int = field(default_factory=lambda: _int("BRIDGE_QUESTION_TIMEOUT", 90))
     bridge_answer_grace: float = field(default_factory=lambda: _float("BRIDGE_ANSWER_GRACE", 6.0))
     bridge_max_questions_per_mr: int = field(

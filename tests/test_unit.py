@@ -297,6 +297,63 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     usage.current_tracker.reset(token)
 
 
+def test_model_overrides_and_routing(tmp_path, monkeypatch):
+    # owner feature 2026-07-23: switch tier models at runtime from the dashboard;
+    # vendor-prefixed overrides must route via OpenRouter, claude-* via gateway
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer import overrides
+    from reviewer.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(overrides, "_cache", None)
+
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    assert overrides.model_for_tier("smart", cfg) == cfg.model_smart  # env default
+    overrides.save({"smart": "openai/gpt-5.6-terra", "junk": "ignored"})
+    assert overrides.model_for_tier("smart", cfg) == "openai/gpt-5.6-terra"
+    assert overrides.load()["fast"] == ""  # untouched tiers stay on defaults
+
+    # complete() with the override must call the OpenRouter client, not primary
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")],
+            stop_reason="end_turn", model="openai/gpt-5.6-terra",
+            usage=SimpleNamespace(input_tokens=5, output_tokens=5))
+
+    client = AIClient(cfg)
+    client._fallback = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    client._primary = None  # would explode if touched — proves routing
+    result = asyncio.run(client.complete("smart", "sys", "user", use_cache=False))
+    assert result.provider == "openrouter"
+    assert captured["model"] == "openai/gpt-5.6-terra"
+    assert captured["extra_body"]["models"][0] == "openai/gpt-5.6-terra"
+
+    monkeypatch.setattr(overrides, "_cache", None)  # don't leak into other tests
+
+
+def test_basic_auth(monkeypatch):
+    import base64
+    from reviewer.config import settings
+    from reviewer.server import basic_auth_ok, stats_access_allowed
+
+    monkeypatch.setattr(settings, "stats_user", "max")
+    monkeypatch.setattr(settings, "stats_password", "pw123")
+    good = "Basic " + base64.b64encode(b"max:pw123").decode()
+    bad = "Basic " + base64.b64encode(b"max:nope").decode()
+    assert basic_auth_ok(good) is True
+    assert basic_auth_ok(bad) is False
+    assert basic_auth_ok("Bearer xyz") is False
+    # with basic configured, unauthenticated local access is no longer allowed
+    monkeypatch.setattr(settings, "stats_token", "")
+    assert stats_access_allowed(good, "", "203.0.113.7") is True
+    assert stats_access_allowed("", "", None) is False
+
+
 def test_stats_access_control(monkeypatch):
     from reviewer.config import settings
     from reviewer.server import stats_access_allowed
