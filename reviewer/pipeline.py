@@ -72,6 +72,22 @@ def _msg(table: dict[str, str], **kwargs) -> str:
     return template.format(**kwargs) if kwargs else template
 
 
+def tester_report_targets() -> list[str]:
+    """Chats that receive the tester-report document.
+
+    Bridge chat first (AIManager archives reports into its corpus), then the
+    team channels where the testers actually are (TESTER_REPORT_CHAT_IDS, or
+    all regular notification channels when unset)."""
+    targets: list[str] = []
+    if settings.bridge_chat_id:
+        targets.append(settings.bridge_chat_id)
+    if settings.telegram_enabled:
+        for chat_id in settings.tester_report_chat_ids or settings.telegram_chat_ids:
+            if chat_id not in targets:
+                targets.append(chat_id)
+    return targets
+
+
 def split_investigation(text: str) -> tuple[str, str | None]:
     """Split investigator output into (impact analysis, optional tester report)."""
     report = None
@@ -419,11 +435,11 @@ class Pipeline:
         else:  # upload failed — inline the report so it isn't lost
             await gitlab_io.post_note(mr, report_ru[:60_000])
 
-        if settings.bridge_chat_id:
-            caption = (f"🧪 Tester report: {mr_data['project_path']} "
-                       f"!{mr_data['mr_iid']}\n{mr_data['url']}")
+        caption = (f"🧪 Tester report: {mr_data['project_path']} "
+                   f"!{mr_data['mr_iid']}\n{mr_data['url']}")
+        for chat_id in tester_report_targets():
             await telegram_io.send_document(
-                settings.bridge_chat_id, filename, report_ru.encode("utf-8"), caption)
+                chat_id, filename, report_ru.encode("utf-8"), caption)
 
     # --- legacy gemini path (rollback hatch) ---
 

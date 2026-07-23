@@ -129,6 +129,10 @@ class Settings:
 
     # --- Review Bridge ---
     bridge_chat_id: str = field(default_factory=lambda: os.getenv("REVIEW_BRIDGE_CHAT_ID", ""))
+    # where tester reports are sent besides the bridge chat; empty = all
+    # regular notification channels (TELEGRAM_CHAT_ID*)
+    tester_report_chat_ids: list[str] = field(
+        default_factory=lambda: _csv("TESTER_REPORT_CHAT_IDS", ""))
     bridge_question_timeout: int = field(default_factory=lambda: _int("BRIDGE_QUESTION_TIMEOUT", 90))
     bridge_answer_grace: float = field(default_factory=lambda: _float("BRIDGE_ANSWER_GRACE", 6.0))
     bridge_max_questions_per_mr: int = field(

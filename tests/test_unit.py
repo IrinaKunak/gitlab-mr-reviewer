@@ -238,6 +238,27 @@ WEBHOOK_PAYLOAD = {
 }
 
 
+def test_tester_report_targets(monkeypatch):
+    # owner request 2026-07-23: reports go to the team group(s) too, not only
+    # the bridge chat where AIManager archives them
+    from reviewer.config import settings
+    from reviewer.pipeline import tester_report_targets
+
+    monkeypatch.setattr(settings, "bridge_chat_id", "-100bridge")
+    monkeypatch.setattr(settings, "telegram_enabled", True)
+    monkeypatch.setattr(settings, "telegram_chat_ids", ["-100team", "-100extra"])
+    monkeypatch.setattr(settings, "tester_report_chat_ids", [])
+    assert tester_report_targets() == ["-100bridge", "-100team", "-100extra"]
+
+    # explicit override narrows the team targets; dedupe against bridge
+    monkeypatch.setattr(settings, "tester_report_chat_ids", ["-100team", "-100bridge"])
+    assert tester_report_targets() == ["-100bridge", "-100team"]
+
+    # telegram off -> only the bridge copy
+    monkeypatch.setattr(settings, "telegram_enabled", False)
+    assert tester_report_targets() == ["-100bridge"]
+
+
 def test_split_investigation():
     # regression: with TESTER_REPORT=off the whole investigation (impact analysis
     # included) was silently discarded — only the tester report is flag-gated
