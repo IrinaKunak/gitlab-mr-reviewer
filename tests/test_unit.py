@@ -271,6 +271,11 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     assert agg["by_model"]["claude-opus-4-8"]["calls"] == 2
     assert len(agg["recent"]) == 2
 
+    # telegram footer, AIManager style
+    footer = tracker.footer_line()
+    assert "haiku-4-5: →19000 ←450" in footer
+    assert "💰$" in footer
+
     # contextvar plumbing: record() is a no-op without an active tracker
     usage.record(tier="fast", model="m", provider="p",
                  input_tokens=1, output_tokens=1)

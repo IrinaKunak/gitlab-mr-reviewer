@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from . import usage
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -164,5 +165,11 @@ def format_mr_message(mr_data: dict, project_name: str, has_conflicts: bool = Fa
             "\n📝 Code review posted to GitLab (too long for Telegram)"
             if lang == "en" else
             "\n📝 Обзор кода опубликован в GitLab (слишком длинный для Telegram)")
+
+    # usage footer (AIManager style) — only on review-completion messages
+    if review_content:
+        tracker = usage.current_tracker.get()
+        if tracker is not None and tracker.calls:
+            parts.append(f"\n`{tracker.footer_line()}`")
 
     return "\n".join(parts)

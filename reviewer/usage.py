@@ -113,6 +113,15 @@ class UsageTracker:
         return (f"${self.total_cost:.2f} "
                 f"({self.total_input:,}→{self.total_output:,} tok; {per_model})")
 
+    def footer_line(self) -> str:
+        """Compact usage footer for Telegram messages (AIManager style)."""
+        segs = []
+        for model, stats in sorted(self.by_model().items()):
+            name = model.split("/")[-1].replace("claude-", "")
+            segs.append(f"{name}: →{stats['input_tokens']} ←{stats['output_tokens']}")
+        segs.append(f"💰${self.total_cost:.2f}")
+        return " | ".join(segs)
+
 
 current_tracker: contextvars.ContextVar[UsageTracker | None] = contextvars.ContextVar(
     "usage_tracker", default=None)
