@@ -11,6 +11,7 @@ N workers and webhook-retry dedupe; the bridge listener runs as a lifespan task.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import shutil
@@ -161,9 +162,26 @@ async def root() -> dict[str, Any]:
     }
 
 
+def stats_access_allowed(authorization: str, query_token: str,
+                         forwarded_for: str | None) -> bool:
+    """STATS_TOKEN set -> require Bearer header or ?token=; unset -> only
+    direct local requests (proxied ones carry X-Forwarded-For) are allowed."""
+    token = settings.stats_token
+    if token:
+        if hmac.compare_digest(authorization, f"Bearer {token}"):
+            return True
+        return bool(query_token) and hmac.compare_digest(query_token, token)
+    return forwarded_for is None
+
+
 @app.get("/stats")
-async def stats() -> dict[str, Any]:
+async def stats(request: Request) -> dict[str, Any]:
     """Token/cost stats: overall totals, per-model breakdown, recent reviews."""
+    if not stats_access_allowed(
+            request.headers.get("authorization", ""),
+            request.query_params.get("token", ""),
+            request.headers.get("x-forwarded-for")):
+        raise HTTPException(status_code=403, detail="Forbidden")
     return await asyncio.to_thread(usage.aggregate)
 
 

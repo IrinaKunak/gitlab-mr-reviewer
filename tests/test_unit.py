@@ -286,6 +286,23 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     usage.current_tracker.reset(token)
 
 
+def test_stats_access_control(monkeypatch):
+    from reviewer.config import settings
+    from reviewer.server import stats_access_allowed
+
+    # no token configured: only direct (non-proxied) requests pass
+    monkeypatch.setattr(settings, "stats_token", "")
+    assert stats_access_allowed("", "", None) is True
+    assert stats_access_allowed("", "", "203.0.113.7") is False
+
+    # token configured: Bearer header or ?token= must match exactly
+    monkeypatch.setattr(settings, "stats_token", "s3cret")
+    assert stats_access_allowed("Bearer s3cret", "", "203.0.113.7") is True
+    assert stats_access_allowed("", "s3cret", "203.0.113.7") is True
+    assert stats_access_allowed("Bearer wrong", "", None) is False
+    assert stats_access_allowed("", "", None) is False  # token set: local needs it too
+
+
 def test_agent_loop_records_usage_on_max_iterations(tmp_path):
     # regression: only the clean end_turn exit recorded usage — investigations
     # that hit max_iterations or died mid-loop vanished from the stats
