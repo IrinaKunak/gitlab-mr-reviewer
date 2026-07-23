@@ -270,6 +270,17 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     assert agg["totals"]["input_tokens"] == 2 * 419_000
     assert agg["by_model"]["claude-opus-4-8"]["calls"] == 2
     assert len(agg["recent"]) == 2
+    # daily rollup for the dashboard: both entries land on today's UTC date
+    assert len(agg["daily"]) == 1
+    (day_stats,) = agg["daily"].values()
+    assert day_stats["reviews"] == 2
+
+    # the dashboard page is self-contained and wired to /stats
+    from reviewer.dashboard import DASHBOARD_HTML
+    assert '"/stats"' in DASHBOARD_HTML
+    assert '<svg id="daily"' in DASHBOARD_HTML
+    # fully self-contained: no external asset/script URLs anywhere
+    assert "https://" not in DASHBOARD_HTML and "http://" not in DASHBOARD_HTML
 
     # telegram footer, AIManager style
     footer = tracker.footer_line()

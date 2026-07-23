@@ -164,9 +164,10 @@ def persist(tracker: UsageTracker, mr_data: dict) -> None:
 
 
 def aggregate() -> dict:
-    """Overall stats from usage.jsonl for the /stats endpoint."""
+    """Overall stats from usage.jsonl for the /stats endpoint and dashboard."""
     totals = {"reviews": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     models: dict[str, dict] = {}
+    daily: dict[str, dict] = {}
     recent: list[dict] = []
     try:
         with _usage_path().open(encoding="utf-8") as fh:
@@ -189,7 +190,14 @@ def aggregate() -> dict:
                     m["output_tokens"] += stats.get("output_tokens", 0)
                     m["cost_usd"] = round(
                         m["cost_usd"] + stats.get("cost_usd", 0.0), 6)
+                day = (entry.get("ts") or "")[:10]
+                if day:
+                    d = daily.setdefault(day, {"reviews": 0, "cost_usd": 0.0})
+                    d["reviews"] += 1
+                    d["cost_usd"] = round(
+                        d["cost_usd"] + entry.get("cost_usd", 0.0), 6)
                 recent.append(entry)
     except FileNotFoundError:
         pass
-    return {"totals": totals, "by_model": models, "recent": recent[-20:]}
+    return {"totals": totals, "by_model": models, "daily": daily,
+            "recent": recent[-20:]}

@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
 from . import __version__, gitlab_io, telegram_io, usage
 from .bridge import bridge
@@ -183,6 +184,18 @@ async def stats(request: Request) -> dict[str, Any]:
             request.headers.get("x-forwarded-for")):
         raise HTTPException(status_code=403, detail="Forbidden")
     return await asyncio.to_thread(usage.aggregate)
+
+
+@app.get("/dashboard")
+async def dashboard(request: Request) -> HTMLResponse:
+    """Self-contained stats dashboard (same auth as /stats)."""
+    if not stats_access_allowed(
+            request.headers.get("authorization", ""),
+            request.query_params.get("token", ""),
+            request.headers.get("x-forwarded-for")):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    from .dashboard import DASHBOARD_HTML
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 @app.post("/webhook")
