@@ -189,6 +189,11 @@ class Pipeline:
         head_sha = mr_data.get("last_commit") or getattr(mr, "sha", "") or ""
         prev_sha = review_state.get_last_sha(
             gitlab_config["name"], mr_data["project_id"], mr_data["mr_iid"])
+        if mr_data.get("force_full"):
+            # re-review label / [re-review] marker: full fresh review on demand
+            logger.info("MR !%s: force_full requested — ignoring incremental state",
+                        mr_data["mr_iid"])
+            prev_sha = None
         if prev_sha and head_sha and prev_sha == head_sha:
             logger.info("MR !%s already reviewed at %s — skipping (metadata-only "
                         "update)", mr_data["mr_iid"], head_sha[:8])
@@ -219,7 +224,7 @@ class Pipeline:
             changes = delta
             incremental = True
             logger.info("incremental re-review for MR !%s: %s..%s (%d files)",
-                        mr_data["mr_iid"], prev_sha[:8], head_sha[:8],
+                        mr_data["mr_iid"], (prev_sha or "")[:8], head_sha[:8],
                         len(delta["changes"]))
         else:
             changes = await asyncio.to_thread(

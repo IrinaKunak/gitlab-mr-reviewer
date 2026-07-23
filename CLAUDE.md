@@ -72,7 +72,9 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   `repository_compare(prev_sha, head_sha)` delta with `INCREMENTAL_REVIEW_NOTE`
   (unfixed earlier findings = author's decision); same-sha events (title/label edits)
   are skipped entirely. State: `cache/reviewed_shas.json` (`review_state.py`,
-  bounded, fail-open → full review). Infra MRs still need `[no-review]` in the title
+  bounded, fail-open → full review). A `re-review` label / `[re-review]` title marker
+  forces a full fresh review (bypasses dedupe too — the label event's sha is one the
+  TTL window would swallow). Infra MRs still need `[no-review]` in the title
   (or a `no-review` label) — e.g. the standing v2→master MR.
 - **Reviews are verdict-first and anti-pedantic** (`REVIEW_SYSTEM` noise rules:
   intentional changes are intentional, no hypotheticals, no "confirm/verify" asks,

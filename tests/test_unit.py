@@ -614,6 +614,37 @@ def test_incremental_review_helpers():
         SimpleNamespace(files=_Files()), "main") == ""
 
 
+def test_force_full_re_review_marker():
+    # a re-review label / [re-review] title marker forces a fresh full review
+    # (regenerates the tester report on demand) and bypasses webhook dedupe,
+    # since the label-add event carries the same sha the TTL window swallows
+    from reviewer.server import ReviewQueue
+
+    payload = {
+        "object_attributes": {
+            "action": "update", "iid": 5, "id": 50, "title": "INCR-54",
+            "source_branch": "b", "target_branch": "master",
+            "url": "https://x/-/merge_requests/5",
+            "last_commit": {"id": "abc"}},
+        "project": {"id": 170, "path_with_namespace": "g/p"},
+        "user": {"username": "dev"},
+        "labels": [{"title": "re-review"}],
+    }
+    parsed = gitlab_io.parse_merge_request_webhook(payload)
+    assert parsed and parsed["force_full"] is True
+    payload["labels"] = []
+    assert gitlab_io.parse_merge_request_webhook(payload)["force_full"] is False
+    payload["object_attributes"]["title"] = "INCR-54 [re-review]"
+    assert gitlab_io.parse_merge_request_webhook(payload)["force_full"] is True
+
+    q = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=30)
+    mr = {"gitlab_config": {"name": "primary"}, "project_id": 170,
+          "mr_iid": 5, "last_commit": "abc"}
+    assert q.submit(dict(mr)) is True
+    assert q.submit(dict(mr)) is False                       # normal dedupe
+    assert q.submit({**mr, "force_full": True}) is True      # forced through
+
+
 def test_real_mr_author_and_comment_fetch():
     # webhook "user" is the EVENT ACTOR (title edit by the owner relabeled other
     # people's MRs as spikerwork) — the live MR object carries the real author

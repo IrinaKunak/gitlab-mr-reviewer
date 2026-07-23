@@ -56,6 +56,13 @@ class ReviewQueue:
         self._seen = {key: stamp for key, stamp in self._seen.items()
                       if now - stamp < self.dedupe_ttl}
         key = self.dedupe_key(mr_data)
+        if mr_data.get("force_full"):
+            # explicit re-review request — bypass dedupe (the triggering label
+            # event carries the same sha the TTL window would swallow)
+            self._seen[key] = now
+            self._mr_seen[key[:3]] = now
+            self.queue.put_nowait(mr_data)
+            return True
         if key in self._seen:
             logger.info("Duplicate webhook for %s — skipped", key)
             return False

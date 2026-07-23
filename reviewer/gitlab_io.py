@@ -68,6 +68,9 @@ def parse_merge_request_webhook(payload: dict[str, Any]) -> dict[str, Any] | Non
             "action": action,
             "url": url,
             "last_commit": attrs.get("last_commit", {}).get("id"),
+            # opt-in: force a full fresh review (skips incremental delta and
+            # same-sha suppression) — e.g. to regenerate the tester report
+            "force_full": "[re-review]" in marker_text or "re-review" in labels,
         }
     except KeyError as exc:
         logger.error("Missing required field in webhook payload: %s", exc)

@@ -23,7 +23,9 @@ Operational guidance for AI-assisted development: `CLAUDE.md`.
   review), `[no-review]` title marker / `no-review` label opt-out
 - 🔁 **Incremental re-reviews** — the first review covers the whole MR; each next push
   reviews only the new delta (unaddressed earlier remarks are treated as the author's
-  decision, not repeated); metadata-only updates don't re-review at all
+  decision, not repeated); metadata-only updates don't re-review at all. Want a fresh
+  full review (e.g. to regenerate the tester report)? Add a `re-review` label or
+  `[re-review]` to the title
 - 📋 **Verdict-first reviews** — every review opens with SHIP / SHIP WITH FIXES /
   DO NOT MERGE and only reports demonstrable defects (no "confirm your own change",
   no hypotheticals)
