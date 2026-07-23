@@ -21,6 +21,14 @@ Operational guidance for AI-assisted development: `CLAUDE.md`.
 - 📱 **Telegram notifications** — up to 10 channels, error alerts included
 - 🚦 **Sane webhook handling** — retry dedupe, burst collapsing (one user action = one
   review), `[no-review]` title marker / `no-review` label opt-out
+- 🔁 **Incremental re-reviews** — the first review covers the whole MR; each next push
+  reviews only the new delta (unaddressed earlier remarks are treated as the author's
+  decision, not repeated); metadata-only updates don't re-review at all
+- 📋 **Verdict-first reviews** — every review opens with SHIP / SHIP WITH FIXES /
+  DO NOT MERGE and only reports demonstrable defects (no "confirm your own change",
+  no hypotheticals)
+- ⚙️ **Per-project guidelines** — an `.ai-review.md` at the repo root (target branch)
+  is added to the review prompt: write what to focus on / what to skip, in any language
 - 🌍 **English/Russian** — prompts run in English, final output translated to Russian
 - 🐳 **Docker deployment**, HTTP/SOCKS proxy support, bulk webhook management scripts
 

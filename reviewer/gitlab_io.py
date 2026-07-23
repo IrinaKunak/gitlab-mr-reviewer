@@ -177,6 +177,32 @@ def extract_review_content(project, mr, changes: dict[str, Any]) -> str:
     return "\n".join(review_parts)
 
 
+def fetch_review_guidelines(project, ref: str) -> str:
+    """Per-project reviewer config: .ai-review.md at the MR target branch root.
+    Teams write what to focus on / what to skip (CodeRabbit-style). Best-effort."""
+    try:
+        file_obj = project.files.get(".ai-review.md", ref=ref)
+        text = file_obj.decode().decode("utf-8", errors="replace").strip()
+        return text[:4000]  # cap: it shares the system prompt budget
+    except Exception:  # noqa: BLE001 — absent file is the normal case
+        return ""
+
+
+def fetch_delta_changes(project, prev_sha: str, head_sha: str) -> dict[str, Any] | None:
+    """Changes-shaped dict with only the diffs between two SHAs (incremental
+    re-review). None = can't compare (force-push, GC'd sha) -> full review."""
+    try:
+        comp = project.repository_compare(prev_sha, head_sha)
+        diffs = comp.get("diffs") if isinstance(comp, dict) else getattr(comp, "diffs", None)
+        if not diffs:
+            return None
+        return {"changes": diffs}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("compare %s..%s failed (%s) — falling back to full review",
+                       prev_sha[:8], head_sha[:8], exc)
+        return None
+
+
 def extract_diff_only(changes: dict[str, Any]) -> str:
     """Compact diff for the triage stage (no file contents)."""
     parts = []

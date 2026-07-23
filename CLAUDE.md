@@ -67,8 +67,19 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 - **One user action can emit several webhooks** (reopen → `reopen` + `update` with
   different SHAs) — the per-MR burst window (`DEDUPE_BURST_SECONDS`, default 30) collapses
   them. The queued review reads live MR state, so nothing is lost.
-- **Every push to an open MR re-reviews the whole diff.** Infra MRs must carry
-  `[no-review]` in the title (or a `no-review` label) — e.g. the standing v2→master MR.
+- **Re-reviews are incremental** (dev feedback 2026-07-23: full re-reviews rehashed
+  old remarks every push): first review = whole diff; later pushes review only the
+  `repository_compare(prev_sha, head_sha)` delta with `INCREMENTAL_REVIEW_NOTE`
+  (unfixed earlier findings = author's decision); same-sha events (title/label edits)
+  are skipped entirely. State: `cache/reviewed_shas.json` (`review_state.py`,
+  bounded, fail-open → full review). Infra MRs still need `[no-review]` in the title
+  (or a `no-review` label) — e.g. the standing v2→master MR.
+- **Reviews are verdict-first and anti-pedantic** (`REVIEW_SYSTEM` noise rules:
+  intentional changes are intentional, no hypotheticals, no "confirm/verify" asks,
+  empty review is valid). Teams can extend focus via `.ai-review.md` in the repo root
+  (target branch, capped 4000 chars, any language).
+- **Translation tier is length-routed**: >3500 chars goes to main tier — Haiku left
+  long reviews half-English mid-sentence.
 - **Debug/usage logging must never break a review** — logs dir can be unwritable
   (bind-mount ownership); all accounting is fail-open.
 - **Translator input is wrapped in `<document>` tags** and output must contain Cyrillic,

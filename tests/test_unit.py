@@ -556,6 +556,113 @@ def test_process_skips_merged_or_closed_mr(monkeypatch):
             mr_data, {"name": "primary", "url": "https://x"}, {}))
 
 
+def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
+    from reviewer import review_state
+    from reviewer.config import settings
+
+    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(review_state, "_cache", None)  # drop module-level cache
+
+    assert review_state.get_last_sha("primary", 1, 2) is None
+    review_state.set_last_sha("primary", 1, 2, "abc123")
+    assert review_state.get_last_sha("primary", 1, 2) == "abc123"
+    review_state.set_last_sha("primary", 1, 2, "def456")  # newer push wins
+    assert review_state.get_last_sha("primary", 1, 2) == "def456"
+
+    # survives a cold start (persisted to the cache volume)
+    monkeypatch.setattr(review_state, "_cache", None)
+    assert review_state.get_last_sha("primary", 1, 2) == "def456"
+
+    # bounded: oldest entries evicted beyond MAX_ENTRIES
+    monkeypatch.setattr(review_state, "MAX_ENTRIES", 3)
+    for i in range(5):
+        review_state.set_last_sha("primary", 100 + i, 1, f"sha{i}")
+    assert review_state.get_last_sha("primary", 100, 1) is None
+    assert review_state.get_last_sha("primary", 104, 1) == "sha4"
+
+
+def test_incremental_review_helpers():
+    # prompt contract for the anti-pedantry overhaul (dev feedback 2026-07-23)
+    from types import SimpleNamespace
+    from reviewer import prompts
+
+    assert "## Verdict" in prompts.REVIEW_SYSTEM
+    assert "INTENTIONAL" in prompts.REVIEW_SYSTEM      # no "confirm your decision"
+    assert "No hypothetical concerns" in prompts.REVIEW_SYSTEM
+    note = prompts.INCREMENTAL_REVIEW_NOTE.format(prev_sha="abc12345")
+    assert "abc12345" in note and "delta" in note
+    assert ".ai-review.md" in prompts.guidelines_section("Focus on SQL")
+
+    # delta fetch wraps compare diffs into a changes-shaped dict; degrades to None
+    stub = SimpleNamespace(
+        repository_compare=lambda a, b: {"diffs": [{"new_path": "x.py", "diff": "+1"}]})
+    delta = gitlab_io.fetch_delta_changes(stub, "aaa", "bbb")
+    assert delta == {"changes": [{"new_path": "x.py", "diff": "+1"}]}
+    stub_empty = SimpleNamespace(repository_compare=lambda a, b: {"diffs": []})
+    assert gitlab_io.fetch_delta_changes(stub_empty, "aaa", "bbb") is None
+
+    def _raise(a, b):
+        raise RuntimeError("404 commit not found")
+    stub_err = SimpleNamespace(repository_compare=_raise)
+    assert gitlab_io.fetch_delta_changes(stub_err, "aaa", "bbb") is None
+
+    # .ai-review.md is best-effort: absent file -> empty string
+    class _Files:
+        def get(self, path, ref):
+            raise RuntimeError("404")
+    assert gitlab_io.fetch_review_guidelines(
+        SimpleNamespace(files=_Files()), "main") == ""
+
+
+def test_translate_long_text_upgrades_tier(monkeypatch):
+    # dev feedback 2026-07-23: long reviews came back half-English from Haiku —
+    # texts over the threshold must route to the main tier
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer.config import settings
+    from reviewer.pipeline import Pipeline
+
+    monkeypatch.setattr(settings, "review_language", "ru")
+    tiers = []
+
+    class StubAI:
+        async def complete(self, tier, system, user, **kwargs):
+            tiers.append(tier)
+            return SimpleNamespace(text="Перевод готов.")
+
+    p = Pipeline(client=StubAI())
+    asyncio.run(p._translate_if_needed("short text", "fast"))
+    asyncio.run(p._translate_if_needed("long text " * 500, "fast"))  # ~5000 chars
+    assert tiers == ["fast", "main"]
+
+
+def test_process_skips_already_reviewed_sha(monkeypatch):
+    # metadata-only update webhooks (title/labels edits) re-arrive with the same
+    # head sha we already reviewed — must skip before any notify/AI spend
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer import pipeline as pipeline_mod
+    from reviewer import review_state
+
+    stub_mr = SimpleNamespace(state="opened", sha="abc123")
+    stub_project = SimpleNamespace(
+        mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
+        path_with_namespace="group/proj")
+    stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client", lambda cfg: stub_gl)
+    monkeypatch.setattr(review_state, "get_last_sha", lambda *a: "abc123")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("must not run for an already-reviewed sha")
+
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
+    monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
+
+    p = pipeline_mod.Pipeline(client=object())
+    mr_data = {"project_id": 1, "mr_iid": 2, "title": "t", "last_commit": "abc123"}
+    asyncio.run(p._process_inner(mr_data, {"name": "primary", "url": "https://x"}, {}))
+
+
 def test_burst_dedupe_collapses_multi_event_actions():
     # regression: reopening an MR after new pushes makes GitLab emit reopen +
     # update events with DIFFERENT shas ~1s apart -> two parallel reviews

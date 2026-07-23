@@ -21,7 +21,7 @@ from typing import Any
 
 import gitlab as gitlab_lib
 
-from . import gitlab_io, prompts, telegram_io, usage
+from . import gitlab_io, prompts, review_state, telegram_io, usage
 from .ai_client import AIClient, AIError, AIInputTooLargeError, AITimeoutError, ToolDef, ai_client
 from .bridge import bridge
 from .config import settings
@@ -177,6 +177,17 @@ class Pipeline:
             logger.info("Skipping MR !%s: state is %s", mr_data["mr_iid"], state)
             return
 
+        # incremental re-review: if we already reviewed this MR at some sha,
+        # narrow this run to the delta since then — full re-reviews rehashed
+        # remarks about earlier commits on every push (dev feedback 2026-07-23)
+        head_sha = mr_data.get("last_commit") or getattr(mr, "sha", "") or ""
+        prev_sha = review_state.get_last_sha(
+            gitlab_config["name"], mr_data["project_id"], mr_data["mr_iid"])
+        if prev_sha and head_sha and prev_sha == head_sha:
+            logger.info("MR !%s already reviewed at %s — skipping (metadata-only "
+                        "update)", mr_data["mr_iid"], head_sha[:8])
+            return
+
         has_conflicts = await asyncio.to_thread(gitlab_io.check_merge_conflicts, mr)
         await telegram_io.notify(telegram_io.format_mr_message(
             mr_data, project.path_with_namespace, has_conflicts,
@@ -187,13 +198,26 @@ class Pipeline:
             logger.info("Skipped review for MR !%s due to conflicts", mr_data["mr_iid"])
             return
 
+        incremental = False
+        delta = None
+        if prev_sha and head_sha:
+            delta = await asyncio.to_thread(
+                gitlab_io.fetch_delta_changes, project, prev_sha, head_sha)
+
         await gitlab_io.post_note(
             mr, _msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
 
         # access_raw_diffs bypasses GitLab's per-file collapse limit, which
         # otherwise returns empty diffs for large files (silently unreviewed)
-        changes = await asyncio.to_thread(
-            lambda: mr.changes(access_raw_diffs="true"))
+        if delta:
+            changes = delta
+            incremental = True
+            logger.info("incremental re-review for MR !%s: %s..%s (%d files)",
+                        mr_data["mr_iid"], prev_sha[:8], head_sha[:8],
+                        len(delta["changes"]))
+        else:
+            changes = await asyncio.to_thread(
+                lambda: mr.changes(access_raw_diffs="true"))
         review_content = await asyncio.to_thread(
             gitlab_io.extract_review_content, project, mr, changes)
         if not review_content:
@@ -202,21 +226,38 @@ class Pipeline:
 
         diff_only = gitlab_io.extract_diff_only(changes)
 
+        def _mark_reviewed(posted: bool) -> None:
+            if posted:
+                review_state.set_last_sha(gitlab_config["name"], mr_data["project_id"],
+                                          mr_data["mr_iid"], head_sha)
+
         if settings.ai_provider == "gemini":
             review_ru = await self._legacy_gemini_review(mr_data, review_content)
-            await self._deliver_review(mr, mr_data, project, gitlab_config,
-                                       has_conflicts, review_ru)
+            _mark_reviewed(await self._deliver_review(
+                mr, mr_data, project, gitlab_config, has_conflicts, review_ru))
             return
 
         if not settings.pipeline_v2:
             review_text = await self._parity_review(mr_data, review_content, diff_only)
-            await self._deliver_review(mr, mr_data, project, gitlab_config,
-                                       has_conflicts, review_text)
+            _mark_reviewed(await self._deliver_review(
+                mr, mr_data, project, gitlab_config, has_conflicts, review_text))
             return
 
         # ---- tiered pipeline ----
+        # per-project reviewer config (.ai-review.md) + incremental focus
+        guidelines = await asyncio.to_thread(
+            gitlab_io.fetch_review_guidelines, project,
+            mr_data.get("target_branch") or getattr(project, "default_branch", ""))
+        system_extra = ""
+        if guidelines:
+            system_extra += prompts.guidelines_section(guidelines)
+        if incremental:
+            system_extra += prompts.INCREMENTAL_REVIEW_NOTE.format(
+                prev_sha=(prev_sha or "")[:8])
+
         triage = await self._triage(mr_data, changes)
-        review_en = await self._review(mr_data, review_content, triage, diff_only)
+        review_en = await self._review(mr_data, review_content, triage, diff_only,
+                                       system_extra)
 
         investigation = None
         if (settings.investigator and triage.get("needs_investigation")
@@ -229,8 +270,8 @@ class Pipeline:
                 review_en += "\n\n---\n\n" + investigation["impact"]
 
         review_out = await self._translate_if_needed(review_en, tier="fast")
-        await self._deliver_review(mr, mr_data, project, gitlab_config,
-                                   has_conflicts, review_out)
+        _mark_reviewed(await self._deliver_review(
+            mr, mr_data, project, gitlab_config, has_conflicts, review_out))
 
         if investigation and settings.tester_report and investigation.get("tester_report"):
             report_ru = await self._translate_if_needed(
@@ -268,13 +309,14 @@ class Pipeline:
         return parsed
 
     async def _review(self, mr_data: dict, review_content: str, triage: dict,
-                      diff_only: str = "") -> str:
+                      diff_only: str = "", system_extra: str = "") -> str:
         if triage.get("complexity") == "trivial":
             user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
             result = await self.ai.complete(
-                "fast", prompts.TRIVIAL_REVIEW_SYSTEM, user, max_tokens=1024)
+                "fast", prompts.TRIVIAL_REVIEW_SYSTEM + system_extra, user,
+                max_tokens=1024)
             return result.text
-        system = settings.review_prompt_en or prompts.REVIEW_SYSTEM
+        system = (settings.review_prompt_en or prompts.REVIEW_SYSTEM) + system_extra
         if triage.get("risk_areas"):
             system += "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
         result = await self._complete_with_degradation(
@@ -395,6 +437,10 @@ class Pipeline:
     async def _translate_if_needed(self, text: str, tier: str) -> str:
         if settings.review_language != "ru" or not text:
             return text
+        # long documents overwhelm Haiku: it starts leaving half the prose in
+        # English mid-sentence (dev feedback 2026-07-23) — main tier handles them
+        if tier == "fast" and len(text) > 3500:
+            tier = "main"
         try:
             result = await self.ai.complete(
                 tier, prompts.TRANSLATE_SYSTEM, prompts.translate_user_prompt(text),
@@ -413,7 +459,9 @@ class Pipeline:
     # --- delivery ---
 
     async def _deliver_review(self, mr, mr_data: dict, project, gitlab_config: dict,
-                              has_conflicts: bool, review_text: str) -> None:
+                              has_conflicts: bool, review_text: str) -> bool:
+        """Returns True when the review comment was posted (drives the
+        last-reviewed-sha state for incremental re-reviews)."""
         comment = gitlab_io.format_review_comment(review_text)
         try:
             await gitlab_io.post_note(mr, comment)
@@ -432,11 +480,12 @@ class Pipeline:
                 await gitlab_io.post_note(mr, _msg(error_msg))
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
-            return
+            return False
         if settings.telegram_enabled:
             await telegram_io.notify(telegram_io.format_mr_message(
                 mr_data, project.path_with_namespace, has_conflicts,
                 review_text, gitlab_config["url"]))
+        return True
 
     async def _deliver_tester_report(self, project, mr, mr_data: dict,
                                      report_ru: str) -> None:
