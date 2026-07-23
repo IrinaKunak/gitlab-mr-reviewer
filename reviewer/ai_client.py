@@ -95,6 +95,10 @@ class AIResult:
     provider: str = ""  # "gateway" | "openrouter" | "cache"
     input_tokens: int = 0
     output_tokens: int = 0
+    # prompt-cache tokens are reported SEPARATELY from input_tokens on the wire
+    # (auto-caching models via OpenRouter put nearly the whole prompt here)
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     cached: bool = False
 
 
@@ -197,12 +201,14 @@ class AIClient:
 
     @staticmethod
     def _record_agent_usage(tier: str, model: str, provider: str,
-                            total_in: int, total_out: int) -> None:
+                            total_in: int, total_out: int,
+                            total_cr: int, total_cc: int) -> None:
         """Record accumulated agent-loop tokens — called on EVERY exit path;
         a failed investigation's completed turns are still real spend."""
-        if total_in or total_out:
+        if total_in or total_out or total_cr or total_cc:
             usage.record(tier=tier, model=model, provider=provider,
-                         input_tokens=total_in, output_tokens=total_out)
+                         input_tokens=total_in, output_tokens=total_out,
+                         cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
     def _primary_params(self, tier: str, effort: str | None, model: str = "") -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
@@ -374,12 +380,15 @@ class AIClient:
     def _finish(self, tier: str, result: AIResult, cache_key: str,
                 use_cache: bool, json_schema: dict | None, started: float) -> AIResult:
         logger.info(
-            "ai ok tier=%s model=%s provider=%s in=%d out=%d %.1fs",
+            "ai ok tier=%s model=%s provider=%s in=%d cached=%d out=%d %.1fs",
             tier, result.model, result.provider, result.input_tokens,
+            result.cache_read_tokens + result.cache_creation_tokens,
             result.output_tokens, time.monotonic() - started)
         usage.record(tier=tier, model=result.model, provider=result.provider,
                      input_tokens=result.input_tokens,
-                     output_tokens=result.output_tokens)
+                     output_tokens=result.output_tokens,
+                     cache_read_tokens=result.cache_read_tokens,
+                     cache_creation_tokens=result.cache_creation_tokens)
         self._debug("response", f"provider={result.provider} text={result.text[:5000]}")
         if use_cache and not json_schema and result.text != TRUNCATION_MARKER:
             # never cache a no-text truncation — it would poison retries for an hour
@@ -437,6 +446,9 @@ class AIClient:
             provider=provider,
             input_tokens=getattr(usage_info, "input_tokens", 0) or 0,
             output_tokens=getattr(usage_info, "output_tokens", 0) or 0,
+            cache_read_tokens=getattr(usage_info, "cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(
+                usage_info, "cache_creation_input_tokens", 0) or 0,
         )
 
     def _wrap(self, exc: Exception) -> AIError:
@@ -468,7 +480,7 @@ class AIClient:
         messages: list[dict] = [{"role": "user", "content": user_content}]
         model = overrides.model_for_tier(tier, self.cfg)
         via_openrouter = "/" in model  # vendor-prefixed runtime override
-        total_in = total_out = 0
+        total_in = total_out = total_cr = total_cc = 0
         last_text = ""
         provider = "gateway"
 
@@ -476,7 +488,7 @@ class AIClient:
             await self._rate_limit()
             if via_openrouter:
                 if self.fallback is None:
-                    self._record_agent_usage(tier, model, provider, total_in, total_out)
+                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise AIError(
                         "cross-vendor model override requires OPENROUTER_API_TOKEN")
                 request = {"model": model, "system": system,
@@ -496,13 +508,13 @@ class AIClient:
                 provider = "openrouter" if via_openrouter else "gateway"
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
                 if not _should_fallback(exc):
-                    self._record_agent_usage(tier, model, provider, total_in, total_out)
+                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise self._wrap(exc)
                 logger.warning("agent_loop primary failed (%s), trying openrouter",
                                type(exc).__name__)
                 client = self.fallback
                 if client is None:
-                    self._record_agent_usage(tier, model, provider, total_in, total_out)
+                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise self._wrap(exc)
                 chain = self.cfg.fallback_chain(tier)
                 request = {"model": chain[0], "system": system,
@@ -513,12 +525,14 @@ class AIClient:
                     response = await self._call(client, request, self.cfg.ai_agent_timeout)
                     provider = "openrouter"
                 except Exception as exc2:  # noqa: BLE001
-                    self._record_agent_usage(tier, model, provider, total_in, total_out)
+                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise self._wrap(exc2) from exc
 
             usage_info = getattr(response, "usage", None)
             total_in += getattr(usage_info, "input_tokens", 0) or 0
             total_out += getattr(usage_info, "output_tokens", 0) or 0
+            total_cr += getattr(usage_info, "cache_read_input_tokens", 0) or 0
+            total_cc += getattr(usage_info, "cache_creation_input_tokens", 0) or 0
             last_text = "".join(block.text for block in response.content
                                 if getattr(block, "type", "") == "text") or last_text
 
@@ -529,14 +543,16 @@ class AIClient:
                 messages.append({"role": "assistant", "content": response.content})
                 continue
             if response.stop_reason == "refusal":
-                self._record_agent_usage(tier, model, provider, total_in, total_out)
+                self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                 raise AIError("model refused during investigation (stop_reason=refusal)")
             if response.stop_reason != "tool_use":
                 logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
                             iteration + 1, response.stop_reason, total_in, total_out)
-                self._record_agent_usage(tier, model, provider, total_in, total_out)
+                self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                 return AIResult(text=last_text.strip(), model=model, provider=provider,
-                                input_tokens=total_in, output_tokens=total_out)
+                                input_tokens=total_in, output_tokens=total_out,
+                                cache_read_tokens=total_cr,
+                                cache_creation_tokens=total_cc)
 
             messages.append({"role": "assistant", "content": response.content})
             results = []
@@ -557,9 +573,10 @@ class AIClient:
             messages.append({"role": "user", "content": results})
 
         logger.warning("agent_loop hit max_iterations=%d", max_iterations)
-        self._record_agent_usage(tier, model, provider, total_in, total_out)
+        self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
         return AIResult(text=last_text.strip(), model=model, provider=provider,
-                        input_tokens=total_in, output_tokens=total_out)
+                        input_tokens=total_in, output_tokens=total_out,
+                        cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
 
 ai_client = AIClient()

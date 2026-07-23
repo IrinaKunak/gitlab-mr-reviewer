@@ -297,6 +297,65 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     usage.current_tracker.reset(token)
 
 
+def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
+    # regression: gpt-5.6-terra via OpenRouter reported →9 input tokens on a
+    # 3-iteration investigation (prod 2026-07-23) — wire-format input_tokens
+    # EXCLUDES cached tokens, and auto-caching models put nearly the whole
+    # prompt in cache_read_input_tokens, which we silently dropped
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer import usage
+    from reviewer.ai_client import ToolDef
+
+    tracker = usage.UsageTracker()
+    tracker.record(tier="smart", model="openai/gpt-5.6-terra",
+                   provider="openrouter", input_tokens=9, output_tokens=4029,
+                   cache_read_tokens=150_000, cache_creation_tokens=10_000)
+    call = tracker.calls[0]
+    assert call["input_tokens"] == 160_009        # full amount the model read
+    assert call["cached_tokens"] == 160_000
+    expected = (9 * 2.5 + 150_000 * 2.5 * 0.1 + 10_000 * 2.5 * 1.25
+                + 4029 * 15.0) / 1_000_000        # reads 0.1x, writes 1.25x
+    assert abs(call["cost_usd"] - expected) < 1e-9
+    assert "→160009" in tracker.footer_line()
+
+    # _to_result and agent_loop must both pick the cache fields off the wire
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    cfg.ai_rate_limit = 0
+    # a dev-machine cache/model_overrides.json must not reroute this test
+    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
+                        lambda tier, c: c.model_for_tier(tier))
+    client = AIClient(cfg)
+    resp = SimpleNamespace(
+        stop_reason="end_turn", model="openai/gpt-5.6-terra",
+        content=[SimpleNamespace(type="text", text="done")],
+        usage=SimpleNamespace(input_tokens=9, output_tokens=100,
+                              cache_read_input_tokens=50_000,
+                              cache_creation_input_tokens=2_000))
+    result = client._to_result(resp, "openrouter")
+    assert result.cache_read_tokens == 50_000
+    assert result.cache_creation_tokens == 2_000
+
+    async def fake_create(**kwargs):
+        return resp
+
+    stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    stub.with_options = lambda **kw: stub
+    client._primary = stub
+    token = usage.current_tracker.set(usage.UsageTracker())
+    try:
+        loop_result = asyncio.run(client.agent_loop(
+            "smart", "sys", "user", [ToolDef("t", "d", {}, None)],
+            max_iterations=2))
+        assert loop_result.cache_read_tokens == 50_000
+        recorded = usage.current_tracker.get().calls[-1]
+        assert recorded["input_tokens"] == 9 + 50_000 + 2_000
+        assert recorded["cached_tokens"] == 52_000
+    finally:
+        usage.current_tracker.reset(token)
+
+
 def test_model_overrides_and_routing(tmp_path, monkeypatch):
     # owner feature 2026-07-23: switch tier models at runtime from the dashboard;
     # vendor-prefixed overrides must route via OpenRouter, claude-* via gateway

@@ -129,8 +129,10 @@ git pull && docker compose up -d --build
 - `logs/ai-debug.log` — request/response dumps when `AI_DEBUG=true` (rotating)
 - Telegram review notifications end with a usage footer:
   `haiku-4-5: →19448 ←446 | sonnet-5: →104634 ←7457 | 💰$0.63`
-- Costs are list-price ceilings — gateway/prompt-cache discounts aren't visible in
-  returned token counts.
+- Costs are list-price ceilings. Prompt-cache tokens ARE counted: wire-format
+  `input_tokens` excludes them (auto-caching models via OpenRouter report 9-token
+  inputs on 100k prompts), so cache read/creation tokens are added to input counts
+  and priced at 0.1×/1.25× of the input rate.
 
 ## Testing utilities
 

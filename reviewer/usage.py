@@ -66,9 +66,19 @@ def model_key(model: str) -> str:
     return model
 
 
-def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+# cache pricing vs the model's input price (Anthropic ratios: reads 0.1x,
+# writes 1.25x — close enough for OpenAI/Gemini auto-caching via OpenRouter,
+# and keeps the stated "list-price ceiling" stance)
+CACHE_READ_MULT = 0.1
+CACHE_WRITE_MULT = 1.25
+
+
+def cost_usd(model: str, input_tokens: int, output_tokens: int,
+             cache_read_tokens: int = 0, cache_creation_tokens: int = 0) -> float:
     inp, outp = PRICES.get(model_key(model), (0.0, 0.0))
-    return (input_tokens * inp + output_tokens * outp) / 1_000_000
+    return (input_tokens * inp + output_tokens * outp
+            + cache_read_tokens * inp * CACHE_READ_MULT
+            + cache_creation_tokens * inp * CACHE_WRITE_MULT) / 1_000_000
 
 
 @dataclass
@@ -76,20 +86,30 @@ class UsageTracker:
     calls: list[dict] = field(default_factory=list)
 
     def record(self, *, tier: str, model: str, provider: str,
-               input_tokens: int, output_tokens: int) -> None:
+               input_tokens: int, output_tokens: int,
+               cache_read_tokens: int = 0, cache_creation_tokens: int = 0) -> None:
+        # wire-format input_tokens EXCLUDES cached tokens — models with
+        # automatic prompt caching (gpt/gemini/deepseek via OpenRouter)
+        # report 9-token inputs on 100k prompts; store the full amount the
+        # model read, price the cached parts at their discounted rates
         self.calls.append({
             "tier": tier, "model": model_key(model), "provider": provider,
-            "input_tokens": input_tokens, "output_tokens": output_tokens,
-            "cost_usd": cost_usd(model, input_tokens, output_tokens),
+            "input_tokens": input_tokens + cache_read_tokens + cache_creation_tokens,
+            "cached_tokens": cache_read_tokens + cache_creation_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost_usd(model, input_tokens, output_tokens,
+                                 cache_read_tokens, cache_creation_tokens),
         })
 
     def by_model(self) -> dict[str, dict]:
         out: dict[str, dict] = {}
         for call in self.calls:
             m = out.setdefault(call["model"], {
-                "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+                "calls": 0, "input_tokens": 0, "cached_tokens": 0,
+                "output_tokens": 0, "cost_usd": 0.0})
             m["calls"] += 1
             m["input_tokens"] += call["input_tokens"]
+            m["cached_tokens"] += call.get("cached_tokens", 0)
             m["output_tokens"] += call["output_tokens"]
             m["cost_usd"] = round(m["cost_usd"] + call["cost_usd"], 6)
         return out
@@ -148,6 +168,7 @@ def persist(tracker: UsageTracker, mr_data: dict) -> None:
         "project": mr_data.get("project_path"),
         "mr_iid": mr_data.get("mr_iid"),
         "input_tokens": tracker.total_input,
+        "cached_tokens": sum(c.get("cached_tokens", 0) for c in tracker.calls),
         "output_tokens": tracker.total_output,
         "cost_usd": tracker.total_cost,
         "models": tracker.by_model(),
@@ -183,10 +204,11 @@ def aggregate() -> dict:
                     totals["cost_usd"] + entry.get("cost_usd", 0.0), 6)
                 for model, stats in (entry.get("models") or {}).items():
                     m = models.setdefault(model, {
-                        "calls": 0, "input_tokens": 0, "output_tokens": 0,
-                        "cost_usd": 0.0})
+                        "calls": 0, "input_tokens": 0, "cached_tokens": 0,
+                        "output_tokens": 0, "cost_usd": 0.0})
                     m["calls"] += stats.get("calls", 0)
                     m["input_tokens"] += stats.get("input_tokens", 0)
+                    m["cached_tokens"] += stats.get("cached_tokens", 0)
                     m["output_tokens"] += stats.get("output_tokens", 0)
                     m["cost_usd"] = round(
                         m["cost_usd"] + stats.get("cost_usd", 0.0), 6)
