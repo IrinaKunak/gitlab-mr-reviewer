@@ -469,6 +469,34 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     assert asyncio.run(p._translate_if_needed("review text", "fast")) == "Обзор: всё в порядке."
 
 
+def test_process_skips_merged_or_closed_mr(monkeypatch):
+    # an update webhook can sit in the queue while the MR gets merged/closed
+    # (push fix -> merge on green); the worker must not review it then
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer import pipeline as pipeline_mod
+
+    for state in ("merged", "closed"):
+        stub_mr = SimpleNamespace(state=state)
+        stub_project = SimpleNamespace(
+            mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
+            path_with_namespace="group/proj")
+        stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
+        monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client",
+                            lambda cfg: stub_gl)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(f"must not run for a {stub_mr.state} MR")
+
+        monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
+        monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
+
+        p = pipeline_mod.Pipeline(client=object())  # AI must never be touched
+        mr_data = {"project_id": 1, "mr_iid": 2, "title": "t"}
+        asyncio.run(p._process_inner(
+            mr_data, {"name": "primary", "url": "https://x"}, {}))
+
+
 def test_burst_dedupe_collapses_multi_event_actions():
     # regression: reopening an MR after new pushes makes GitLab emit reopen +
     # update events with DIFFERENT shas ~1s apart -> two parallel reviews

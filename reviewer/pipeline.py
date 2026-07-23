@@ -169,6 +169,14 @@ class Pipeline:
                 "gitlab_api_error", f"Failed to get MR !{mr_data['mr_iid']}: {exc}", ctx)
             return
 
+        # the webhook only queues open/update/reopen, but the MR can get merged
+        # or closed while the event waits in the queue — don't burn tokens
+        # reviewing an MR nobody can act on
+        state = getattr(mr, "state", "opened")
+        if state != "opened":
+            logger.info("Skipping MR !%s: state is %s", mr_data["mr_iid"], state)
+            return
+
         has_conflicts = await asyncio.to_thread(gitlab_io.check_merge_conflicts, mr)
         await telegram_io.notify(telegram_io.format_mr_message(
             mr_data, project.path_with_namespace, has_conflicts,
