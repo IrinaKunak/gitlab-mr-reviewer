@@ -216,6 +216,48 @@ def extract_diff_only(changes: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def real_mr_author(mr) -> str:
+    """Username of the actual MR author from the live MR object.
+
+    The webhook's `user` field is the EVENT ACTOR (whoever pushed/edited/
+    reopened), not the author — a title edit by the owner must not relabel
+    someone else's MR."""
+    author = getattr(mr, "author", None) or {}
+    if isinstance(author, dict):
+        return author.get("username") or ""
+    return getattr(author, "username", "") or ""
+
+
+def fetch_mr_comments(mr, bot_username: str = "", max_chars: int = 6000) -> str:
+    """Human discussion on the MR (context for review/investigation).
+
+    Skips system notes (pushes, label changes) and the bot's own notes (our
+    previous reviews/reports — the incremental-review note covers those).
+    Best-effort: any API failure returns an empty string."""
+    try:
+        notes = mr.notes.list(per_page=100, order_by="created_at", sort="asc",
+                              get_all=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not fetch MR notes: %s", exc)
+        return ""
+    parts: list[str] = []
+    for note in notes:
+        if getattr(note, "system", False):
+            continue
+        author = getattr(note, "author", None) or {}
+        username = (author.get("username", "") if isinstance(author, dict)
+                    else getattr(author, "username", "")) or "unknown"
+        if bot_username and username == bot_username:
+            continue
+        body = (getattr(note, "body", "") or "").strip()
+        if body:
+            parts.append(f"[{username}]: {body}")
+    text = "\n\n".join(parts)
+    if len(text) > max_chars:  # keep the tail — latest replies matter most
+        text = "…" + text[-max_chars:]
+    return text
+
+
 def mr_header(mr_data: dict) -> str:
     return (
         f"Merge Request: {mr_data['title']}\n"

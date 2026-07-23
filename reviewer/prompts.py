@@ -64,6 +64,8 @@ Noise rules — violating these is a review failure:
 - No style, naming, architecture or taste opinions. Deliberate patterns
   (custom exception factories, chosen abstractions) are not defects.
 - Do not review code the diff merely touches or moves — only changed behavior.
+- If the MR discussion shows a point was already raised and the author replied
+  (explained, rejected, or deferred it) — accept that and do not re-raise it.
 - Fewer, harder findings. Two real bugs beat ten stretched remarks. "No
   significant issues found" is a valid and welcome review.
 Do not praise; if something is fine, say nothing about it."""

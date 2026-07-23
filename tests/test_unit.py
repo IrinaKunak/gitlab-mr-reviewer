@@ -614,6 +614,43 @@ def test_incremental_review_helpers():
         SimpleNamespace(files=_Files()), "main") == ""
 
 
+def test_real_mr_author_and_comment_fetch():
+    # webhook "user" is the EVENT ACTOR (title edit by the owner relabeled other
+    # people's MRs as spikerwork) — the live MR object carries the real author
+    from types import SimpleNamespace
+
+    assert gitlab_io.real_mr_author(
+        SimpleNamespace(author={"username": "nisvem"})) == "nisvem"
+    assert gitlab_io.real_mr_author(SimpleNamespace(author=None)) == ""
+
+    def note(author, body, system=False):
+        return SimpleNamespace(author={"username": author}, body=body, system=system)
+
+    notes = [
+        note("gitlab", "added 1 commit", system=True),      # system -> skipped
+        note("botuser", "## 🤖 Automated Code Review ..."),  # our own -> skipped
+        note("irina", "это осознанное изменение, фабрика исключений"),
+        note("artem", "каталог без бэка не бывает"),
+    ]
+    stub_mr = SimpleNamespace(notes=SimpleNamespace(list=lambda **kw: notes))
+    text = gitlab_io.fetch_mr_comments(stub_mr, bot_username="botuser")
+    assert "[irina]: это осознанное" in text
+    assert "[artem]:" in text
+    assert "Automated Code Review" not in text and "added 1 commit" not in text
+
+    # oversized discussions keep the tail (latest replies), and API failures
+    # must not break the review
+    long_notes = [note("dev", f"comment {i} " + "x" * 500) for i in range(30)]
+    stub_long = SimpleNamespace(notes=SimpleNamespace(list=lambda **kw: long_notes))
+    capped = gitlab_io.fetch_mr_comments(stub_long, max_chars=2000)
+    assert len(capped) <= 2001 and "comment 29" in capped
+
+    def _raise(**kw):
+        raise RuntimeError("403")
+    broken = SimpleNamespace(notes=SimpleNamespace(list=_raise))
+    assert gitlab_io.fetch_mr_comments(broken) == ""
+
+
 def test_translate_long_text_upgrades_tier(monkeypatch):
     # dev feedback 2026-07-23: long reviews came back half-English from Haiku —
     # texts over the threshold must route to the main tier
