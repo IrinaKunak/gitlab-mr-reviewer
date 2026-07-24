@@ -22,8 +22,8 @@ from typing import Any
 import gitlab as gitlab_lib
 
 from . import gitlab_io, prompts, review_state, telegram_io, usage
-from .ai_client import (AIClient, AIError, AIInputTooLargeError, AITimeoutError,
-                        ToolDef, ai_client, estimate_tokens)
+from .ai_client import (CHARS_PER_TOKEN, AIClient, AIError, AIInputTooLargeError,
+                        AITimeoutError, ToolDef, ai_client, estimate_tokens)
 from .bridge import bridge
 from .config import settings
 from .repo_cache import repo_cache, repo_grep, repo_list_tree, repo_read_file
@@ -419,7 +419,7 @@ class Pipeline:
             # last resort: review the files that fit rather than nothing at all.
             # 80% of the budget in chars (estimate_tokens is len//3) leaves room
             # for the system prompt, guidelines and header.
-            budget = int(settings.ai_max_input_tokens * 3 * 0.8)
+            budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.8)
             trimmed = await asyncio.to_thread(
                 gitlab_io.extract_diff_only, changes, budget)
             logger.warning("MR !%s still too large — reviewing a %d-char subset",
@@ -449,7 +449,7 @@ class Pipeline:
                 return content
             except AIInputTooLargeError:
                 continue
-        budget = int(settings.ai_max_input_tokens * 3 * 0.6)
+        budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.6)
         logger.warning("MR !%s: investigating on a %d-char diff subset",
                        mr_data["mr_iid"], budget)
         return (diff_only or review_content)[:budget]

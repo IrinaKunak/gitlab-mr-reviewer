@@ -65,6 +65,16 @@ def _should_fallback(exc: Exception) -> bool:
 # is why terra investigations cost ~half what the same loop costs on the gateway.)
 CACHE_CONTROL = {"type": "ephemeral"}  # 5-min TTL: reads 0.1x, writes 1.25x
 
+# OpenRouter rejects a longer models array with a 400 ("'models' array must have
+# 3 items or fewer") — prepending a runtime override to a 3-entry chain hits it
+MAX_OPENROUTER_MODELS = 3
+
+
+def _routing_chain(model: str, chain: list[str]) -> list[str]:
+    """Preferred model first, then its fallbacks, deduped and length-capped."""
+    ordered = [model] + [m for m in chain if m != model] if model else list(chain)
+    return ordered[:MAX_OPENROUTER_MODELS]
+
 
 def _strip_cache_control(messages: list[dict]) -> list[dict]:
     """Remove cache_control markers before sending to OpenRouter — cross-vendor
@@ -137,9 +147,15 @@ class ToolDef:
                 "input_schema": self.input_schema}
 
 
+# measured on prod MR !779: 580k chars of diff billed 290,883 input tokens — 2.0
+# chars/token. The old //3 under-counted by ~50%, so budgets admitted far more
+# than intended (a "193k" review actually cost 291k tokens).
+CHARS_PER_TOKEN = 2
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap upper-ish estimate; avoids a count_tokens round-trip per request."""
-    return len(text) // 3
+    return len(text) // CHARS_PER_TOKEN
 
 
 def extract_json(text: str) -> dict | None:
@@ -367,7 +383,7 @@ class AIClient:
             # vendor-prefixed runtime override (e.g. openai/gpt-5.6-terra):
             # the CF gateway can't serve it — route via OpenRouter, with the
             # tier's regular chain behind it as backup
-            chain = [model] + [m for m in self.cfg.fallback_chain(tier) if m != model]
+            chain = _routing_chain(model, self.cfg.fallback_chain(tier))
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout,
                 cause=None, chain=chain)
@@ -436,7 +452,7 @@ class AIClient:
         if client is None:
             raise (self._wrap(cause) if cause is not None
                    else AIError("cross-vendor model override requires OPENROUTER_API_TOKEN"))
-        chain = chain or self.cfg.fallback_chain(tier)
+        chain = _routing_chain("", chain or self.cfg.fallback_chain(tier))
         if json_schema:
             system = (f"{system}\n\nRespond with ONLY valid JSON matching this schema, "
                       f"no prose:\n{json.dumps(json_schema)}")
@@ -527,8 +543,8 @@ class AIClient:
                 request = {"model": model, "system": system,
                            "messages": _strip_thinking(_strip_cache_control(messages)),
                            "max_tokens": max_tokens, "tools": api_tools,
-                           "extra_body": {"models": [model] + [
-                               m for m in self.cfg.fallback_chain(tier) if m != model]}}
+                           "extra_body": {"models": _routing_chain(
+                               model, self.cfg.fallback_chain(tier))}}
             else:
                 request = {
                     "model": model, "system": system, "messages": messages,
@@ -549,7 +565,7 @@ class AIClient:
                 if client is None:
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise self._wrap(exc)
-                chain = self.cfg.fallback_chain(tier)
+                chain = _routing_chain("", self.cfg.fallback_chain(tier))
                 request = {"model": chain[0], "system": system,
                            "messages": _strip_thinking(_strip_cache_control(messages)),
                            "max_tokens": max_tokens, "tools": api_tools,

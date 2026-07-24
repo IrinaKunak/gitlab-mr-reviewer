@@ -182,6 +182,35 @@ def test_primary_params_per_tier():
         "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
 
 
+def test_openrouter_models_array_capped():
+    # prod !779: smart overridden to openai/gpt-5.6-terra + a 3-entry fallback
+    # chain -> 4 models -> OpenRouter 400 "'models' array must have 3 items or
+    # fewer" -> the whole investigation was lost after the review had run
+    from reviewer.ai_client import MAX_OPENROUTER_MODELS, _routing_chain
+
+    chain = ["anthropic/claude-opus-5", "google/gemini-3.6-flash",
+             "deepseek/deepseek-v4-pro"]
+    out = _routing_chain("openai/gpt-5.6-terra", chain)
+    assert len(out) == MAX_OPENROUTER_MODELS == 3
+    assert out[0] == "openai/gpt-5.6-terra"          # override is preferred
+    # an override already in the chain is not duplicated
+    assert _routing_chain("anthropic/claude-opus-5", chain) == [
+        "anthropic/claude-opus-5", "google/gemini-3.6-flash",
+        "deepseek/deepseek-v4-pro"]
+    # a long configured chain is capped too
+    assert len(_routing_chain("", chain + ["a/b", "c/d"])) == 3
+
+
+def test_token_estimate_matches_measured_diff_ratio():
+    # prod !779: 580k chars of diff billed 290,883 input tokens (2.0 chars/tok).
+    # The old //3 estimate said ~193k — budgets silently admitted ~50% more
+    # than intended, so a "under budget" review really cost 291k tokens.
+    from reviewer.ai_client import CHARS_PER_TOKEN, estimate_tokens
+
+    assert CHARS_PER_TOKEN == 2
+    assert estimate_tokens("x" * 580_000) >= 290_000
+
+
 def test_input_size_guard():
     cfg = Settings()
     cfg.ai_max_input_tokens = 10
