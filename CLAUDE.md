@@ -56,6 +56,15 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   cross-vendor: gemini-3.5-flash-lite / gemini-3.6-flash / gpt-5.6-terra / kimi-k3 /
   deepseek. `anthropic/*` via OpenRouter hits the same upstream — cross-vendor entries
   are the real availability hedge.
+- **Runtime per-tier overrides** (dashboard → `cache/model_overrides.json`): a plain
+  `claude-*` id routes via the CF gateway; anything with a `/` (`openai/…`, `google/…`)
+  routes via OpenRouter with the tier's fallback chain behind it. The dashboard offers
+  the **entire** OpenRouter catalog (`reviewer/openrouter_models.py`, `GET /models`,
+  6h-cached, fail-open) as a free-text combo, and prices unknown models from that
+  catalog (`usage.price_of`: curated MODEL_PRICES win → live catalog → $0). Handy: the
+  smart tier on `openai/gpt-5.6-terra` runs a full investigation for ~$0.54 vs Opus
+  ~$1.00 and Sonnet-as-smart ~$2.00 (no CF caching), and OpenRouter auto-caches repo
+  context (0.1× reads), so agentic loops are far cheaper there than list price implies.
 
 ## Operational gotchas (each cost real money/debugging to learn)
 
