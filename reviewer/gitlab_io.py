@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from fnmatch import fnmatch
 from typing import Any
 
 import gitlab
@@ -19,6 +20,77 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b")
+
+MAX_LISTED_SKIPPED_FILES = 40
+MAX_MANIFEST_FILES = 600
+
+
+def _change_status(change: dict) -> str:
+    if change.get("new_file"):
+        return "added"
+    if change.get("deleted_file"):
+        return "deleted"
+    if change.get("renamed_file"):
+        return "renamed"
+    return "modified"
+
+
+def file_manifest(changes: dict[str, Any]) -> str:
+    """Path + status + diff size for every changed file.
+
+    Cheap enough to hand the triage model so IT decides which files carry no
+    review value (assets, generated output, vendored code) — a hardcoded
+    extension list can't know a given project's conventions."""
+    rows = []
+    for change in changes.get("changes", [])[:MAX_MANIFEST_FILES]:
+        path = change.get("new_path") or change.get("old_path") or "unknown"
+        size = len(change.get("diff") or "")
+        rows.append(f"{_change_status(change)}\t{size}\t{path}")
+    total = len(changes.get("changes", []))
+    if total > MAX_MANIFEST_FILES:
+        rows.append(f"... and {total - MAX_MANIFEST_FILES} more files")
+    return "\n".join(rows)
+
+
+MAX_SKIP_GLOBS = 40
+MAX_SKIP_SHARE = 0.98  # a pattern set that eats the whole MR is a bad verdict
+
+
+def resolve_skip(changes: dict[str, Any], globs: Any) -> set[str]:
+    """Expand triage's glob patterns into concrete paths.
+
+    The model picks the rule, this applies it — deterministically, and with
+    guards: catch-alls are dropped, and a verdict that would swallow the entire
+    MR is discarded so a bad triage can never silence the review."""
+    if not isinstance(globs, list):
+        return set()
+    patterns = [g.strip() for g in globs[:MAX_SKIP_GLOBS]
+                if isinstance(g, str) and g.strip()
+                and g.strip().strip("*/") not in ("", ".")]
+    if not patterns:
+        return set()
+    paths = [c.get("new_path") or c.get("old_path") or ""
+             for c in changes.get("changes", [])]
+    matched = {p for p in paths if p and any(
+        fnmatch(p, g) or fnmatch(p, g.rstrip("/") + "/*") for g in patterns)}
+    if paths and len(matched) > MAX_SKIP_SHARE * len(paths):
+        logger.warning("triage skip_globs %s matched %d/%d files — ignoring",
+                       patterns, len(matched), len(paths))
+        return set()
+    return matched
+
+
+def summarize_skipped(entries: list[str]) -> str:
+    """One compact block naming files whose contents were deliberately skipped."""
+    if not entries:
+        return ""
+    shown = entries[:MAX_LISTED_SKIPPED_FILES]
+    extra = len(entries) - len(shown)
+    body = "\n".join(f"  {e}" for e in shown)
+    if extra:
+        body += f"\n  ... and {extra} more"
+    return (f"\n{'=' * 80}\nSKIPPED — {len(entries)} changed file(s) judged to carry "
+            f"no review value; contents not shown\n{'=' * 80}\n{body}\n")
 
 
 def get_gitlab_client(gitlab_config: dict) -> gitlab.Gitlab:
@@ -106,9 +178,14 @@ def check_merge_conflicts(mr) -> bool:
         return False
 
 
-def extract_review_content(project, mr, changes: dict[str, Any]) -> str:
-    """Diffs + current file contents (first 200 lines) — same format as v1."""
+def extract_review_content(project, mr, changes: dict[str, Any],
+                           skip: set[str] | None = None) -> str:
+    """Diffs + current file contents (first 200 lines) — same format as v1.
+
+    `skip` holds paths triage judged not worth reading (assets, generated
+    output); they are listed at the end instead of being dumped."""
     review_parts: list[str] = []
+    skipped: list[str] = []
     file_count = 0
 
     for change in changes.get("changes", []):
@@ -116,6 +193,9 @@ def extract_review_content(project, mr, changes: dict[str, Any]) -> str:
         diff = change.get("diff", "")
         collapsed = not diff and (change.get("collapsed") or change.get("too_large"))
         if not diff and not collapsed:
+            continue
+        if skip and file_path in skip:
+            skipped.append(f"{_change_status(change)}: {file_path}")
             continue
 
         file_count += 1
@@ -177,6 +257,8 @@ def extract_review_content(project, mr, changes: dict[str, Any]) -> str:
         review_parts.append("\n--- DIFF ---\n")
         review_parts.append(diff)
 
+    if skipped:
+        review_parts.append(summarize_skipped(skipped))
     return "\n".join(review_parts)
 
 
@@ -206,16 +288,36 @@ def fetch_delta_changes(project, prev_sha: str, head_sha: str) -> dict[str, Any]
         return None
 
 
-def extract_diff_only(changes: dict[str, Any]) -> str:
-    """Compact diff for the triage stage (no file contents)."""
-    parts = []
+def extract_diff_only(changes: dict[str, Any], max_chars: int | None = None,
+                      skip: set[str] | None = None) -> str:
+    """Compact diff for the triage stage (no file contents).
+
+    `max_chars` caps the output on a whole-file boundary and says what was
+    dropped — a partial review beats refusing an oversized MR outright."""
+    parts: list[str] = []
+    skipped: list[str] = []
+    used = omitted = 0
     for change in changes.get("changes", []):
         file_path = change.get("new_path", change.get("old_path", "unknown"))
         diff = change.get("diff", "")
-        if diff:
-            parts.append(f"\n--- {file_path} ---\n{diff}")
-        elif change.get("collapsed") or change.get("too_large"):
-            parts.append(f"\n--- {file_path} ---\n[diff unavailable: file too large]")
+        collapsed = change.get("collapsed") or change.get("too_large")
+        if not diff and not collapsed:
+            continue
+        if skip and file_path in skip:
+            skipped.append(f"{_change_status(change)}: {file_path}")
+            continue
+        block = (f"\n--- {file_path} ---\n{diff}" if diff else
+                 f"\n--- {file_path} ---\n[diff unavailable: file too large]")
+        if max_chars is not None and used + len(block) > max_chars:
+            omitted += 1
+            continue
+        parts.append(block)
+        used += len(block)
+    if omitted:
+        parts.append(f"\n[{omitted} more changed file(s) omitted — this MR exceeds "
+                     f"the review input budget; only the files above were reviewed]")
+    if skipped:
+        parts.append(summarize_skipped(skipped))
     return "\n".join(parts)
 
 

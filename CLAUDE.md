@@ -77,6 +77,17 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 - **GitLab collapses large per-file diffs to empty strings** — changes are fetched with
   `access_raw_diffs=true`; still-collapsed files fall back to current file content with a
   marker. Never silently skip empty diffs.
+- **Big MRs degrade, they are never refused** (prod: !779 = 655 files / 235k tokens got
+  "MR too large to analyze"). Three levers, in order: (1) **triage returns `skip_globs`** —
+  the model sees a path/status/size manifest and picks patterns for files not worth
+  reading (on !779: `*.svg`, `public/assets/images/**` → 439 files, 235k→145k tokens);
+  patterns not paths, because 439 paths overflowed the fast tier's `max_tokens`.
+  `resolve_skip` applies them with guards (catch-alls dropped, a verdict matching
+  >98% of files is discarded) so a bad triage can't silence a review; skipped files
+  are still *listed*. (2) `AI_MAX_INPUT_TOKENS` 300k — every tier model has 1M
+  context; 150k was a Gemini-era holdover. (3) full context → diffs-only →
+  whole-file-truncated-to-budget, each with a marker saying what was dropped.
+  Triage therefore runs BEFORE content assembly in the v2 path.
 - **Timed-out Anthropic calls still bill server-side** — `AI_TIMEOUT` default is 300s and
   primary SDK retries are 1; don't lower/raise casually.
 - **One user action can emit several webhooks** (reopen → `reopen` + `update` with

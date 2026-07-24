@@ -19,7 +19,17 @@ or business context (Jira) would materially improve the review and tester guidan
 
 Extract Jira issue keys (patterns like ABC-123) ONLY from the branch name, MR title and
 MR description fields. NEVER extract keys from the diff content — diffs routinely contain
-example keys in docs, tests and fixtures that do not belong to this MR."""
+example keys in docs, tests and fixtures that do not belong to this MR.
+
+skip_globs: glob patterns (e.g. "*.svg", "public/assets/*", "yarn.lock") matching files
+in the CHANGED FILES manifest whose CONTENTS a reviewer gains nothing from reading, so
+the budget goes to real code. Typically: binary-ish assets (images, fonts, media),
+dependency lockfiles, generated/compiled/minified output, vendored third-party code,
+large data fixtures. Judge by this project's actual conventions and the sizes shown.
+Give a few broad patterns rather than many exact paths. NEVER skip hand-written source,
+config, infrastructure or test code, and never skip a file merely for being large.
+Never return a catch-all like "*". That these files CHANGED is still reported to the
+reviewer; only their contents are withheld. Return [] when unsure."""
 
 TRIAGE_SCHEMA = {
     "type": "object",
@@ -29,8 +39,10 @@ TRIAGE_SCHEMA = {
         "jira_keys": {"type": "array", "items": {"type": "string"}},
         "needs_investigation": {"type": "boolean"},
         "summary": {"type": "string"},
+        "skip_globs": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["complexity", "risk_areas", "jira_keys", "needs_investigation", "summary"],
+    "required": ["complexity", "risk_areas", "jira_keys", "needs_investigation",
+                 "summary", "skip_globs"],
     "additionalProperties": False,
 }
 
@@ -173,14 +185,18 @@ def review_user_prompt(mr_header: str, review_content: str) -> str:
     )
 
 
-def triage_user_prompt(mr_data: dict, diff_summary: str) -> str:
-    return (
-        f"MR title: {mr_data.get('title', '')}\n"
-        f"Source branch: {mr_data.get('source_branch', '')}\n"
-        f"Target branch: {mr_data.get('target_branch', '')}\n"
-        f"Description:\n{(mr_data.get('description') or '')[:2000]}\n\n"
-        f"===== DIFF =====\n{diff_summary}"
-    )
+def triage_user_prompt(mr_data: dict, diff_summary: str, manifest: str = "") -> str:
+    parts = [
+        f"MR title: {mr_data.get('title', '')}",
+        f"Source branch: {mr_data.get('source_branch', '')}",
+        f"Target branch: {mr_data.get('target_branch', '')}",
+        f"Description:\n{(mr_data.get('description') or '')[:2000]}",
+    ]
+    if manifest:
+        parts.append("===== CHANGED FILES (status, diff bytes, path) =====\n"
+                     + manifest)
+    parts.append(f"===== DIFF =====\n{diff_summary}")
+    return "\n\n".join(parts)
 
 
 def investigator_user_prompt(mr_data: dict, review_content: str, triage: dict,

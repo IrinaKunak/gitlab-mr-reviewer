@@ -735,6 +735,55 @@ def test_incremental_review_helpers():
         SimpleNamespace(files=_Files()), "main") == ""
 
 
+def test_triage_chooses_skipped_files_and_budget_truncation():
+    # MR !779 (655 files, 235k tokens of diff) was refused outright as "MR too
+    # large". 439 of those files were SVG/asset blobs — which files are worth
+    # reading is a judgement call, so triage makes it; a hardcoded extension
+    # list cannot know a project's conventions.
+    from reviewer import prompts
+
+    changes = {"changes": [
+        {"new_path": "src/auth.py", "diff": "+def login():\n" * 50},
+        {"new_path": "public/logo.svg", "diff": "+<path d='M0 0'/>\n" * 400},
+        {"new_path": "yarn.lock", "diff": "+dep\n" * 300, "new_file": True},
+        {"new_path": "src/pay.py", "diff": "+def charge():\n" * 50},
+    ]}
+
+    # the manifest triage judges from: status, size and path for every file
+    manifest = gitlab_io.file_manifest(changes)
+    assert "modified\t" in manifest and "public/logo.svg" in manifest
+    assert "added\t" in manifest                     # yarn.lock is new_file
+    assert manifest in prompts.triage_user_prompt({"title": "t"}, "diff", manifest)
+    assert "skip_globs" in prompts.TRIAGE_SCHEMA["properties"]
+    assert "skip_globs" in prompts.TRIAGE_SYSTEM
+
+    # triage returns PATTERNS, not paths — listing 439 SVGs individually blew
+    # the fast tier's max_tokens and the whole triage came back unparseable
+    skip = gitlab_io.resolve_skip(changes, ["*.svg", "yarn.lock"])
+    assert skip == {"public/logo.svg", "yarn.lock"}
+    assert gitlab_io.resolve_skip(changes, ["public/*"]) == {"public/logo.svg"}
+    # guards: a catch-all or an everything-matching verdict is discarded, so a
+    # bad triage can never silence the review
+    assert gitlab_io.resolve_skip(changes, ["*"]) == set()
+    assert gitlab_io.resolve_skip(changes, ["*.py", "*.svg", "*.lock"]) == set()
+    assert gitlab_io.resolve_skip(changes, "not-a-list") == set()
+
+    # honouring triage's verdict keeps the code and names (not dumps) the rest
+    out = gitlab_io.extract_diff_only(changes, skip=skip)
+    assert "def login" in out and "def charge" in out
+    assert "<path d=" not in out
+    assert "SKIPPED — 2 changed file(s)" in out
+    assert "deleted: " not in out and "modified: public/logo.svg" in out
+    # no skip list -> unchanged v1 behaviour, everything included
+    assert "<path d=" in gitlab_io.extract_diff_only(changes)
+
+    # budget cap drops whole files and says so, instead of refusing the MR
+    small = gitlab_io.extract_diff_only(changes, max_chars=800, skip=skip)
+    assert len(small) < 2000
+    assert "more changed file(s) omitted" in small
+    assert "def login" in small                      # first file still reviewed
+
+
 def test_force_full_re_review_marker():
     # a re-review label / [re-review] title marker forces a fresh full review
     # (regenerates the tester report on demand) and bypasses webhook dedupe,

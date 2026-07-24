@@ -95,7 +95,9 @@ class Settings:
     ai_debug: bool = field(default_factory=lambda: _bool("AI_DEBUG", _bool("GEMINI_DEBUG")))
     ai_log_dir: str = field(default_factory=lambda: os.getenv(
         "AI_LOG_DIR", os.getenv("GEMINI_LOG_DIR", "logs")))
-    ai_max_input_tokens: int = field(default_factory=lambda: _int("AI_MAX_INPUT_TOKENS", 150_000))
+    # every current tier model has a 1M context window — 150k was a v1/Gemini-era
+    # holdover that refused real MRs outright ("MR too large to analyze")
+    ai_max_input_tokens: int = field(default_factory=lambda: _int("AI_MAX_INPUT_TOKENS", 300_000))
     ai_workers: int = field(default_factory=lambda: _int("AI_WORKERS", 2))
     dedupe_ttl: int = field(default_factory=lambda: _int("DEDUPE_TTL", 600))
     dedupe_burst: int = field(default_factory=lambda: _int("DEDUPE_BURST_SECONDS", 30))
