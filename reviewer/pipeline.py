@@ -293,7 +293,7 @@ class Pipeline:
         if (settings.investigator and triage.get("needs_investigation")
                 and triage.get("complexity") == "complex"):
             investigation = await self._investigate(
-                mr_data, gitlab_config, review_content, triage, review_en)
+                mr_data, gitlab_config, review_content, triage, review_en, diff_only)
             if investigation and investigation.get("impact"):
                 # the impact analysis belongs in the review comment — only the
                 # tester report is gated behind TESTER_REPORT below
@@ -405,8 +405,35 @@ class Pipeline:
                   "exceeds the review input budget)", trimmed)
             return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
 
+    def _investigator_content(self, mr_data: dict, review_content: str, triage: dict,
+                              review_en: str, diff_only: str) -> str:
+        """Pick the largest context that fits, BEFORE paying for a repo clone.
+
+        The investigator gets the same content as the review, which on a big MR
+        is exactly what the review's own size guard just rejected — checking
+        after the clone means cloning a whole repo only to give up."""
+        system = prompts.INVESTIGATOR_SYSTEM.format(
+            max_iterations=settings.investigator_max_iterations)
+        for content in (review_content, diff_only):
+            if not content:
+                continue
+            try:
+                self.ai.guard_input_size(
+                    system,
+                    prompts.investigator_user_prompt(mr_data, content, triage, review_en))
+                return content
+            except AIInputTooLargeError:
+                continue
+        budget = int(settings.ai_max_input_tokens * 3 * 0.6)
+        logger.warning("MR !%s: investigating on a %d-char diff subset",
+                       mr_data["mr_iid"], budget)
+        return (diff_only or review_content)[:budget]
+
     async def _investigate(self, mr_data: dict, gitlab_config: dict,
-                           review_content: str, triage: dict, review_en: str) -> dict | None:
+                           review_content: str, triage: dict, review_en: str,
+                           diff_only: str = "") -> dict | None:
+        review_content = self._investigator_content(
+            mr_data, review_content, triage, review_en, diff_only)
         worktree = None
         try:
             worktree = await repo_cache.checkout_mr(

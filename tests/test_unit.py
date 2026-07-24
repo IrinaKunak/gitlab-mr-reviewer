@@ -784,6 +784,28 @@ def test_triage_chooses_skipped_files_and_budget_truncation():
     assert "def login" in small                      # first file still reviewed
 
 
+def test_investigator_degrades_before_cloning(monkeypatch):
+    # prod !779: the investigator got the same full context the review had just
+    # rejected as too large — and the guard only fires inside agent_loop, AFTER
+    # the repo clone, so we paid for a clone then silently dropped the analysis
+    from reviewer.config import settings
+    from reviewer.pipeline import Pipeline
+
+    monkeypatch.setattr(settings, "ai_max_input_tokens", 10_000)
+    p = Pipeline(client=AIClient(Settings()))
+    monkeypatch.setattr(p.ai.cfg, "ai_max_input_tokens", 10_000)
+    triage, mr_data = {"jira_keys": [], "summary": "s", "risk_areas": []}, {"mr_iid": 779}
+
+    huge, small = "x" * 200_000, "y" * 6_000
+    # full context too big -> falls back to the diff, no exception, no clone yet
+    assert p._investigator_content(mr_data, huge, triage, "review", small) == small
+    # both too big -> a truncated subset, still something to investigate
+    picked = p._investigator_content(mr_data, huge, triage, "review", huge)
+    assert 0 < len(picked) < len(huge)
+    # fits -> untouched
+    assert p._investigator_content(mr_data, small, triage, "review", "z") == small
+
+
 def test_force_full_re_review_marker():
     # a re-review label / [re-review] title marker forces a fresh full review
     # (regenerates the tester report on demand) and bypasses webhook dedupe,
