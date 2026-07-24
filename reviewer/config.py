@@ -73,7 +73,7 @@ class Settings:
     openrouter_token: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_TOKEN", ""))
     model_fast: str = field(default_factory=lambda: os.getenv("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5"))
     model_main: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MAIN_MODEL", "claude-sonnet-5"))
-    model_smart: str = field(default_factory=lambda: os.getenv("ANTHROPIC_SMART_MODEL", "claude-opus-4-8"))
+    model_smart: str = field(default_factory=lambda: os.getenv("ANTHROPIC_SMART_MODEL", "claude-opus-5"))
     fallback_fast: list[str] = field(default_factory=lambda: _csv(
         "OPENROUTER_FALLBACK_FAST",
         "anthropic/claude-haiku-4.5,google/gemini-3.5-flash-lite,deepseek/deepseek-v4-flash"))
@@ -82,7 +82,7 @@ class Settings:
         "anthropic/claude-sonnet-5,google/gemini-3.6-flash,deepseek/deepseek-v4-pro"))
     fallback_smart: list[str] = field(default_factory=lambda: _csv(
         "OPENROUTER_FALLBACK_SMART",
-        "anthropic/claude-opus-4.8,openai/gpt-5.6-terra,moonshotai/kimi-k3"))
+        "anthropic/claude-opus-5,openai/gpt-5.6-terra,moonshotai/kimi-k3"))
 
     # --- AI behavior (legacy GEMINI_* read as fallback) ---
     ai_cache_ttl: int = field(default_factory=lambda: _int("AI_CACHE_TTL", 3600, "GEMINI_CACHE_TTL"))

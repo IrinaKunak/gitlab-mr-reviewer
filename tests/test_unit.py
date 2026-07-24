@@ -173,6 +173,13 @@ def test_primary_params_per_tier():
     # whole max_tokens budget before any text on big diffs (prod 2026-07-22)
     assert client._primary_params("main", None) == {"thinking": {"type": "disabled"}}
     assert client._primary_params("main", "high") == {"thinking": {"type": "disabled"}}
+    # claude-opus-5 rejects disabled thinking at effort xhigh/max — effort must
+    # never be emitted alongside it, whatever the caller passes
+    for eff in (None, "high", "xhigh", "max"):
+        assert "output_config" not in client._primary_params("main", eff, "claude-opus-5")
+    # smart tier keeps adaptive + effort, which opus-5 accepts
+    assert client._primary_params("smart", "high", "claude-opus-5") == {
+        "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
 
 
 def test_input_size_guard():
@@ -335,6 +342,11 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     assert abs(cost - (0.6 + 2.2)) < 1e-9
     # curated prices still win over the catalog
     assert usage.price_of("claude-opus-4-8") == (5.0, 25.0)
+    # opus-5 (released 2026-07-24) is priced like 4.8 on both routes — an
+    # unpriced tier model would silently cost $0 in the stats
+    assert usage.price_of("claude-opus-5") == (5.0, 25.0)
+    assert usage.price_of("anthropic/claude-opus-5") == (5.0, 25.0)
+    assert usage.price_of(Settings().model_smart) != (0.0, 0.0)
     # a genuinely unknown model is $0 (fail-open), not a crash
     assert usage.price_of("totally/unknown") == (0.0, 0.0)
 

@@ -45,12 +45,19 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 |------|-------------|----------|------------|
 | fast (triage, trivial review, translation) | `ANTHROPIC_FAST_MODEL`=claude-haiku-4-5 | none (param omitted) | ≤2048 |
 | main (standard review) | `ANTHROPIC_MAIN_MODEL`=claude-sonnet-5 | **explicitly `{"type": "disabled"}`** | 16000 |
-| smart (investigator) | `ANTHROPIC_SMART_MODEL`=claude-opus-4-8 | adaptive + effort | 32000/turn |
+| smart (investigator) | `ANTHROPIC_SMART_MODEL`=claude-opus-5 | adaptive + effort | 32000/turn |
 
 - **Sonnet 5 runs ADAPTIVE thinking when the `thinking` param is omitted** (changed from
   Sonnet 4.6). Disabling must be explicit, else thinking silently consumes the whole
   output budget on big diffs (zero visible text). See `_primary_params` in ai_client.
 - Thinking tokens bill against `max_tokens` — that's why smart tier gets 32k.
+- **claude-opus-5** (2026-07-24) is the smart default: same $5/$25 as opus-4-8, 1M ctx.
+  Two behaviour changes to respect — thinking is ON by default (omitting the param
+  runs adaptive, unlike 4.8), and `thinking:{"type":"disabled"}` is a 400 at effort
+  `xhigh`/`max`. Our fast/main tiers send disabled with NO effort, which is legal;
+  never add `effort` there. Elevated cyber safeguards mean a review of auth/crypto
+  code can return `stop_reason:"refusal"` -> AIError (review fails cleanly, the
+  investigator just skips); server-side `fallbacks` would fix it if it ever bites.
 - **Anthropic prompt caching is OPT-IN** — the investigator's `agent_loop` sets
   `cache_control` breakpoints on the gateway path (static prefix = tools+system+diff,
   plus one rolling breakpoint on the latest tool-result turn; ≤4 per request is the

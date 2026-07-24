@@ -28,9 +28,12 @@ DEFAULT_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-5": (2.0, 10.0),      # intro pricing through 2026-08-31
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-5": (5.0, 25.0),        # same price as 4.8, released 2026-07-24
+    "claude-fable-5": (10.0, 50.0),
     "anthropic/claude-haiku-4.5": (1.0, 5.0),
     "anthropic/claude-sonnet-5": (2.0, 10.0),
     "anthropic/claude-opus-4.8": (5.0, 25.0),
+    "anthropic/claude-opus-5": (5.0, 25.0),
     "google/gemini-3.6-flash": (1.5, 7.5),
     "google/gemini-3.5-flash-lite": (0.3, 2.5),
     "deepseek/deepseek-v4-flash": (0.1, 0.2),

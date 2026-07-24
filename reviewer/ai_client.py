@@ -247,6 +247,9 @@ class AIClient:
             params["thinking"] = {"type": "adaptive"}
             if effort:
                 params["output_config"] = {"effort": effort}
+        # NB fast/main fall through to thinking=disabled with NO effort. On
+        # claude-opus-5 disabled thinking is a 400 at effort xhigh/max but fine
+        # at the default (high) — so effort must stay unset on those tiers.
         elif tier == "main":
             # sonnet-5 runs ADAPTIVE thinking when the param is omitted (changed
             # from sonnet-4-6!) — disabling must be explicit for predictable cost
