@@ -297,6 +297,46 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     usage.current_tracker.reset(token)
 
 
+def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
+    # any OpenRouter model can be a tier override -> its cost must be priced
+    # from the live catalog, not silently $0
+    from reviewer import openrouter_models, usage
+    from reviewer.config import settings
+
+    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(openrouter_models, "_cache", None)
+    monkeypatch.setattr(openrouter_models, "_fetched_at", 0.0)
+
+    raw = {"data": [
+        {"id": "z-ai/glm-5", "pricing": {"prompt": "0.0000006", "completion": "0.0000022"}},
+        {"id": "qwen/qwen4-coder", "pricing": {"prompt": "0.0000003", "completion": "0.0000012"}},
+        {"id": "broken/model", "pricing": {"prompt": "n/a"}},  # unparseable -> skipped
+        {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}},
+    ]}
+    parsed = openrouter_models._parse(raw)
+    assert parsed["z-ai/glm-5"] == (0.6, 2.2)          # $/token -> $/MTok
+    assert "broken/model" not in parsed
+    assert "openrouter/auto" not in parsed             # negative sentinel filtered
+
+    # feed the catalog in and confirm cost_usd uses it for an unknown model
+    monkeypatch.setattr(openrouter_models, "_cache", parsed)
+    monkeypatch.setattr(openrouter_models, "_fetched_at", 1e18)  # never stale
+    assert usage.price_of("z-ai/glm-5") == (0.6, 2.2)
+    cost = usage.cost_usd("z-ai/glm-5", 1_000_000, 1_000_000)
+    assert abs(cost - (0.6 + 2.2)) < 1e-9
+    # curated prices still win over the catalog
+    assert usage.price_of("claude-opus-4-8") == (5.0, 25.0)
+    # a genuinely unknown model is $0 (fail-open), not a crash
+    assert usage.price_of("totally/unknown") == (0.0, 0.0)
+
+    # refresh() is fail-open: a network error keeps the cached copy
+    def _boom():
+        raise RuntimeError("no network")
+    monkeypatch.setattr(openrouter_models, "_fetch_now", _boom)
+    monkeypatch.setattr(openrouter_models, "_fetched_at", 0.0)  # force a refresh attempt
+    assert openrouter_models.refresh() == parsed  # falls back to cache, no raise
+
+
 def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     # regression: gpt-5.6-terra via OpenRouter reported →9 input tokens on a
     # 3-iteration investigation (prod 2026-07-23) — wire-format input_tokens

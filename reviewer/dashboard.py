@@ -81,9 +81,11 @@ DASHBOARD_HTML = """<!doctype html>
              gap: 10px; align-items: center; padding: 4px 0; }
   .tierrow label { font-size: 12.5px; color: var(--ink); }
   .tierrow .hint { font-size: 11.5px; color: var(--muted); }
-  select, button { font: inherit; color: var(--ink); background: var(--page);
+  select, button, input { font: inherit; color: var(--ink); background: var(--page);
                    border: 1px solid var(--border); border-radius: 7px;
                    padding: 5px 8px; }
+  input[data-tier] { width: 100%; box-sizing: border-box;
+                     font-variant-numeric: tabular-nums; }
   button { cursor: pointer; font-weight: 600; }
   code { font-size: 11.5px; }
 </style>
@@ -222,23 +224,46 @@ DASHBOARD_HTML = """<!doctype html>
   try {
     const mm = await fetch(api("/admin/models"), {cache: "no-store"})
       .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
-    const route = m => m.includes("/") ? "OpenRouter" : "CF gateway";
+    const route = m => m && m.includes("/") ? "OpenRouter" : "CF gateway";
+    // price lookup: curated claude prices + the live OpenRouter catalog
+    const prices = Object.assign({}, mm.known_prices || {});
+    (mm.openrouter_models || []).forEach(m => { prices[m.id] = [m.in, m.out]; });
+    const priceStr = m => {
+      const p = prices[m];
+      return p ? "$" + (+p[0]).toFixed(2) + "/" + (+p[1]).toFixed(2) + " per Mtok"
+               : "price unknown";
+    };
+    // one shared datalist: curated models first, then the whole OpenRouter catalog
+    const ids = mm.known_models.concat(
+      (mm.openrouter_models || []).map(m => m.id).filter(
+        id => mm.known_models.indexOf(id) < 0));
+    document.getElementById("tiers").insertAdjacentHTML("beforebegin",
+      '<datalist id="modeldl">' + ids.map(id =>
+        '<option value="' + id + '">' + route(id) + " · " + priceStr(id) +
+        "</option>").join("") + "</datalist>");
+    const hint = (tier, val) => {
+      const eff = val || mm.defaults[tier];
+      return (val ? "override" : "default") + ": " + eff + " · " +
+        route(eff) + " · " + priceStr(eff);
+    };
     document.getElementById("tiers").innerHTML =
-      ["fast", "main", "smart"].map(tier => {
-        const opts = ['<option value="">default — ' + mm.defaults[tier] + "</option>"]
-          .concat(mm.known_models.map(m =>
-            '<option value="' + m + '"' +
-            (mm.overrides[tier] === m ? " selected" : "") + ">" + m +
-            " · " + route(m) + "</option>")).join("");
-        return '<div class="tierrow"><label>' + tier + '</label>' +
-          '<select data-tier="' + tier + '">' + opts + "</select>" +
-          '<span class="hint">now: ' + mm.effective[tier] + " · " +
-          route(mm.effective[tier]) + "</span></div>";
-      }).join("");
+      ["fast", "main", "smart"].map(tier =>
+        '<div class="tierrow"><label>' + tier + '</label>' +
+        '<input list="modeldl" data-tier="' + tier + '" spellcheck="false" ' +
+        'placeholder="default — ' + mm.defaults[tier] + '" value="' +
+        (mm.overrides[tier] || "") + '"/>' +
+        '<span class="hint" data-hint="' + tier + '">' +
+        hint(tier, mm.overrides[tier]) + "</span></div>").join("");
+    // live route/price feedback as you type or pick
+    document.querySelectorAll("input[data-tier]").forEach(inp =>
+      inp.addEventListener("input", () => {
+        document.querySelector('[data-hint="' + inp.dataset.tier + '"]')
+          .textContent = hint(inp.dataset.tier, inp.value.trim());
+      }));
     document.getElementById("saveModels").addEventListener("click", async () => {
       const body = {};
-      document.querySelectorAll("select[data-tier]").forEach(
-        s => body[s.dataset.tier] = s.value);
+      document.querySelectorAll("input[data-tier]").forEach(
+        s => body[s.dataset.tier] = s.value.trim());
       const st = document.getElementById("modelsStatus");
       st.textContent = "saving…";
       try {

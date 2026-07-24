@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import openrouter_models
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -73,9 +74,21 @@ CACHE_READ_MULT = 0.1
 CACHE_WRITE_MULT = 1.25
 
 
+def price_of(model: str) -> tuple[float, float]:
+    """(input, output) $/MTok. Curated PRICES/MODEL_PRICES win; then the live
+    OpenRouter catalog (so any vendor-prefixed model is priced); else $0."""
+    key = model_key(model)
+    if key in PRICES:
+        return PRICES[key]
+    catalog_price = openrouter_models.price_for(model)
+    if catalog_price is not None:
+        return catalog_price
+    return (0.0, 0.0)
+
+
 def cost_usd(model: str, input_tokens: int, output_tokens: int,
              cache_read_tokens: int = 0, cache_creation_tokens: int = 0) -> float:
-    inp, outp = PRICES.get(model_key(model), (0.0, 0.0))
+    inp, outp = price_of(model)
     return (input_tokens * inp + output_tokens * outp
             + cache_read_tokens * inp * CACHE_READ_MULT
             + cache_creation_tokens * inp * CACHE_WRITE_MULT) / 1_000_000

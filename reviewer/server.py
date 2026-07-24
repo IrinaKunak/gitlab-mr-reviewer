@@ -23,7 +23,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from . import __version__, gitlab_io, overrides, telegram_io, usage
+from . import __version__, gitlab_io, openrouter_models, overrides, telegram_io, usage
 from .bridge import bridge
 from .config import settings
 from .pipeline import pipeline
@@ -233,16 +233,23 @@ async def dashboard(request: Request) -> HTMLResponse:
 
 @app.get("/admin/models")
 async def get_models(request: Request) -> dict[str, Any]:
-    """Current tier models: .env defaults, runtime overrides, effective values."""
+    """Current tier models: .env defaults, runtime overrides, effective values,
+    plus the full OpenRouter catalog (any of which can be set as a tier override —
+    vendor-prefixed ids route via OpenRouter, priced from the live catalog)."""
     _dash_guard(request)
     ov = overrides.load()
     defaults = {"fast": settings.model_fast, "main": settings.model_main,
                 "smart": settings.model_smart}
+    catalog = await asyncio.to_thread(openrouter_models.refresh)
+    or_models = [{"id": mid, "in": price[0], "out": price[1]}
+                 for mid, price in sorted(catalog.items())]
     return {
         "defaults": defaults,
         "overrides": ov,
         "effective": {t: (ov.get(t) or d) for t, d in defaults.items()},
         "known_models": sorted(usage.PRICES),
+        "known_prices": {m: list(p) for m, p in usage.PRICES.items()},
+        "openrouter_models": or_models,
     }
 
 
