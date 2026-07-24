@@ -109,6 +109,9 @@ class UsageTracker:
             "tier": tier, "model": model_key(model), "provider": provider,
             "input_tokens": input_tokens + cache_read_tokens + cache_creation_tokens,
             "cached_tokens": cache_read_tokens + cache_creation_tokens,
+            # kept apart: reads are the saving (0.1x), creations the premium (1.25x)
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
             "output_tokens": output_tokens,
             "cost_usd": cost_usd(model, input_tokens, output_tokens,
                                  cache_read_tokens, cache_creation_tokens),
@@ -119,13 +122,27 @@ class UsageTracker:
         for call in self.calls:
             m = out.setdefault(call["model"], {
                 "calls": 0, "input_tokens": 0, "cached_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
                 "output_tokens": 0, "cost_usd": 0.0})
             m["calls"] += 1
             m["input_tokens"] += call["input_tokens"]
             m["cached_tokens"] += call.get("cached_tokens", 0)
+            m["cache_read_tokens"] += call.get("cache_read_tokens", 0)
+            m["cache_creation_tokens"] += call.get("cache_creation_tokens", 0)
             m["output_tokens"] += call["output_tokens"]
             m["cost_usd"] = round(m["cost_usd"] + call["cost_usd"], 6)
         return out
+
+    def cache_savings(self) -> float:
+        """Net $ vs paying full input price for the same tokens: reads save 0.9x,
+        cache writes cost a 0.25x premium."""
+        saved = 0.0
+        for call in self.calls:
+            inp, _ = price_of(call["model"])
+            saved += (call.get("cache_read_tokens", 0) * inp * (1 - CACHE_READ_MULT)
+                      - call.get("cache_creation_tokens", 0) * inp
+                      * (CACHE_WRITE_MULT - 1)) / 1_000_000
+        return round(saved, 6)
 
     @property
     def total_cost(self) -> float:
@@ -182,6 +199,7 @@ def persist(tracker: UsageTracker, mr_data: dict) -> None:
         "mr_iid": mr_data.get("mr_iid"),
         "input_tokens": tracker.total_input,
         "cached_tokens": sum(c.get("cached_tokens", 0) for c in tracker.calls),
+        "cache_savings_usd": tracker.cache_savings(),
         "output_tokens": tracker.total_output,
         "cost_usd": tracker.total_cost,
         "models": tracker.by_model(),
@@ -199,7 +217,8 @@ def persist(tracker: UsageTracker, mr_data: dict) -> None:
 
 def aggregate() -> dict:
     """Overall stats from usage.jsonl for the /stats endpoint and dashboard."""
-    totals = {"reviews": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    totals = {"reviews": 0, "input_tokens": 0, "cached_tokens": 0,
+              "output_tokens": 0, "cost_usd": 0.0, "cache_savings_usd": 0.0}
     models: dict[str, dict] = {}
     daily: dict[str, dict] = {}
     recent: list[dict] = []
@@ -212,16 +231,24 @@ def aggregate() -> dict:
                     continue
                 totals["reviews"] += 1
                 totals["input_tokens"] += entry.get("input_tokens", 0)
+                totals["cached_tokens"] += entry.get("cached_tokens", 0)
                 totals["output_tokens"] += entry.get("output_tokens", 0)
                 totals["cost_usd"] = round(
                     totals["cost_usd"] + entry.get("cost_usd", 0.0), 6)
+                totals["cache_savings_usd"] = round(
+                    totals["cache_savings_usd"]
+                    + entry.get("cache_savings_usd", 0.0), 6)
                 for model, stats in (entry.get("models") or {}).items():
                     m = models.setdefault(model, {
                         "calls": 0, "input_tokens": 0, "cached_tokens": 0,
+                        "cache_read_tokens": 0, "cache_creation_tokens": 0,
                         "output_tokens": 0, "cost_usd": 0.0})
                     m["calls"] += stats.get("calls", 0)
                     m["input_tokens"] += stats.get("input_tokens", 0)
                     m["cached_tokens"] += stats.get("cached_tokens", 0)
+                    m["cache_read_tokens"] += stats.get("cache_read_tokens", 0)
+                    m["cache_creation_tokens"] += stats.get(
+                        "cache_creation_tokens", 0)
                     m["output_tokens"] += stats.get("output_tokens", 0)
                     m["cost_usd"] = round(
                         m["cost_usd"] + stats.get("cost_usd", 0.0), 6)

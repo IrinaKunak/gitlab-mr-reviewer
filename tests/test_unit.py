@@ -279,6 +279,15 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     from reviewer.dashboard import DASHBOARD_HTML
     assert '"/stats"' in DASHBOARD_HTML
     assert '<svg id="daily"' in DASHBOARD_HTML
+    # cache visibility: tile + per-model tooltip + recent-reviews column, all
+    # fed by fields aggregate() actually emits
+    assert "Prompt cache" in DASHBOARD_HTML
+    assert "cache_savings_usd" in DASHBOARD_HTML
+    assert "% of input from cache" in DASHBOARD_HTML
+    assert '<th class="num">cached</th>' in DASHBOARD_HTML
+    for field in ("cached_tokens", "cache_savings_usd"):
+        assert field in agg["totals"], field
+    assert "cached_tokens" in agg["by_model"]["claude-opus-4-8"]
     # fully self-contained: no external asset/script URLs anywhere
     assert "https://" not in DASHBOARD_HTML and "http://" not in DASHBOARD_HTML
 
@@ -420,6 +429,16 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
                 + 4029 * 15.0) / 1_000_000        # reads 0.1x, writes 1.25x
     assert abs(call["cost_usd"] - expected) < 1e-9
     assert "→160009" in tracker.footer_line()
+
+    # cache savings are NET: reads save 0.9x of the input rate, cache writes
+    # cost a 0.25x premium — a write-only review must not look like a win
+    expected_saved = (150_000 * 2.5 * 0.9 - 10_000 * 2.5 * 0.25) / 1_000_000
+    assert abs(tracker.cache_savings() - expected_saved) < 1e-9
+    write_only = usage.UsageTracker()
+    write_only.record(tier="smart", model="claude-opus-4-8", provider="gateway",
+                      input_tokens=100, output_tokens=10,
+                      cache_creation_tokens=100_000)
+    assert write_only.cache_savings() < 0
 
     # _to_result and agent_loop must both pick the cache fields off the wire
     cfg = Settings()

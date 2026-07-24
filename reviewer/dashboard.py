@@ -142,11 +142,17 @@ DASHBOARD_HTML = """<!doctype html>
   const avg = t.reviews ? t.cost_usd / t.reviews : 0;
   const days = Object.keys(data.daily || {}).sort();
   const last7 = days.slice(-7).reduce((s, d) => s + data.daily[d].cost_usd, 0);
+  // prompt-cache health: share of input served from cache, and what it saved
+  const cachePct = t.input_tokens ? 100 * (t.cached_tokens || 0) / t.input_tokens : 0;
+  const saved = t.cache_savings_usd || 0;
   document.getElementById("tiles").innerHTML = [
     ["Total spend", fmt$(t.cost_usd), t.input_tokens ? fmtK(t.input_tokens) + " in → " + fmtK(t.output_tokens) + " out" : ""],
     ["Reviews", String(t.reviews), ""],
     ["Avg / review", fmt$(avg), ""],
     ["Last 7 days", fmt$(last7), ""],
+    ["Prompt cache", cachePct.toFixed(0) + "%",
+     (t.cached_tokens ? fmtK(t.cached_tokens) + " tok cached · " : "") +
+     (saved >= 0 ? "saved " + fmt$(saved) : "cost " + fmt$(-saved))],
   ].map(([k, v, d]) =>
     '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v +
     '</div><div class="d">' + d + '</div></div>').join("");
@@ -215,8 +221,10 @@ DASHBOARD_HTML = """<!doctype html>
   document.getElementById("models").addEventListener("mousemove", ev => {
     const row = ev.target.closest("[data-m]"); if (!row) return hideTip();
     const m = data.by_model[row.dataset.m];
+    const pct = m.input_tokens ? 100 * (m.cached_tokens || 0) / m.input_tokens : 0;
     showTip(ev, row.dataset.m + "<br><b>" + fmt$(m.cost_usd) + "</b> · " +
-      m.calls + " calls · " + fmtK(m.input_tokens) + "→" + fmtK(m.output_tokens));
+      m.calls + " calls · " + fmtK(m.input_tokens) + "→" + fmtK(m.output_tokens) +
+      "<br>" + pct.toFixed(0) + "% of input from cache");
   });
   document.getElementById("models").addEventListener("mouseleave", hideTip);
 
@@ -286,11 +294,14 @@ DASHBOARD_HTML = """<!doctype html>
     .sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
   document.getElementById("recent").innerHTML =
     "<tr><th>when (UTC)</th><th>project</th><th>MR</th>" +
-    '<th class="num">in</th><th class="num">out</th><th class="num">cost</th></tr>' +
+    '<th class="num">in</th><th class="num">cached</th>' +
+    '<th class="num">out</th><th class="num">cost</th></tr>' +
     rows.map(r =>
       "<tr><td>" + (r.ts || "").replace("T", " ").replace("Z", "") + "</td><td>" +
       (r.project || "?") + "</td><td>!" + r.mr_iid + '</td><td class="num">' +
-      fmtK(r.input_tokens) + '</td><td class="num">' + fmtK(r.output_tokens) +
+      fmtK(r.input_tokens) + '</td><td class="num">' +
+      (r.input_tokens ? (100 * (r.cached_tokens || 0) / r.input_tokens).toFixed(0) + "%" : "—") +
+      '</td><td class="num">' + fmtK(r.output_tokens) +
       '</td><td class="num">' + fmt$(r.cost_usd) + "</td></tr>").join("") ||
     "<tr><td class='sub'>no reviews yet</td></tr>";
 })();
