@@ -59,6 +59,29 @@ def _should_fallback(exc: Exception) -> bool:
     return False
 
 
+# Anthropic prompt caching is OPT-IN: without a cache_control breakpoint every
+# agent-loop iteration re-bills the whole repo/diff prefix at full price. (The
+# auto-caching models we reach through OpenRouter do this for us — that asymmetry
+# is why terra investigations cost ~half what the same loop costs on the gateway.)
+CACHE_CONTROL = {"type": "ephemeral"}  # 5-min TTL: reads 0.1x, writes 1.25x
+
+
+def _strip_cache_control(messages: list[dict]) -> list[dict]:
+    """Remove cache_control markers before sending to OpenRouter — cross-vendor
+    models auto-cache and may reject Anthropic-specific block fields."""
+    cleaned: list[dict] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = [{k: v for k, v in block.items() if k != "cache_control"}
+                       if isinstance(block, dict) else block
+                       for block in content]
+            cleaned.append({**message, "content": content})
+        else:
+            cleaned.append(message)
+    return cleaned
+
+
 def _strip_thinking(messages: list[dict]) -> list[dict]:
     """Drop thinking blocks from assistant turns for cross-vendor fallback requests
     (non-Claude models can reject replayed thinking blocks with no thinking param)."""
@@ -477,9 +500,16 @@ class AIClient:
         self.guard_input_size(system, user_content)
         handlers = {tool.name: tool.handler for tool in tools}
         api_tools = [tool.to_api() for tool in tools]
-        messages: list[dict] = [{"role": "user", "content": user_content}]
         model = overrides.model_for_tier(tier, self.cfg)
         via_openrouter = "/" in model  # vendor-prefixed runtime override
+        # cache the static prefix (tools + system + the MR diff/context render
+        # ahead of it): every iteration re-sends it, so without this the whole
+        # investigation is billed at full input price on each turn
+        first_turn: dict = {"type": "text", "text": user_content}
+        if not via_openrouter:
+            first_turn["cache_control"] = dict(CACHE_CONTROL)
+        messages: list[dict] = [{"role": "user", "content": [first_turn]}]
+        rolling_cache: dict | None = None  # ≤4 breakpoints/request: keep one
         total_in = total_out = total_cr = total_cc = 0
         last_text = ""
         provider = "gateway"
@@ -492,7 +522,7 @@ class AIClient:
                     raise AIError(
                         "cross-vendor model override requires OPENROUTER_API_TOKEN")
                 request = {"model": model, "system": system,
-                           "messages": _strip_thinking(messages),
+                           "messages": _strip_thinking(_strip_cache_control(messages)),
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": [model] + [
                                m for m in self.cfg.fallback_chain(tier) if m != model]}}
@@ -518,7 +548,7 @@ class AIClient:
                     raise self._wrap(exc)
                 chain = self.cfg.fallback_chain(tier)
                 request = {"model": chain[0], "system": system,
-                           "messages": _strip_thinking(messages),
+                           "messages": _strip_thinking(_strip_cache_control(messages)),
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": chain}}
                 try:
@@ -570,6 +600,13 @@ class AIClient:
                         output, is_error = f"Tool error: {exc}", True
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(output)[:60_000], "is_error": is_error})
+            if results and not via_openrouter:
+                # roll the second breakpoint forward so each turn also reads the
+                # growing history; drop the previous one (max 4 per request)
+                if rolling_cache is not None:
+                    rolling_cache.pop("cache_control", None)
+                results[-1]["cache_control"] = dict(CACHE_CONTROL)
+                rolling_cache = results[-1]
             messages.append({"role": "user", "content": results})
 
         logger.warning("agent_loop hit max_iterations=%d", max_iterations)

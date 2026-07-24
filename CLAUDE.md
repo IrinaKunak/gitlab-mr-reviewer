@@ -51,6 +51,12 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   Sonnet 4.6). Disabling must be explicit, else thinking silently consumes the whole
   output budget on big diffs (zero visible text). See `_primary_params` in ai_client.
 - Thinking tokens bill against `max_tokens` — that's why smart tier gets 32k.
+- **Anthropic prompt caching is OPT-IN** — the investigator's `agent_loop` sets
+  `cache_control` breakpoints on the gateway path (static prefix = tools+system+diff,
+  plus one rolling breakpoint on the latest tool-result turn; ≤4 per request is the
+  API limit, markers are stripped for OpenRouter which auto-caches). Without it every
+  iteration re-billed the whole ~180k prefix — that alone made a Sonnet-as-smart
+  investigation ~2x the price of the same loop on terra.
 - A response that is only the truncation marker is retried once at 4× budget and never cached.
 - Fallback chains (OpenRouter, env-overridable): same-class Claude first, then
   cross-vendor: gemini-3.5-flash-lite / gemini-3.6-flash / gpt-5.6-terra / kimi-k3 /

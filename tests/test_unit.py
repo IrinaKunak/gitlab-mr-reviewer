@@ -337,6 +337,68 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     assert openrouter_models.refresh() == parsed  # falls back to cache, no raise
 
 
+def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
+    # Anthropic caching is opt-in: without cache_control every investigator
+    # iteration re-bills the whole repo/diff prefix (that is why the same loop
+    # cost ~2x more on the CF gateway than on auto-caching OpenRouter models)
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer.ai_client import ToolDef
+
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    cfg.ai_rate_limit = 0
+    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
+                        lambda tier, c: c.model_for_tier(tier))
+    client = AIClient(cfg)
+    sent: list[list[dict]] = []
+    turns = iter(["tool_use", "tool_use", "end_turn"])
+
+    def tool_use_response():
+        return SimpleNamespace(
+            stop_reason="tool_use", model="claude-opus-4-8",
+            content=[SimpleNamespace(type="tool_use", id="t1", name="t", input={})],
+            usage=SimpleNamespace(input_tokens=5, output_tokens=5))
+
+    async def fake_create(**kwargs):
+        sent.append(kwargs["messages"])
+        if next(turns) == "tool_use":
+            return tool_use_response()
+        return SimpleNamespace(
+            stop_reason="end_turn", model="claude-opus-4-8",
+            content=[SimpleNamespace(type="text", text="done")],
+            usage=SimpleNamespace(input_tokens=5, output_tokens=5))
+
+    stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    stub.with_options = lambda **kw: stub
+    client._primary = stub
+
+    async def handler(**kw):
+        return "tool output"
+
+    asyncio.run(client.agent_loop(
+        "smart", "sys", "big diff", [ToolDef("t", "d", {}, handler)],
+        max_iterations=5))
+
+    def breakpoints(messages):
+        return [b for m in messages for b in m["content"]
+                if isinstance(b, dict) and "cache_control" in b]
+
+    # the static prefix (tools + system render ahead of it) is always cached
+    assert sent[0][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # ...and a single rolling breakpoint follows the growing history — never
+    # more than the API's 4-per-request limit, however long the loop runs
+    for messages in sent:
+        assert 1 <= len(breakpoints(messages)) <= 4
+    assert len(breakpoints(sent[-1])) == 2      # static prefix + latest turn
+    assert sent[-1][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    # OpenRouter models auto-cache and may reject the marker — strip it there
+    stripped = ai_mod._strip_cache_control(sent[-1])
+    assert breakpoints(stripped) == []
+    assert stripped[0]["content"][0]["text"] == "big diff"  # content preserved
+
+
 def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     # regression: gpt-5.6-terra via OpenRouter reported →9 input tokens on a
     # 3-iteration investigation (prod 2026-07-23) — wire-format input_tokens
