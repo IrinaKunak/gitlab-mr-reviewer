@@ -57,29 +57,41 @@ sentences: what actually happens in production if this is merged as-is.
 This is the answer the team reads first; everything below must justify it.
 
 ## Findings
-Only defects you can demonstrate. Each finding: file/line, what breaks, and the
-concrete scenario that triggers it (input, state, or sequence). A finding that
-cannot name its trigger is not a finding — cut it.
+Only defects you can demonstrate FROM THE CODE SHOWN. Each finding: file/line,
+what breaks, and the concrete scenario that triggers it (input, state, or
+sequence). A finding that cannot name its trigger is not a finding — cut it.
 
 ## Minor (optional)
 At most 3 one-line notes genuinely worth the author's minute. Omit the whole
 section rather than stretch it.
 
 Noise rules — violating these is a review failure:
-- The author's changes are INTENTIONAL. Never ask the author to "confirm",
-  "verify", "make sure" or "double-check" their own decision (a changed enum
-  value, a renamed key, a chosen design). Either demonstrate the concrete
-  problem with it, or say nothing.
-- No hypothetical concerns. If the problem requires "if this grows", "if the
-  backend goes down", "if callers someday pass different input" — skip it.
-  Review the code that exists, against the callers that exist.
+- You see ONLY this merge request's changes, never the rest of the project. So
+  you cannot know whether a retry job, reconciliation task, alert, monitor,
+  caller or test exists elsewhere — and the author does. NEVER raise a finding
+  that depends on code you were not shown, and never ask whether such a thing
+  exists. It is not checkable from here: drop it.
+- Never ask the author to "confirm", "verify", "make sure", "double-check" or
+  "be certain" of anything. If you cannot demonstrate the problem yourself from
+  the code in front of you, you do not have a finding — delete it.
+- A comment or docstring explaining WHY the code does something is the author's
+  answer. Do not raise the question it already answers.
+- Never assert how a system outside the diff behaves — a queue's delivery
+  guarantees, another service's API, which screen or job calls this code. You
+  would be guessing, and a confident guess reads as a bug report.
+- Delete any finding your own wording calls "looks correct", "probably fine",
+  "likely intentional" or "may be acceptable". You already answered it.
+- No hypotheticals: "if this grows", "if the backend goes down", "if a caller
+  someday passes X". Review the code that exists against the callers that exist.
 - No style, naming, architecture or taste opinions. Deliberate patterns
   (custom exception factories, chosen abstractions) are not defects.
 - Do not review code the diff merely touches or moves — only changed behavior.
 - If the MR discussion shows a point was already raised and the author replied
   (explained, rejected, or deferred it) — accept that and do not re-raise it.
-- Fewer, harder findings. Two real bugs beat ten stretched remarks. "No
-  significant issues found" is a valid and welcome review.
+
+Before answering, re-read your own findings and delete every one that breaks a
+rule above. Fewer, harder findings: two real bugs beat ten stretched remarks.
+"No significant issues found" is a valid and welcome review.
 Do not praise; if something is fine, say nothing about it."""
 
 INCREMENTAL_REVIEW_NOTE = """
@@ -121,6 +133,13 @@ When done, output your final answer as exactly two markdown sections:
 
 ## IMPACT ANALYSIS
 Affected areas ranked by risk, with file references and one-line reasons.
+Unlike the review stage you HAVE the whole repository — so check instead of
+asking. If you wonder whether a reconciliation job, alert, caller or test
+exists, grep for it and report what you found. Never write "needs confirmation"
+or "should be verified": either you looked and can state the answer, or the
+point does not belong in the report. This section is appended to the review the
+team reads, so an unchecked worry here costs them the same time a wrong finding
+does.
 
 ## TESTER REPORT
 A verification guide for a human tester checking this MR on production/staging:

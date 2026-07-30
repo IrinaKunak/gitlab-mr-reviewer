@@ -749,8 +749,22 @@ def test_incremental_review_helpers():
     from reviewer import prompts
 
     assert "## Verdict" in prompts.REVIEW_SYSTEM
-    assert "INTENTIONAL" in prompts.REVIEW_SYSTEM      # no "confirm your decision"
-    assert "No hypothetical concerns" in prompts.REVIEW_SYSTEM
+    assert "No hypotheticals" in prompts.REVIEW_SYSTEM
+    # dev feedback 2026-07-30 (Irina, telemarketing-back !8/!9): four findings in
+    # a row were "confirm that a periodic reconciliation exists", about code the
+    # reviewer was never shown. Banning second-guessing the author's DECISIONS
+    # did not cover asking whether something exists ELSEWHERE — the reviewer
+    # cannot see the rest of the repo, so those must be dropped, not hedged.
+    assert "ONLY this merge request's changes" in prompts.REVIEW_SYSTEM
+    assert "never ask whether such a thing" in prompts.REVIEW_SYSTEM
+    for banned in ('"confirm"', '"verify"', '"make sure"', '"double-check"'):
+        assert banned in prompts.REVIEW_SYSTEM, banned
+    # a docstring explaining WHY is the answer; don't re-ask it
+    assert "is the author's" in prompts.REVIEW_SYSTEM
+    # and don't ship a finding you yourself called fine
+    assert '"looks correct"' in prompts.REVIEW_SYSTEM
+    # the investigator DOES have the repo — it must check, not ask
+    assert "grep for it and report what you found" in prompts.INVESTIGATOR_SYSTEM
     note = prompts.INCREMENTAL_REVIEW_NOTE.format(prev_sha="abc12345")
     assert "abc12345" in note and "delta" in note
     assert ".ai-review.md" in prompts.guidelines_section("Focus on SQL")
