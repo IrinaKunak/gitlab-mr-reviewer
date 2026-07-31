@@ -17,6 +17,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from typing import Any
 
 import gitlab as gitlab_lib
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 # extract_review_content adds up to 200 lines of current content per file;
 # ~2000 tokens each is the estimate used to decide whether fetching is worth it
 FILE_CONTEXT_TOKENS_EST = 2000
+
+# dialogue replies get the diff as reference, capped — repo tools cover the rest
+DIALOGUE_DIFF_MAX_CHARS = 60_000
+DIALOGUE_WINDOW_SECONDS = 86_400  # per-MR reply budget window
 
 CONFLICT_SKIP_MSG = {
     "en": "⚠️ Merge request has conflicts. Code review skipped until conflicts are resolved.",
@@ -106,6 +111,8 @@ def split_investigation(text: str) -> tuple[str, str | None]:
 class Pipeline:
     def __init__(self, client: AIClient | None = None):
         self.ai = client or ai_client
+        # (instance, project_id, mr_iid) -> timestamps of dialogue replies sent
+        self._dialogue_replies: dict[tuple, list[float]] = {}
 
     # --- entry point ---
 
@@ -311,18 +318,40 @@ class Pipeline:
             system_extra += prompts.INCREMENTAL_REVIEW_NOTE.format(
                 prev_sha=(prev_sha or "")[:8])
 
-        review_en = await self._review(mr_data, review_content, triage, diff_only,
-                                       system_extra, changes)
+        # one repo checkout serves both the tool-assisted review and the
+        # investigator. The review stage verifies its own cross-file concerns
+        # with it instead of asking the author to "confirm" them (dev feedback
+        # 2026-07-31: a diff-only reviewer structurally cannot check anything
+        # outside the diff, so prompt rules alone kept letting hedges through).
+        need_investigation = (settings.investigator and triage.get("needs_investigation")
+                              and triage.get("complexity") == "complex")
+        want_review_tools = (settings.review_repo_tools
+                             and triage.get("complexity") != "trivial")
+        worktree = None
+        if want_review_tools or need_investigation:
+            try:
+                worktree = await repo_cache.checkout_mr(
+                    gitlab_config, mr_data["project_path"], mr_data["mr_iid"],
+                    mr_data.get("last_commit"))
+            except Exception as exc:  # noqa: BLE001 — tools degrade, review still runs
+                logger.error("repo checkout failed, continuing without repo tools: %s", exc)
 
         investigation = None
-        if (settings.investigator and triage.get("needs_investigation")
-                and triage.get("complexity") == "complex"):
-            investigation = await self._investigate(
-                mr_data, gitlab_config, review_content, triage, review_en, diff_only)
-            if investigation and investigation.get("impact"):
-                # the impact analysis belongs in the review comment — only the
-                # tester report is gated behind TESTER_REPORT below
-                review_en += "\n\n---\n\n" + investigation["impact"]
+        try:
+            review_en = await self._review(
+                mr_data, review_content, triage, diff_only, system_extra, changes,
+                worktree=worktree if want_review_tools else None)
+            if need_investigation:
+                investigation = await self._investigate(
+                    mr_data, review_content, triage, review_en, diff_only,
+                    worktree=worktree)
+                if investigation and investigation.get("impact"):
+                    # the impact analysis belongs in the review comment — only the
+                    # tester report is gated behind TESTER_REPORT below
+                    review_en += "\n\n---\n\n" + investigation["impact"]
+        finally:
+            if worktree is not None:
+                await repo_cache.release(worktree)
 
         review_out = await self._translate_if_needed(review_en, tier="fast")
         _mark_reviewed(await self._deliver_review(
@@ -367,7 +396,7 @@ class Pipeline:
 
     async def _review(self, mr_data: dict, review_content: str, triage: dict,
                       diff_only: str = "", system_extra: str = "",
-                      changes: dict | None = None) -> str:
+                      changes: dict | None = None, worktree=None) -> str:
         if triage.get("complexity") == "trivial":
             user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
             result = await self.ai.complete(
@@ -377,6 +406,16 @@ class Pipeline:
         system = (settings.review_prompt_en or prompts.REVIEW_SYSTEM) + system_extra
         if triage.get("risk_areas"):
             system += "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
+        if worktree is not None:
+            try:
+                text = await self._review_with_tools(
+                    system, mr_data, review_content, diff_only, changes, worktree)
+                if text is not None:
+                    return text
+            except AIInputTooLargeError:
+                raise
+            except AIError as exc:
+                logger.warning("tool-assisted review failed (%s) — plain review", exc)
         result = await self._complete_with_degradation(
             "main", system, mr_data, review_content, diff_only, effort="high",
             changes=changes)
@@ -394,41 +433,80 @@ class Pipeline:
             "main", system, mr_data, review_content, diff_only)
         return result.text
 
+    async def _user_prompts(self, mr_data: dict, review_content: str,
+                            diff_only: str, changes: dict | None):
+        """Successive smaller review inputs: full context -> diffs only -> as
+        many whole file diffs as the budget fits. Each variant is built only
+        after the previous one proved too large."""
+        header = gitlab_io.mr_header(mr_data)
+        yield prompts.review_user_prompt(header, review_content)
+        if not diff_only:
+            return
+        logger.warning("MR !%s too large with file context — retrying diff-only",
+                       mr_data["mr_iid"])
+        yield prompts.review_user_prompt(
+            header + "\n(file context omitted — MR too large; diffs only)", diff_only)
+        if changes is None:
+            return
+        # last resort: review the files that fit rather than nothing at all.
+        # 80% of the budget in chars leaves room for the system prompt,
+        # guidelines and header.
+        budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.8)
+        trimmed = await asyncio.to_thread(gitlab_io.extract_diff_only, changes, budget)
+        logger.warning("MR !%s still too large — reviewing a %d-char subset",
+                       mr_data["mr_iid"], len(trimmed))
+        yield prompts.review_user_prompt(
+            header + "\n(file context omitted and the diff was truncated — this MR "
+                     "exceeds the review input budget)", trimmed)
+
     async def _complete_with_degradation(self, tier: str, system: str, mr_data: dict,
                                          review_content: str, diff_only: str,
                                          effort: str | None = None,
                                          changes: dict | None = None):
-        """Review with file context, degrading rather than refusing: full context
-        -> diffs only -> as many whole file diffs as the budget fits."""
-        try:
-            user = prompts.review_user_prompt(gitlab_io.mr_header(mr_data), review_content)
-            return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
-        except AIInputTooLargeError:
-            if not diff_only:
-                raise
-            logger.warning("MR !%s too large with file context — retrying diff-only",
-                           mr_data["mr_iid"])
-        try:
-            user = prompts.review_user_prompt(
-                gitlab_io.mr_header(mr_data)
-                + "\n(file context omitted — MR too large; diffs only)", diff_only)
-            return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
-        except AIInputTooLargeError:
-            if changes is None:
-                raise
-            # last resort: review the files that fit rather than nothing at all.
-            # 80% of the budget in chars (estimate_tokens is len//3) leaves room
-            # for the system prompt, guidelines and header.
-            budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.8)
-            trimmed = await asyncio.to_thread(
-                gitlab_io.extract_diff_only, changes, budget)
-            logger.warning("MR !%s still too large — reviewing a %d-char subset",
-                           mr_data["mr_iid"], len(trimmed))
-            user = prompts.review_user_prompt(
-                gitlab_io.mr_header(mr_data)
-                + "\n(file context omitted and the diff was truncated — this MR "
-                  "exceeds the review input budget)", trimmed)
-            return await self.ai.complete(tier, system, user, max_tokens=16000, effort=effort)
+        """Review with file context, degrading rather than refusing."""
+        last_exc: AIInputTooLargeError | None = None
+        async for user in self._user_prompts(mr_data, review_content, diff_only, changes):
+            try:
+                return await self.ai.complete(tier, system, user, max_tokens=16000,
+                                              effort=effort)
+            except AIInputTooLargeError as exc:
+                last_exc = exc
+        raise last_exc or AIInputTooLargeError("no review content variant fits")
+
+    async def _review_with_tools(self, system: str, mr_data: dict, review_content: str,
+                                 diff_only: str, changes: dict | None,
+                                 worktree) -> str | None:
+        """Agentic review: same content ladder, plus read-only repo tools so the
+        model VERIFIES cross-file concerns itself instead of asking the author
+        to. Returns None when the loop produced no usable review — the caller
+        falls back to the plain single-shot path."""
+        system = system + prompts.REVIEW_TOOLS_NOTE.format(
+            max_calls=settings.review_max_tool_calls)
+        tools = self._repo_tools(worktree)
+        last_exc: AIInputTooLargeError | None = None
+        async for user in self._user_prompts(mr_data, review_content, diff_only, changes):
+            try:
+                result = await self.ai.agent_loop(
+                    "main", system, user, tools,
+                    # the prompt budgets N tool calls; the loop needs turns for
+                    # them plus a final text-only answer
+                    max_iterations=settings.review_max_tool_calls + 2,
+                    max_tokens=16000)
+            except AIInputTooLargeError as exc:
+                last_exc = exc
+                continue
+            if "verdict" not in result.text.lower():
+                # ran out of turns mid-check or emitted only preamble — the
+                # plain path writes the real review instead
+                logger.warning("tool-assisted review produced no verdict — "
+                               "falling back to plain review")
+                return None
+            logger.info("tool-assisted review done: in=%d cached=%d out=%d",
+                        result.input_tokens,
+                        result.cache_read_tokens + result.cache_creation_tokens,
+                        result.output_tokens)
+            return result.text
+        raise last_exc or AIInputTooLargeError("no review content variant fits")
 
     def _investigator_content(self, mr_data: dict, review_content: str, triage: dict,
                               review_en: str, diff_only: str) -> str:
@@ -454,46 +532,47 @@ class Pipeline:
                        mr_data["mr_iid"], budget)
         return (diff_only or review_content)[:budget]
 
-    async def _investigate(self, mr_data: dict, gitlab_config: dict,
-                           review_content: str, triage: dict, review_en: str,
-                           diff_only: str = "") -> dict | None:
+    @staticmethod
+    def _repo_tools(worktree) -> list[ToolDef]:
+        """Read-only, sandboxed tools over a checkout at the MR head commit
+        (shared by the tool-assisted review, the investigator and dialogue)."""
+        wt = worktree
+        return [
+            ToolDef("repo_grep",
+                    "Search the project for a regex pattern. Returns file:line: text matches.",
+                    {"type": "object", "properties": {
+                        "pattern": {"type": "string", "description": "Python regex"},
+                        "glob": {"type": "string", "description": "optional path glob, e.g. **/*.py"},
+                        "max_results": {"type": "integer"}},
+                     "required": ["pattern"]},
+                    handler=lambda **kw: asyncio.to_thread(repo_grep, wt, **kw)),
+            ToolDef("repo_read_file",
+                    "Read a file from the project at the MR head commit (line-numbered).",
+                    {"type": "object", "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"}},
+                     "required": ["path"]},
+                    handler=lambda **kw: asyncio.to_thread(repo_read_file, wt, **kw)),
+            ToolDef("repo_list_tree",
+                    "List files/directories under a path.",
+                    {"type": "object", "properties": {
+                        "path": {"type": "string"}, "depth": {"type": "integer"}},
+                     "required": []},
+                    handler=lambda **kw: asyncio.to_thread(repo_list_tree, wt, **kw)),
+        ]
+
+    async def _investigate(self, mr_data: dict, review_content: str, triage: dict,
+                           review_en: str, diff_only: str = "",
+                           worktree=None) -> dict | None:
+        """Agentic whole-repo investigation. The caller owns the worktree
+        (checked out once, shared with the tool-assisted review)."""
         review_content = self._investigator_content(
             mr_data, review_content, triage, review_en, diff_only)
-        worktree = None
-        try:
-            worktree = await repo_cache.checkout_mr(
-                gitlab_config, mr_data["project_path"], mr_data["mr_iid"],
-                mr_data.get("last_commit"))
-        except Exception as exc:  # noqa: BLE001 — investigation degrades, review still ships
-            logger.error("repo checkout failed, investigating without repo tools: %s", exc)
-
-        tools: list[ToolDef] = []
-        if worktree is not None:
-            wt = worktree
-            tools += [
-                ToolDef("repo_grep",
-                        "Search the project for a regex pattern. Returns file:line: text matches.",
-                        {"type": "object", "properties": {
-                            "pattern": {"type": "string", "description": "Python regex"},
-                            "glob": {"type": "string", "description": "optional path glob, e.g. **/*.py"},
-                            "max_results": {"type": "integer"}},
-                         "required": ["pattern"]},
-                        handler=lambda **kw: asyncio.to_thread(repo_grep, wt, **kw)),
-                ToolDef("repo_read_file",
-                        "Read a file from the project at the MR head commit (line-numbered).",
-                        {"type": "object", "properties": {
-                            "path": {"type": "string"},
-                            "start_line": {"type": "integer"},
-                            "end_line": {"type": "integer"}},
-                         "required": ["path"]},
-                        handler=lambda **kw: asyncio.to_thread(repo_read_file, wt, **kw)),
-                ToolDef("repo_list_tree",
-                        "List files/directories under a path.",
-                        {"type": "object", "properties": {
-                            "path": {"type": "string"}, "depth": {"type": "integer"}},
-                         "required": []},
-                        handler=lambda **kw: asyncio.to_thread(repo_list_tree, wt, **kw)),
-            ]
+        tools: list[ToolDef] = (
+            self._repo_tools(worktree) if worktree is not None else [])
+        if worktree is None:
+            logger.warning("investigating without repo tools (no checkout)")
 
         questions_left = settings.bridge_max_questions_per_mr
 
@@ -530,9 +609,6 @@ class Pipeline:
         except AIError as exc:
             logger.error("investigation failed: %s", exc)
             return None
-        finally:
-            if worktree is not None:
-                await repo_cache.release(worktree)
 
         impact, report = split_investigation(result.text)
         logger.info("investigation done: %d chars, tester_report=%s, tokens in=%d out=%d",
@@ -560,6 +636,127 @@ class Pipeline:
             return out
         logger.warning("translation output had no Cyrillic — delivering English original")
         return text
+
+    # --- MR discussion dialogue ---
+
+    async def process_note(self, note_data: dict[str, Any]) -> None:
+        """Answer a developer's reply in an MR discussion thread ("Пусть сам
+        подтверждает" — dev feedback 2026-07-31: instead of the reviewer asking
+        humans to confirm things, humans can now ask IT, and it checks the repo)."""
+        gitlab_config = note_data.get("gitlab_config")
+        if not gitlab_config:
+            logger.error("No GitLab configuration found in note_data")
+            return
+        tracker = usage.UsageTracker()
+        tracker_token = usage.current_tracker.set(tracker)
+        try:
+            await self._process_note_inner(note_data, gitlab_config)
+        except Exception:  # noqa: BLE001 — a failed reply must not spam the thread
+            logger.exception("dialogue failed for note %s in MR !%s",
+                             note_data.get("note_id"), note_data.get("mr_iid"))
+        finally:
+            usage.current_tracker.reset(tracker_token)
+            usage.persist(tracker, {**note_data, "kind": "dialogue"})
+
+    async def _process_note_inner(self, note_data: dict, gitlab_config: dict) -> None:
+        mr_iid, note_id = note_data["mr_iid"], note_data.get("note_id")
+        gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, gitlab_config)
+        bot = getattr(getattr(gl, "user", None), "username", "") or ""
+        author = note_data.get("note_author", "")
+        if bot and author == bot:
+            return  # our own review/reply notes fire note hooks too
+        project = await asyncio.to_thread(gl.projects.get, note_data["project_id"])
+        mr = await asyncio.to_thread(project.mergerequests.get, mr_iid)
+
+        discussion_id, notes = await asyncio.to_thread(
+            gitlab_io.discussion_context, mr, note_id,
+            note_data.get("discussion_id", ""))
+        mentioned = gitlab_io.mentions_user(note_data.get("note_body", ""), bot)
+        # only answer inside threads the bot is part of, or on an explicit
+        # @mention — everything else is the humans talking to each other
+        if not (mentioned or gitlab_io.thread_involves_bot(notes, bot)):
+            logger.debug("note %s: not our thread and no mention — ignoring", note_id)
+            return
+        if gitlab_io.bot_answered_after(notes, note_id, bot):
+            logger.info("note %s: already answered — skipping", note_id)
+            return
+        if not self._dialogue_budget_ok(
+                gitlab_config["name"], note_data["project_id"], mr_iid):
+            logger.warning("dialogue reply budget exhausted for MR !%s — staying "
+                           "silent", mr_iid)
+            return
+
+        logger.info("dialogue: answering @%s in %s!%s", author,
+                    note_data.get("project_path", ""), mr_iid)
+        changes = await asyncio.to_thread(
+            lambda: mr.changes(access_raw_diffs="true"))
+        diff = gitlab_io.extract_diff_only(changes, max_chars=DIALOGUE_DIFF_MAX_CHARS)
+        thread_text = (gitlab_io.render_thread(notes, bot) if notes
+                       else f"[@{author}]:\n{note_data.get('note_body', '')}")
+        header = gitlab_io.mr_header({
+            "title": getattr(mr, "title", "") or "",
+            "author": gitlab_io.real_mr_author(mr) or author,
+            "source_branch": getattr(mr, "source_branch", "") or "",
+            "target_branch": getattr(mr, "target_branch", "") or "",
+        })
+
+        worktree = None
+        try:
+            worktree = await repo_cache.checkout_mr(
+                gitlab_config, note_data["project_path"], mr_iid,
+                note_data.get("last_commit") or getattr(mr, "sha", None))
+        except Exception as exc:  # noqa: BLE001 — answer from the diff alone
+            logger.warning("repo checkout for dialogue failed: %s", exc)
+        try:
+            user = prompts.dialogue_user_prompt(
+                header, thread_text, author,
+                note_data.get("note_position", ""), diff)
+            result = await self.ai.agent_loop(
+                "main", prompts.DIALOGUE_SYSTEM, user,
+                self._repo_tools(worktree) if worktree is not None else [],
+                max_iterations=settings.review_max_tool_calls + 2,
+                max_tokens=4000)
+        finally:
+            if worktree is not None:
+                await repo_cache.release(worktree)
+
+        text = (result.text or "").strip()
+        if not text or text.upper().startswith("NO_REPLY"):
+            logger.info("dialogue: nothing to answer in note %s", note_id)
+            return
+        reply = await self._translate_if_needed(text, tier="fast")
+
+        posted = False
+        if discussion_id:
+            try:
+                await gitlab_io.post_discussion_reply(mr, discussion_id, reply)
+                posted = True
+            except Exception as exc:  # noqa: BLE001 — thread reply can 400 on odd notes
+                logger.warning("discussion reply failed (%s) — posting a plain note", exc)
+        if not posted:
+            quote = "\n".join(
+                "> " + line
+                for line in note_data.get("note_body", "").splitlines()[:6])
+            await gitlab_io.post_note(mr, f"@{author}\n\n{quote}\n\n{reply}")
+        self._dialogue_replied(gitlab_config["name"], note_data["project_id"], mr_iid)
+        logger.info("dialogue: replied in MR !%s (thread %s)", mr_iid,
+                    discussion_id or "new")
+
+    def _dialogue_budget_ok(self, instance: str, project_id, mr_iid) -> bool:
+        now = time.time()
+        key = (instance, project_id, mr_iid)
+        stamps = [t for t in self._dialogue_replies.get(key, ())
+                  if now - t < DIALOGUE_WINDOW_SECONDS]
+        self._dialogue_replies[key] = stamps
+        if len(self._dialogue_replies) > 500:  # bound the map itself
+            self._dialogue_replies = {
+                k: v for k, v in self._dialogue_replies.items()
+                if v and now - v[-1] < DIALOGUE_WINDOW_SECONDS}
+        return len(stamps) < settings.dialogue_max_replies_per_mr
+
+    def _dialogue_replied(self, instance: str, project_id, mr_iid) -> None:
+        self._dialogue_replies.setdefault(
+            (instance, project_id, mr_iid), []).append(time.time())
 
     # --- delivery ---
 

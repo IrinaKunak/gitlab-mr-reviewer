@@ -16,14 +16,21 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 
 `w-server.py` is a thin shim so `uvicorn w-server:app` keeps working.
 
-- **reviewer/server.py** — FastAPI app: `POST /webhook` (contract unchanged from v1),
-  `GET /` (health + flags), `GET /stats` (token/cost aggregates); asyncio queue with
-  N workers; webhook dedupe (exact-SHA TTL + per-MR burst window); lifespan starts the
-  bridge listener and GitLab startup checks
-- **reviewer/pipeline.py** — stage orchestrator: triage (fast) → review (main) →
-  investigator (smart, agentic, complex MRs only) → translate EN→RU → deliver review
-  (+impact analysis) and tester report; per-review usage tracking; v1-parity path when
-  `PIPELINE_V2=off`; legacy `AI_PROVIDER=gemini` subprocess path as rollback hatch
+- **reviewer/server.py** — FastAPI app: `POST /webhook` (MR events, contract unchanged
+  from v1, **plus Note Hook** → dialogue jobs on the same queue, deduped by note id and
+  exempt from the burst window), `GET /` (health + flags), `GET /stats` (token/cost
+  aggregates); asyncio queue with N workers; webhook dedupe (exact-SHA TTL + per-MR
+  burst window); lifespan starts the bridge listener and GitLab startup checks (which
+  also capture each instance's `bot_username` so the bot's own notes are dropped at
+  the door)
+- **reviewer/pipeline.py** — stage orchestrator: triage (fast) → review (main,
+  **agentic with repo tools** — see below) → investigator (smart, agentic, complex MRs
+  only) → translate EN→RU → deliver review (+impact analysis) and tester report; one
+  repo checkout is shared by the tool-assisted review and the investigator;
+  `process_note` answers developer replies in MR discussion threads (main tier + repo
+  tools, `NO_REPLY` sentinel, per-MR daily reply budget); per-review usage tracking
+  (`kind: review|dialogue` in usage.jsonl); v1-parity path when `PIPELINE_V2=off`;
+  legacy `AI_PROVIDER=gemini` subprocess path as rollback hatch
 - **reviewer/ai_client.py** — Anthropic SDK via Cloudflare AI Gateway with OpenRouter
   fallback (Anthropic-compatible `/api/v1/messages`, `models` array failover); response
   cache, rate limiting, agent tool loop, empty-response retry, usage recording
@@ -113,6 +120,23 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   intentional changes are intentional, no hypotheticals, no "confirm/verify" asks,
   empty review is valid). Teams can extend focus via `.ai-review.md` in the repo root
   (target branch, capped 4000 chars, any language).
+- **The review VERIFIES instead of hedging** (dev feedback 2026-07-31: prompt rules
+  alone still let "нужно подтвердить, что…" through, because a diff-only reviewer
+  structurally cannot check anything outside the diff). `REVIEW_REPO_TOOLS=on` gives
+  the main-tier review the investigator's read-only repo tools (grep/read/tree at the
+  MR head) + `REVIEW_TOOLS_NOTE`: check cross-file concerns yourself, cite file:line,
+  or say nothing. Non-trivial MRs now clone into the repo cache (shared with the
+  investigator, one checkout per review). Any tool-path failure (checkout, refusal,
+  no-verdict output) falls back to the plain single-shot review.
+- **MR dialogue** (`MR_DIALOGUE=on`): replying to a bot comment or @mentioning the bot
+  in an MR triggers a Note Hook → the bot answers in the same thread, checking the
+  repo before answering ("Пусть сам подтверждает"). Requires `note_events` on project
+  webhooks — `add_webhooks_to_all_projects.py` enables it and also UPDATES existing
+  hooks (re-run it once after deploying). Guards: own-note drop (startup-captured
+  bot_username + worker re-check), only bot-threads/mentions answered,
+  already-answered check, `DIALOGUE_MAX_REPLIES_PER_MR` (20/day), `NO_REPLY` sentinel
+  for acks. Replies are never posted on failure paths (a broken reply must not spam
+  the thread).
 - **Translation tier is length-routed**: >3500 chars goes to main tier — Haiku left
   long reviews half-English mid-sentence.
 - **Debug/usage logging must never break a review** — logs dir can be unwritable
@@ -136,6 +160,8 @@ Key groups (see `.env.example` for the full annotated list):
   `cf-aig-authorization: Bearer`), model tiers, `OPENROUTER_API_TOKEN` + fallback chains
 - **Flags**: `PIPELINE_V2`, `INVESTIGATOR`, `BRIDGE`, `TESTER_REPORT` — all ON in prod;
   all off = v1-parity. Rollback = flip a flag + `docker compose up -d`.
+  `REVIEW_REPO_TOOLS` / `MR_DIALOGUE` default ON (env `off` to disable);
+  `REVIEW_MAX_TOOL_CALLS` (8) budgets both the review's checks and dialogue replies.
 - **Bridge**: `REVIEW_BRIDGE_CHAT_ID`, `BRIDGE_QUESTION_TIMEOUT`, `BRIDGE_MAX_QUESTIONS_PER_MR`
 - **Repo cache**: `REPO_CACHE_DIR`, `REPO_CACHE_MAX_GB` (LRU) or `REPO_CACHE_EPHEMERAL=true`
 - **Stats**: `MODEL_PRICES="model=in/out,..."` ($/MTok override; sonnet-5 intro pricing

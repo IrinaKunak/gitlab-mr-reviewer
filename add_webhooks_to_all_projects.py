@@ -127,12 +127,35 @@ def check_existing_webhook(project, webhook_url: str) -> Optional[Any]:
         return None
 
 
+def ensure_hook_events(project, hook) -> bool:
+    """Bring an existing hook up to the current event set (MR + note events).
+
+    note_events powers the MR dialogue feature (the bot answering replies in
+    discussion threads) — hooks created before 2026-07-31 have it off.
+    Returns True when the hook was modified."""
+    changed = False
+    if not getattr(hook, "merge_requests_events", False):
+        hook.merge_requests_events = True
+        changed = True
+    if not getattr(hook, "note_events", False):
+        hook.note_events = True
+        changed = True
+    if changed:
+        hook.save()
+        logger.info(
+            f"🔁 Updated webhook events for {project.path_with_namespace} "
+            f"(note_events enabled)"
+        )
+    return changed
+
+
 def add_webhook_to_project(project, webhook_url: str, webhook_token: str) -> bool:
     """Add webhook to a specific project"""
     try:
         # Check if webhook already exists
         existing_hook = check_existing_webhook(project, webhook_url)
         if existing_hook:
+            ensure_hook_events(project, existing_hook)
             logger.info(
                 f"Webhook already exists for {project.path_with_namespace} (ID: {existing_hook.id})"
             )
@@ -146,7 +169,7 @@ def add_webhook_to_project(project, webhook_url: str, webhook_token: str) -> boo
             "issues_events": False,
             "confidential_issues_events": False,
             "tag_push_events": False,
-            "note_events": False,
+            "note_events": True,  # MR dialogue: the bot answers thread replies
             "job_events": False,
             "pipeline_events": False,
             "wiki_page_events": False,
@@ -251,9 +274,17 @@ def process_gitlab_instance(
                     results["successful_webhooks"] += 1
                     continue
 
-                # Check if webhook already exists
+                # Check if webhook already exists (and refresh its event set —
+                # pre-2026-07-31 hooks lack note_events for the MR dialogue)
                 existing_hook = check_existing_webhook(project, WEBHOOK_ENDPOINT)
                 if existing_hook:
+                    try:
+                        ensure_hook_events(project, existing_hook)
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to update webhook events for "
+                            f"{project.path_with_namespace}: {e}"
+                        )
                     results["existing_webhooks"] += 1
                     continue
 

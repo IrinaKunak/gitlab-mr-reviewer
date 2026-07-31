@@ -56,6 +56,17 @@ class ReviewQueue:
         self._seen = {key: stamp for key, stamp in self._seen.items()
                       if now - stamp < self.dedupe_ttl}
         key = self.dedupe_key(mr_data)
+        if mr_data.get("kind") == "note":
+            # dialogue job: dedupe purely by note id (webhook retries) — the
+            # per-MR burst window must NOT apply, a reply right after a review
+            # event is exactly the case we want to serve
+            note_key = ("note", key[0], key[1], mr_data.get("note_id"))
+            if note_key in self._seen:
+                logger.info("Duplicate note webhook for %s — skipped", note_key)
+                return False
+            self._seen[note_key] = now
+            self.queue.put_nowait(mr_data)
+            return True
         if mr_data.get("force_full"):
             # explicit re-review request — bypass dedupe (the triggering label
             # event carries the same sha the TTL window would swallow)
@@ -95,7 +106,10 @@ class ReviewQueue:
         while True:
             mr_data = await self.queue.get()
             try:
-                await pipeline.process(mr_data)
+                if mr_data.get("kind") == "note":
+                    await pipeline.process_note(mr_data)
+                else:
+                    await pipeline.process(mr_data)
             except Exception:  # noqa: BLE001 — workers must survive anything
                 logger.exception("worker %d: unhandled pipeline error", idx)
             finally:
@@ -124,8 +138,13 @@ async def _verify_instances() -> None:
     """Startup connectivity check (non-fatal, v1 behavior)."""
     for config in settings.gitlab_instances.values():
         try:
-            await asyncio.to_thread(gitlab_io.get_gitlab_client, config)
-            logger.info("GitLab instance OK: %s (%s)", config["name"], config["url"])
+            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, config)
+            # remembered so note webhooks from the bot itself are dropped at
+            # the door instead of queueing a job (every review post fires one)
+            config["bot_username"] = getattr(
+                getattr(gl, "user", None), "username", "") or ""
+            logger.info("GitLab instance OK: %s (%s), bot=%s", config["name"],
+                        config["url"], config["bot_username"] or "?")
         except Exception as exc:  # noqa: BLE001
             logger.error("GitLab instance %s connection failed: %s", config["name"], exc)
             await telegram_io.notify_error(
@@ -138,8 +157,11 @@ async def lifespan(app: FastAPI):
     logger.info("GitLab MR Reviewer v%s starting", __version__)
     logger.info("Instances: %s", [c["name"] for c in settings.gitlab_instances.values()])
     logger.info("Flags: pipeline_v2=%s investigator=%s bridge=%s tester_report=%s "
-                "provider=%s", settings.pipeline_v2, settings.investigator,
-                settings.bridge_enabled, settings.tester_report, settings.ai_provider)
+                "review_repo_tools=%s dialogue=%s provider=%s",
+                settings.pipeline_v2, settings.investigator,
+                settings.bridge_enabled, settings.tester_report,
+                settings.review_repo_tools, settings.dialogue_enabled,
+                settings.ai_provider)
     if settings.ai_provider == "gemini" and not shutil.which("gemini"):
         logger.error("AI_PROVIDER=gemini but the gemini CLI is not installed — "
                      "this rollback path requires the v1 Docker image (master branch)")
@@ -167,6 +189,8 @@ async def root() -> dict[str, Any]:
             "investigator": settings.investigator,
             "bridge": settings.bridge_enabled,
             "tester_report": settings.tester_report,
+            "review_repo_tools": settings.review_repo_tools,
+            "dialogue": settings.dialogue_enabled,
         },
     }
 
@@ -286,6 +310,27 @@ async def handle_gitlab_webhook(request: Request):
         logger.error("Invalid JSON in webhook payload")
         await telegram_io.notify_error("webhook_error", "Invalid JSON in webhook payload")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if event_type == "Note Hook":
+        if not settings.dialogue_enabled:
+            return {"status": "ignored", "reason": "dialogue disabled"}
+        note_data = gitlab_io.parse_note_webhook(payload)
+        if not note_data:
+            return {"status": "ignored", "reason": "not an MR comment"}
+        bot = gitlab_config.get("bot_username", "")
+        if bot and note_data.get("note_author") == bot:
+            return {"status": "ignored", "reason": "own note"}
+        note_data["gitlab_config"] = gitlab_config
+        accepted = review_queue.submit(note_data)
+        logger.info("%s dialogue for note %s on MR !%s in project %s on %s",
+                    "Queued" if accepted else "Deduped", note_data["note_id"],
+                    note_data["mr_iid"], note_data["project_id"],
+                    gitlab_config["name"])
+        return {
+            "status": "accepted" if accepted else "duplicate",
+            "merge_request": note_data["mr_iid"],
+            "instance": gitlab_config["name"],
+        }
 
     if event_type != "Merge Request Hook":
         logger.info("Ignoring non-MR event: %s", event_type)

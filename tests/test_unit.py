@@ -1203,3 +1203,277 @@ def test_review_queue_dedupe():
         assert queue.submit(dict(mr)) is False          # webhook retry
         assert queue.submit({**mr, "last_commit": "def"}) is True  # new push
     asyncio.run(run())
+
+
+# --- MR dialogue & tool-assisted review (dev feedback 2026-07-31) ---
+
+def test_parse_note_webhook_variants():
+    # "жаль, он диалоги не поддерживает" — replies to the bot's review comment
+    # arrive as Note Hook events; only human MR comments become dialogue jobs
+    base = {
+        "object_kind": "note",
+        "user": {"username": "irina"},
+        "project": {"id": 42, "path_with_namespace": "novacard/telemarketing-back"},
+        "object_attributes": {
+            "id": 555, "note": "а точно IsAuthenticated остался?",
+            "noteable_type": "MergeRequest", "system": False,
+            "discussion_id": "abc123", "position": None,
+        },
+        "merge_request": {"iid": 10, "url": "https://x/mr/10",
+                          "last_commit": {"id": "sha1"}},
+    }
+    parsed = gitlab_io.parse_note_webhook(base)
+    assert parsed and parsed["kind"] == "note"
+    assert parsed["mr_iid"] == 10 and parsed["note_id"] == 555
+    assert parsed["discussion_id"] == "abc123"
+    assert parsed["note_author"] == "irina"
+    assert parsed["last_commit"] == "sha1"
+
+    # a comment on a diff line carries its anchor
+    diff_note = {**base, "object_attributes": {
+        **base["object_attributes"],
+        "position": {"new_path": "app/views.py", "new_line": 88}}}
+    assert gitlab_io.parse_note_webhook(diff_note)["note_position"] == "app/views.py:88"
+
+    # system notes, non-MR comments, empty bodies -> not dialogue material
+    system_note = {**base, "object_attributes": {**base["object_attributes"], "system": True}}
+    assert gitlab_io.parse_note_webhook(system_note) is None
+    issue_note = {**base, "object_attributes": {
+        **base["object_attributes"], "noteable_type": "Issue"}}
+    assert gitlab_io.parse_note_webhook(issue_note) is None
+    empty = {**base, "object_attributes": {**base["object_attributes"], "note": "  "}}
+    assert gitlab_io.parse_note_webhook(empty) is None
+    assert gitlab_io.parse_note_webhook({**base, "merge_request": {}}) is None
+    assert gitlab_io.parse_note_webhook({"object_kind": "push"}) is None
+
+
+def test_note_queue_dedupe_and_burst_immunity():
+    async def run():
+        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=300)
+        mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
+              "mr_iid": 7, "last_commit": "abc"}
+        assert queue.submit(dict(mr)) is True
+        # a reply seconds after the review event is EXACTLY the dialogue case —
+        # the per-MR burst window must not swallow it
+        note = {**mr, "kind": "note", "note_id": 900}
+        assert queue.submit(dict(note)) is True
+        assert queue.submit(dict(note)) is False        # webhook retry, same note
+        assert queue.submit({**note, "note_id": 901}) is True  # next reply
+    asyncio.run(run())
+
+
+def test_thread_helpers():
+    notes = [
+        {"id": 1, "author": {"username": "reviewer-bot"}, "body": "## Review\nfinding A"},
+        {"id": 2, "author": {"username": "irina"}, "body": "ну нет изменений же"},
+        {"id": 3, "author": {"username": "gitlab"}, "system": True, "body": "added 1 commit"},
+    ]
+    text = gitlab_io.render_thread(notes, "reviewer-bot")
+    assert "[@reviewer-bot [bot — this is you]]" in text
+    assert "[@irina]" in text and "added 1 commit" not in text
+
+    assert gitlab_io.thread_involves_bot(notes, "reviewer-bot") is True
+    assert gitlab_io.thread_involves_bot(notes, "other-bot") is False
+    assert gitlab_io.thread_involves_bot(notes, "") is False
+    # bot note id 1 < trigger id 2 -> not answered yet; a bot note after -> answered
+    assert gitlab_io.bot_answered_after(notes, 2, "reviewer-bot") is False
+    answered = notes + [{"id": 4, "author": {"username": "reviewer-bot"}, "body": "ok"}]
+    assert gitlab_io.bot_answered_after(answered, 2, "reviewer-bot") is True
+
+    assert gitlab_io.mentions_user("cc @Reviewer-Bot, взгляни", "reviewer-bot") is True
+    assert gitlab_io.mentions_user("no mention here", "reviewer-bot") is False
+    assert gitlab_io.mentions_user("@reviewer-bot2 hi", "reviewer-bot") is False
+    assert gitlab_io.mentions_user("hi", "") is False
+
+    # discussion_context: hint path, scan fallback, API failure -> ("", [])
+    from types import SimpleNamespace
+    hit = SimpleNamespace(id="d9", attributes={"notes": [{"id": 5, "body": "x"}]})
+
+    class _Discussions:
+        def get(self, did):
+            assert did == "d9"
+            return hit
+        def list(self, **kw):
+            return iter([SimpleNamespace(id="other", attributes={"notes": [{"id": 1}]}),
+                         hit])
+    mr = SimpleNamespace(discussions=_Discussions())
+    assert gitlab_io.discussion_context(mr, 5, "d9") == ("d9", [{"id": 5, "body": "x"}])
+    assert gitlab_io.discussion_context(mr, 5, "") == ("d9", [{"id": 5, "body": "x"}])
+
+    class _Broken:
+        def get(self, did):
+            raise RuntimeError("403")
+        def list(self, **kw):
+            raise RuntimeError("403")
+    assert gitlab_io.discussion_context(
+        SimpleNamespace(discussions=_Broken()), 5, "d9") == ("", [])
+
+
+def test_dialogue_answers_in_thread(monkeypatch):
+    # "Пусть сам подтверждает" — the bot answers a dev's reply, checking the
+    # repo itself; NO_REPLY suppresses the answer; budget caps runaway threads
+    from types import SimpleNamespace
+    from reviewer import pipeline as pipeline_mod
+    from reviewer.ai_client import AIResult
+    from reviewer.config import settings
+
+    monkeypatch.setattr(settings, "review_language", "en")
+    posted: list[tuple] = []
+
+    stub_mr = SimpleNamespace(
+        title="MR 10", source_branch="f", target_branch="dev", author={"username": "dev1"},
+        changes=lambda access_raw_diffs=None: {"changes": [
+            {"new_path": "a.py", "diff": "+x = 1"}]})
+    stub_project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda iid: stub_mr))
+    stub_gl = SimpleNamespace(user=SimpleNamespace(username="reviewer-bot"),
+                              projects=SimpleNamespace(get=lambda pid: stub_project))
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client", lambda cfg: stub_gl)
+    thread = [{"id": 1, "author": {"username": "reviewer-bot"}, "body": "finding"},
+              {"id": 2, "author": {"username": "irina"}, "body": "точно?"}]
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
+                        lambda mr, nid, did="": ("d1", thread))
+
+    async def _no_repo(*a, **kw):
+        raise RuntimeError("clone disabled in tests")
+    monkeypatch.setattr(pipeline_mod.repo_cache, "checkout_mr", _no_repo)
+
+    async def _record_reply(mr, did, body):
+        posted.append(("thread", did, body))
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_discussion_reply", _record_reply)
+
+    async def _record_note(mr, body):
+        posted.append(("note", body))
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", _record_note)
+
+    answers = iter([AIResult(text="Checked views.py:12 — IsAuthenticated is intact."),
+                    AIResult(text="NO_REPLY")])
+    seen_prompts: list[str] = []
+
+    class StubAI:
+        async def agent_loop(self, tier, system, user, tools, **kw):
+            assert tier == "main"
+            seen_prompts.append(user)
+            return next(answers)
+
+    p = pipeline_mod.Pipeline(client=StubAI())
+    note = {"kind": "note", "gitlab_config": {"name": "primary"}, "project_id": 1,
+            "project_path": "g/p", "mr_iid": 10, "note_id": 2, "discussion_id": "d1",
+            "note_body": "точно?", "note_author": "irina", "note_position": "",
+            "last_commit": "sha1", "url": ""}
+    asyncio.run(p.process_note(dict(note)))
+    assert posted == [("thread", "d1", "Checked views.py:12 — IsAuthenticated is intact.")]
+    # the model sees the thread, knows which side it is, and the diff
+    assert "[bot — this is you]" in seen_prompts[0]
+    assert "Answer the last message, from @irina." in seen_prompts[0]
+    assert "+x = 1" in seen_prompts[0]
+
+    # NO_REPLY -> nothing posted
+    asyncio.run(p.process_note({**note, "note_id": 3}))
+    assert len(posted) == 1
+
+    # the bot's own note must never trigger an answer (loop guard)
+    asyncio.run(p.process_note({**note, "note_id": 4, "note_author": "reviewer-bot"}))
+    assert len(posted) == 1
+
+    # a thread without the bot and without a mention is the humans talking
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
+                        lambda mr, nid, did="": ("d2", [
+                            {"id": 9, "author": {"username": "artem"}, "body": "hi"}]))
+    asyncio.run(p.process_note({**note, "note_id": 9, "discussion_id": "d2"}))
+    assert len(posted) == 1
+
+    # per-MR budget: once exhausted the bot stays silent
+    monkeypatch.setattr(settings, "dialogue_max_replies_per_mr", 1)
+    assert p._dialogue_budget_ok("primary", 1, 10) is False
+    assert p._dialogue_budget_ok("primary", 1, 11) is True
+
+
+def test_review_with_tools_verifies_and_falls_back(monkeypatch):
+    # the review stage checks its own cross-file concerns with repo tools;
+    # any tool-path failure degrades to the plain single-shot review
+    from reviewer import pipeline as pipeline_mod
+    from reviewer.ai_client import AIError, AIResult
+
+    mr_data = {"mr_iid": 1, "title": "t", "author": "dev1",
+               "source_branch": "f", "target_branch": "dev"}
+    triage = {"complexity": "normal", "risk_areas": []}
+    calls: list[str] = []
+
+    class StubAI:
+        def __init__(self, agent_result=None, agent_exc=None):
+            self.agent_result, self.agent_exc = agent_result, agent_exc
+
+        async def agent_loop(self, tier, system, user, tools, **kw):
+            calls.append("agent")
+            assert tier == "main"
+            assert [t.name for t in tools] == ["repo_grep", "repo_read_file",
+                                               "repo_list_tree"]
+            assert "REPO ACCESS FOR THIS REVIEW" in system
+            if self.agent_exc:
+                raise self.agent_exc
+            return self.agent_result
+
+        async def complete(self, tier, system, user, **kw):
+            calls.append("complete")
+            return AIResult(text="## Verdict\n**SHIP** plain path")
+
+    # tool path succeeds -> plain completion never runs
+    p = pipeline_mod.Pipeline(
+        client=StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
+    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
+                                worktree=object()))
+    assert out == "## Verdict\n**SHIP** verified" and calls == ["agent"]
+
+    # loop dies (refusal, provider trouble) -> plain review still ships
+    calls.clear()
+    p = pipeline_mod.Pipeline(client=StubAI(agent_exc=AIError("boom")))
+    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
+                                worktree=object()))
+    assert "plain path" in out and calls == ["agent", "complete"]
+
+    # loop ran out of turns mid-check (no verdict) -> plain review
+    calls.clear()
+    p = pipeline_mod.Pipeline(client=StubAI(agent_result=AIResult(text="hmm, checking")))
+    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
+                                worktree=object()))
+    assert "plain path" in out and calls == ["agent", "complete"]
+
+    # no worktree (checkout failed / flag off) -> straight to the plain path
+    calls.clear()
+    p = pipeline_mod.Pipeline(client=StubAI())
+    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
+                                worktree=None))
+    assert calls == ["complete"]
+
+
+def test_dialogue_and_tools_prompt_contract():
+    from reviewer import prompts
+
+    note = prompts.REVIEW_TOOLS_NOTE.format(max_calls=8)
+    assert "REPO ACCESS FOR THIS REVIEW" in note
+    assert "about 8 tool calls" in note
+    # the upgrade of the epistemic rule: unverifiable -> CHECK it, not drop it
+    assert "CHECK it yourself" in note
+    assert "confirm what these tools can" in note
+
+    assert "NO_REPLY" in prompts.DIALOGUE_SYSTEM
+    assert "CHECK, don't ask" in prompts.DIALOGUE_SYSTEM
+    assert "cannot approve, merge, or modify" in prompts.DIALOGUE_SYSTEM
+    user = prompts.dialogue_user_prompt("hdr", "thread-text", "irina",
+                                        position="a.py:5", diff="+d")
+    assert "thread-text" in user and "a.py:5" in user
+    assert user.rstrip().endswith("Answer the last message, from @irina.")
+
+
+def test_dialogue_and_review_tools_flags(monkeypatch):
+    for var in ("REVIEW_REPO_TOOLS", "MR_DIALOGUE", "REVIEW_MAX_TOOL_CALLS",
+                "DIALOGUE_MAX_REPLIES_PER_MR"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = Settings()
+    assert cfg.review_repo_tools is True and cfg.dialogue_enabled is True
+    assert cfg.review_max_tool_calls == 8
+    assert cfg.dialogue_max_replies_per_mr == 20
+    monkeypatch.setenv("REVIEW_REPO_TOOLS", "off")
+    monkeypatch.setenv("MR_DIALOGUE", "off")
+    cfg = Settings()
+    assert cfg.review_repo_tools is False and cfg.dialogue_enabled is False

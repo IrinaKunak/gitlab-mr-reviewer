@@ -111,6 +111,17 @@ class Settings:
     investigator: bool = field(default_factory=lambda: _bool("INVESTIGATOR"))
     bridge_enabled: bool = field(default_factory=lambda: _bool("BRIDGE"))
     tester_report: bool = field(default_factory=lambda: _bool("TESTER_REPORT"))
+    # the review stage gets read-only repo tools so it VERIFIES cross-file
+    # concerns itself instead of asking the author to "confirm" them (dev
+    # feedback 2026-07-31: prompt rules alone still let hedges through, because
+    # a diff-only reviewer structurally cannot check anything outside the diff)
+    review_repo_tools: bool = field(default_factory=lambda: _bool("REVIEW_REPO_TOOLS", True))
+    review_max_tool_calls: int = field(default_factory=lambda: _int("REVIEW_MAX_TOOL_CALLS", 8))
+    # answer developer replies in MR discussion threads (needs note_events on
+    # the project webhooks — re-run add_webhooks_to_all_projects.py once)
+    dialogue_enabled: bool = field(default_factory=lambda: _bool("MR_DIALOGUE", True))
+    dialogue_max_replies_per_mr: int = field(
+        default_factory=lambda: _int("DIALOGUE_MAX_REPLIES_PER_MR", 20))
 
     # --- repo cache ---
     repo_cache_dir: str = field(default_factory=lambda: os.getenv("REPO_CACHE_DIR", "repos"))

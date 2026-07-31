@@ -149,6 +149,126 @@ def parse_merge_request_webhook(payload: dict[str, Any]) -> dict[str, Any] | Non
         return None
 
 
+def parse_note_webhook(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Comment ('Note Hook') on a merge request -> dialogue job dict, or None.
+
+    Filters out system notes, non-MR comments and empty bodies. The bot's own
+    notes are dropped by the caller (it knows the instance's bot username)."""
+    try:
+        if payload.get("object_kind") != "note":
+            return None
+        attrs = payload.get("object_attributes") or {}
+        if attrs.get("noteable_type") != "MergeRequest" or attrs.get("system"):
+            return None
+        body = (attrs.get("note") or "").strip()
+        if not body:
+            return None
+        mr = payload.get("merge_request") or {}
+        if not mr.get("iid"):
+            return None
+        project = payload["project"]
+        position = attrs.get("position") or {}
+        pos = ""
+        if isinstance(position, dict):
+            path = position.get("new_path") or position.get("old_path")
+            line = position.get("new_line") or position.get("old_line")
+            if path:
+                pos = f"{path}:{line}" if line else str(path)
+        return {
+            "kind": "note",
+            "project_id": project["id"],
+            "project_path": project["path_with_namespace"],
+            "mr_iid": mr["iid"],
+            "note_id": attrs.get("id"),
+            "discussion_id": attrs.get("discussion_id") or "",
+            "note_body": body,
+            "note_author": (payload.get("user") or {}).get("username", ""),
+            "note_position": pos,
+            "last_commit": (mr.get("last_commit") or {}).get("id"),
+            "url": mr.get("url", ""),
+        }
+    except KeyError as exc:
+        logger.error("Missing required field in note webhook payload: %s", exc)
+        return None
+
+
+MAX_DISCUSSION_SCAN = 300  # fallback when the payload carries no discussion_id
+
+
+def discussion_context(mr, note_id, discussion_id: str = "") -> tuple[str, list[dict]]:
+    """(discussion_id, notes-as-dicts) for the thread containing note_id.
+
+    Uses the webhook's discussion_id when present; otherwise scans the MR's
+    discussions (bounded). ("", []) when not found / API failure."""
+    def _notes_of(disc) -> list[dict]:
+        return (getattr(disc, "attributes", None) or {}).get("notes") or []
+    try:
+        if discussion_id:
+            disc = mr.discussions.get(discussion_id)
+            notes = _notes_of(disc)
+            if notes:
+                return discussion_id, notes
+        for idx, disc in enumerate(mr.discussions.list(iterator=True)):
+            if idx >= MAX_DISCUSSION_SCAN:
+                break
+            notes = _notes_of(disc)
+            if any(n.get("id") == note_id for n in notes):
+                return str(getattr(disc, "id", "")), notes
+    except Exception as exc:  # noqa: BLE001 — dialogue is best-effort
+        logger.warning("could not fetch discussion for note %s: %s", note_id, exc)
+    return "", []
+
+
+def render_thread(notes: list[dict], bot_username: str, max_chars: int = 12_000,
+                  per_note_chars: int = 3000) -> str:
+    """Discussion notes as a transcript; the bot's own notes are tagged so the
+    model knows which side of the conversation it is."""
+    parts = []
+    for note in notes:
+        if note.get("system"):
+            continue
+        author = ((note.get("author") or {}).get("username")) or "unknown"
+        tag = " [bot — this is you]" if bot_username and author == bot_username else ""
+        body = (note.get("body") or "").strip()
+        if len(body) > per_note_chars:
+            body = body[:per_note_chars] + " …[trimmed]"
+        parts.append(f"[@{author}{tag}]:\n{body}")
+    text = "\n\n---\n\n".join(parts)
+    if len(text) > max_chars:  # keep the tail — the message being answered is last
+        text = "…" + text[-max_chars:]
+    return text
+
+
+def thread_involves_bot(notes: list[dict], bot_username: str) -> bool:
+    return bool(bot_username) and any(
+        ((n.get("author") or {}).get("username")) == bot_username
+        for n in notes if not n.get("system"))
+
+
+def bot_answered_after(notes: list[dict], note_id, bot_username: str) -> bool:
+    """A bot note NEWER than the triggering note already exists in the thread
+    (webhook retry / restart redelivery) — do not answer the same message twice."""
+    return bool(bot_username) and any(
+        ((n.get("author") or {}).get("username")) == bot_username
+        and (n.get("id") or 0) > (note_id or 0)
+        for n in notes if not n.get("system"))
+
+
+def mentions_user(text: str, username: str) -> bool:
+    if not username:
+        return False
+    return re.search(rf"@{re.escape(username)}\b", text or "", re.IGNORECASE) is not None
+
+
+async def post_discussion_reply(mr, discussion_id: str, body: str) -> None:
+    """Reply inside an MR discussion thread. On a standalone (non-thread) note
+    GitLab converts it into a thread — same endpoint either way."""
+    def _post():
+        discussion = mr.discussions.get(discussion_id)
+        discussion.notes.create({"body": body})
+    await asyncio.to_thread(_post)
+
+
 def extract_jira_keys(mr_data: dict) -> list[str]:
     """Cheap regex extraction from branch/title/description (triage may add more)."""
     haystack = " ".join(

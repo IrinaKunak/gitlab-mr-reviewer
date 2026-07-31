@@ -197,6 +197,7 @@ def persist(tracker: UsageTracker, mr_data: dict) -> None:
         return
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": mr_data.get("kind") or "review",  # review | dialogue
         "instance": (mr_data.get("gitlab_config") or {}).get("name"),
         "project": mr_data.get("project_path"),
         "mr_iid": mr_data.get("mr_iid"),
