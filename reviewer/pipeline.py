@@ -27,7 +27,8 @@ from .ai_client import (CHARS_PER_TOKEN, AIClient, AIError, AIInputTooLargeError
                         AITimeoutError, ToolDef, ai_client, estimate_tokens)
 from .bridge import bridge
 from .config import settings
-from .repo_cache import repo_cache, repo_grep, repo_list_tree, repo_read_file
+from .repo_cache import (repo_cache, repo_find_symbol, repo_grep, repo_list_tree,
+                         repo_read_file)
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +539,17 @@ class Pipeline:
         (shared by the tool-assisted review, the investigator and dialogue)."""
         wt = worktree
         return [
+            ToolDef("repo_find_symbol",
+                    "Find where a class/function/constant is DEFINED, from a "
+                    "pre-built symbol index (exact name first, then fuzzy). "
+                    "Prefer this over repo_grep for definitions; then open the "
+                    "location with repo_read_file.",
+                    {"type": "object", "properties": {
+                        "name": {"type": "string",
+                                 "description": "symbol name, e.g. LeadSerializer"},
+                        "max_results": {"type": "integer"}},
+                     "required": ["name"]},
+                    handler=lambda **kw: asyncio.to_thread(repo_find_symbol, wt, **kw)),
             ToolDef("repo_grep",
                     "Search the project for a regex pattern. Returns file:line: text matches.",
                     {"type": "object", "properties": {

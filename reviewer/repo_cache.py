@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import fnmatch
+import json
 import logging
 import os
 import re
@@ -41,6 +42,13 @@ MAX_FILE_BYTES = 1_500_000  # skip bigger files in grep/read
 GREP_TIME_BUDGET = 15.0     # seconds; coarse ReDoS / huge-repo guard
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
              ".idea", ".mypy_cache", ".ruff_cache", "vendor"}
+
+# Better engines when the image ships them (Dockerfile installs both); every
+# path degrades cleanly when the binary is absent, so tests and old images work.
+_RG = shutil.which("rg")          # ripgrep: linear-time regex, .gitignore-aware
+_CTAGS = shutil.which("ctags")    # universal-ctags: definition index
+CTAGS_TIME_BUDGET = 90.0
+MAX_SYMBOLS = 300_000             # index memory bound (~30 MB worst case)
 
 _CRED_RE = re.compile(r"(https?://)[^/@\s]+@")
 
@@ -131,6 +139,7 @@ class RepoCache:
         return worktree
 
     async def release(self, worktree: Path) -> None:
+        clear_symbol_index(worktree)
         repo_dir = worktree.parent / f"{worktree.name.rsplit('-mr', 1)[0]}.git"
         # same lock as checkout_mr: never drop a bare repo mid-checkout of another MR
         async with self._locks[str(repo_dir)]:
@@ -216,6 +225,78 @@ def repo_grep(worktree: Path, pattern: str, glob: str | None = None,
               max_results: int = 50) -> str:
     if len(pattern) > 256:
         return "Pattern too long (max 256 chars)."
+    if _RG:
+        out = _grep_ripgrep(worktree, pattern, glob, max_results)
+        if out is not None:
+            return out
+        # rg's Rust regex has no lookarounds/backrefs — those patterns fall
+        # through to the Python engine below
+    return _grep_python(worktree, pattern, glob, max_results)
+
+
+def _grep_ripgrep(worktree: Path, pattern: str, glob: str | None,
+                  max_results: int) -> str | None:
+    """ripgrep-backed search: linear-time regex (no ReDoS), .gitignore-aware,
+    orders of magnitude faster than the Python walk on big repos. Returns None
+    when rg cannot run the pattern — the caller falls back to Python re."""
+    cmd = [_RG, "--no-config", "--line-number", "--no-heading", "--color=never",
+           "--sort", "path", "--max-columns", "300", "--max-columns-preview",
+           "--hidden",  # the Python engine searched dotfiles (.gitlab-ci.yml)
+           "--max-filesize", str(MAX_FILE_BYTES),
+           "--max-count", str(max_results)]
+    for skip in sorted(SKIP_DIRS):
+        cmd += ["--glob", f"!**/{skip}/**"]
+    if glob:
+        cmd += ["--glob", glob]
+    cmd += ["-e", pattern, "."]
+    hits: list[str] = []
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(worktree), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.warning("ripgrep unavailable (%s) — python grep fallback", exc)
+        return None
+    stdout = proc.stdout
+    assert stdout is not None  # PIPE above guarantees it
+    try:
+        for line in stdout:  # streamed: bounded memory even on flood matches
+            if len(hits) >= max_results:
+                hits.append(f"... (truncated at {max_results} results)")
+                break
+            if time.monotonic() - started > GREP_TIME_BUDGET:
+                hits.append("... (search time budget exceeded — narrow the "
+                            "pattern or glob)")
+                break
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            path, _, rest = line.partition(":")
+            line_no, _, text = rest.partition(":")
+            if path.startswith("./"):
+                path = path[2:]
+            hits.append(f"{path}:{line_no}: {text.strip()[:300]}")
+    finally:
+        proc.kill()
+        try:
+            stderr = proc.communicate(timeout=5)[1] or ""
+        except (subprocess.TimeoutExpired, OSError):
+            stderr = ""
+    if hits:
+        return "\n".join(hits)
+    if proc.returncode == 1:  # clean run, zero matches
+        return "No matches."
+    if proc.returncode not in (0, None):
+        # exit 2: pattern rejected (lookaround/backref) or IO error — let the
+        # Python engine, which supports the full re syntax, try it
+        logger.debug("rg exit %s: %s", proc.returncode, stderr[:200])
+        return None
+    return "No matches."
+
+
+def _grep_python(worktree: Path, pattern: str, glob: str | None = None,
+                 max_results: int = 50) -> str:
     try:
         regex = re.compile(pattern)
     except re.error as exc:
@@ -293,6 +374,91 @@ def repo_list_tree(worktree: Path, path: str = ".", depth: int = 2) -> str:
             entries.append("... (truncated at 500 entries)")
             break
     return "\n".join(entries) if entries else "(empty)"
+
+
+# --- symbol index (universal-ctags): definition lookup in one tool call ---
+# Grep makes the model GUESS where things are defined and burn its tool budget
+# on wrong guesses; a ctags index answers "where is LeadSerializer" exactly.
+
+_SYMBOL_CACHE: dict[str, list[dict] | None] = {}  # worktree path -> index
+_SYMBOL_CACHE_MAX = 8
+
+
+def _run_ctags(worktree: Path) -> str | None:
+    if not _CTAGS:
+        return None
+    cmd = [_CTAGS, "-R", "--output-format=json", "--fields=+n", "-f", "-"]
+    cmd += [f"--exclude={skip}" for skip in sorted(SKIP_DIRS)]
+    cmd.append(".")
+    try:
+        result = subprocess.run(cmd, cwd=str(worktree), capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                                timeout=CTAGS_TIME_BUDGET, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ctags indexing failed: %s", exc)
+        return None
+    if result.returncode != 0:
+        logger.warning("ctags exit %s: %s", result.returncode,
+                       (result.stderr or "")[:200])
+        return None
+    return result.stdout
+
+
+def _symbol_index(worktree: Path) -> list[dict] | None:
+    """Build (once per worktree) and cache the tag list. None = no index
+    available (ctags missing/failed) — callers degrade to repo_grep."""
+    key = str(worktree)
+    if key in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[key]
+    raw = _run_ctags(worktree)
+    index: list[dict] | None = None
+    if raw is not None:
+        index = []
+        for line in raw.splitlines():
+            if len(index) >= MAX_SYMBOLS:
+                logger.info("symbol index capped at %d tags", MAX_SYMBOLS)
+                break
+            try:
+                tag = json.loads(line)
+            except ValueError:
+                continue
+            if tag.get("_type") != "tag" or not tag.get("name"):
+                continue
+            index.append({"name": tag["name"], "path": tag.get("path", ""),
+                          "line": tag.get("line", 0), "kind": tag.get("kind", "")})
+    while len(_SYMBOL_CACHE) >= _SYMBOL_CACHE_MAX:
+        _SYMBOL_CACHE.pop(next(iter(_SYMBOL_CACHE)))
+    _SYMBOL_CACHE[key] = index
+    return index
+
+
+def clear_symbol_index(worktree: Path) -> None:
+    _SYMBOL_CACHE.pop(str(worktree), None)
+
+
+def repo_find_symbol(worktree: Path, name: str, max_results: int = 20) -> str:
+    name = (name or "").strip()
+    if not name:
+        return "Empty symbol name."
+    index = _symbol_index(worktree)
+    if index is None:
+        return ("Symbol index unavailable in this deployment — use repo_grep "
+                "to locate the definition instead.")
+    matches = [t for t in index if t["name"] == name]
+    if not matches:
+        lowered = name.lower()
+        matches = [t for t in index if t["name"].lower() == lowered]
+    if not matches:
+        lowered = name.lower()
+        matches = [t for t in index if lowered in t["name"].lower()]
+    if not matches:
+        return (f"No symbol matching {name!r} in the index. Try repo_grep — the "
+                "definition may be generated, dynamic, or in an unindexed language.")
+    lines = [f"{t['kind'] or 'symbol'}\t{t['name']}\t{t['path']}:{t['line']}"
+             for t in matches[:max_results]]
+    if len(matches) > max_results:
+        lines.append(f"... and {len(matches) - max_results} more")
+    return "\n".join(lines)
 
 
 repo_cache = RepoCache()

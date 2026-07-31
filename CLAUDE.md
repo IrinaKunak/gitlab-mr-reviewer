@@ -36,7 +36,16 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   cache, rate limiting, agent tool loop, empty-response retry, usage recording
 - **reviewer/repo_cache.py** — lazy bare-clone cache (`refs/merge-requests/<iid>/head`,
   detached worktrees, LRU eviction via `REPO_CACHE_MAX_GB`; `REPO_CACHE_EPHEMERAL=true`
-  = clone→investigate→remove) + sandboxed read-only repo tools for the investigator
+  = clone→investigate→remove) + sandboxed read-only repo tools (review/investigator/
+  dialogue): `repo_find_symbol` (universal-ctags index, cached per worktree, cleared on
+  release — answers "where is X defined" in one call), `repo_grep` (ripgrep engine:
+  linear-time regex, .gitignore-aware, `--hidden` for dotfile parity; falls back to the
+  Python engine for lookaround/backref patterns and rg-less deployments),
+  `repo_read_file`, `repo_list_tree`. Both binaries come from the Dockerfile
+  (`ripgrep`, `universal-ctags`); everything degrades cleanly without them.
+  Deliberately NOT embeddings/RAG: review questions are exact-identifier lookups,
+  and an embedding index would go stale per MR head and add an API dependency —
+  ripgrep+ctags is what Claude Code and aider themselves use.
 - **reviewer/bridge.py** — Review Bridge: exclusive `getUpdates` long-polling, asks
   AIManager questions in the bridge group, strips usage footers from answers
 - **reviewer/usage.py** — per-review token/cost accounting (contextvar tracker), model

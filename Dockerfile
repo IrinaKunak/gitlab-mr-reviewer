@@ -5,11 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# git is required by the repo clone cache (investigator stage)
+# git: repo clone cache; ripgrep + universal-ctags: repo tools' search engine
+# and symbol index (both optional at runtime — the code degrades without them)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
+    ripgrep \
+    universal-ctags \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

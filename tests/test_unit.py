@@ -1406,8 +1406,8 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
         async def agent_loop(self, tier, system, user, tools, **kw):
             calls.append("agent")
             assert tier == "main"
-            assert [t.name for t in tools] == ["repo_grep", "repo_read_file",
-                                               "repo_list_tree"]
+            assert [t.name for t in tools] == ["repo_find_symbol", "repo_grep",
+                                               "repo_read_file", "repo_list_tree"]
             assert "REPO ACCESS FOR THIS REVIEW" in system
             if self.agent_exc:
                 raise self.agent_exc
@@ -1477,3 +1477,83 @@ def test_dialogue_and_review_tools_flags(monkeypatch):
     monkeypatch.setenv("MR_DIALOGUE", "off")
     cfg = Settings()
     assert cfg.review_repo_tools is False and cfg.dialogue_enabled is False
+
+
+# --- repo tool engines: ripgrep + ctags symbol index ---
+
+def test_grep_python_engine_directly(tmp_path):
+    # the fallback engine must keep working even where rg is installed
+    from reviewer import repo_cache as rc
+
+    (tmp_path / "a.py").write_text("def reconcile():\n    pass\n")
+    hits = rc._grep_python(tmp_path, r"reconcile")
+    assert "a.py:1" in hits
+    assert rc._grep_python(tmp_path, r"nothing_here") == "No matches."
+    assert "Invalid regex" in rc._grep_python(tmp_path, r"([")
+
+
+@pytest.mark.skipif(__import__("shutil").which("rg") is None,
+                    reason="ripgrep not installed")
+def test_grep_ripgrep_engine(tmp_path):
+    from reviewer import repo_cache as rc
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "views.py").write_text(
+        "class LeadHistoryView:\n    permission_classes = [IsAuthenticated]\n")
+    (tmp_path / ".gitlab-ci.yml").write_text("stages: [reconcile]\n")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "junk.js").write_text("IsAuthenticated noise\n")
+
+    hits = rc.repo_grep(tmp_path, r"IsAuthenticated")
+    assert "src/views.py:2" in hits
+    assert "node_modules" not in hits            # SKIP_DIRS respected
+    # dotfiles are searched (the Python engine always did — parity matters:
+    # CI configs live in dotfiles)
+    assert ".gitlab-ci.yml:1" in rc.repo_grep(tmp_path, r"reconcile")
+    # glob filter narrows the search
+    assert "views.py" not in rc.repo_grep(tmp_path, r"reconcile", glob="*.py")
+    # lookahead is not Rust-regex: rg exits 2 and the Python engine takes over
+    assert "src/views.py:2" in rc.repo_grep(tmp_path, r"IsAuthenticated(?=\])")
+    assert rc.repo_grep(tmp_path, r"absent_symbol_xyz") == "No matches."
+
+
+def test_symbol_index_lookup(tmp_path, monkeypatch):
+    # repo_find_symbol answers "where is X defined" in ONE tool call — grep
+    # made the model guess file locations and burn its verification budget
+    from reviewer import repo_cache as rc
+
+    canned = "\n".join([
+        '{"_type": "tag", "name": "LeadSerializer", "path": "app/serializers.py", '
+        '"line": 14, "kind": "class"}',
+        '{"_type": "tag", "name": "LeadHistoryView", "path": "app/views.py", '
+        '"line": 88, "kind": "class"}',
+        '{"_type": "tag", "name": "lead_reconcile_task", "path": "app/tasks.py", '
+        '"line": 5, "kind": "function"}',
+        '{"_type": "ptag", "name": "!_TAG_PROGRAM"}',   # pseudo-tags are skipped
+        "not-json-garbage",
+    ])
+    calls = {"n": 0}
+
+    def fake_ctags(worktree):
+        calls["n"] += 1
+        return canned
+
+    monkeypatch.setattr(rc, "_run_ctags", fake_ctags)
+    rc.clear_symbol_index(tmp_path)
+
+    out = rc.repo_find_symbol(tmp_path, "LeadSerializer")
+    assert "app/serializers.py:14" in out and "class" in out
+    # case-insensitive and substring fallbacks
+    assert "app/views.py:88" in rc.repo_find_symbol(tmp_path, "leadhistoryview")
+    assert "app/tasks.py:5" in rc.repo_find_symbol(tmp_path, "reconcile")
+    assert "Try repo_grep" in rc.repo_find_symbol(tmp_path, "NoSuchThing")
+    assert calls["n"] == 1                       # index built once, then cached
+    rc.clear_symbol_index(tmp_path)
+    rc.repo_find_symbol(tmp_path, "LeadSerializer")
+    assert calls["n"] == 2                       # release() invalidates
+
+    # no ctags in the deployment -> the tool says so and points at grep
+    monkeypatch.setattr(rc, "_run_ctags", lambda wt: None)
+    rc.clear_symbol_index(tmp_path)
+    assert "unavailable" in rc.repo_find_symbol(tmp_path, "LeadSerializer")
+    rc.clear_symbol_index(tmp_path)
