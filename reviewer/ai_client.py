@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 # produced no visible text (adaptive thinking consumed the whole output budget)
 TRUNCATION_MARKER = "*[response truncated at the output limit]*"
 
+# thinking:{"type":"disabled"} is a 400 on these at every effort level, and
+# they have no thinking-off mode (sonnet-5-5 has one: "between_tools")
+_ALWAYS_THINKING_PREFIXES = ("claude-opus-5-5", "claude-fable", "claude-mythos")
+
 # Cross-vendor fallbacks may reject Anthropic-specific params — sent only to primary.
 _RETRYABLE = (
     anthropic.RateLimitError,
@@ -267,9 +271,20 @@ class AIClient:
         # claude-opus-5 disabled thinking is a 400 at effort xhigh/max but fine
         # at the default (high) — so effort must stay unset on those tiers.
         elif tier == "main":
-            # sonnet-5 runs ADAPTIVE thinking when the param is omitted (changed
-            # from sonnet-4-6!) — disabling must be explicit for predictable cost
-            params["thinking"] = {"type": "disabled"}
+            if model.startswith("claude-sonnet-5-5"):
+                # sonnet-5-5 400s on "disabled" (prod 2026-09-29, !127) — its
+                # thinking-off mode is "between_tools": no other field allowed,
+                # and legal only at effort high or below, so effort stays unset
+                params["thinking"] = {"type": "between_tools"}
+            elif model.startswith(_ALWAYS_THINKING_PREFIXES):
+                # thinking cannot be turned off at all — lowest effort is the
+                # only lever that keeps it from eating the output budget
+                params["thinking"] = {"type": "adaptive"}
+                params["output_config"] = {"effort": "low"}
+            else:
+                # sonnet-5 runs ADAPTIVE thinking when the param is omitted (changed
+                # from sonnet-4-6!) — disabling must be explicit for predictable cost
+                params["thinking"] = {"type": "disabled"}
         # fast = haiku-4-5: omitted param = no thinking; no effort (400s on Haiku)
         return params
 

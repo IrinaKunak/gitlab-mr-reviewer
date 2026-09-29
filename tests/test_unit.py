@@ -182,6 +182,25 @@ def test_primary_params_per_tier():
         "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
 
 
+def test_primary_params_models_without_disabled_thinking():
+    # prod 2026-09-29 (!127): main switched to claude-sonnet-5-5 -> 400
+    # '"thinking.type.disabled" is not supported for this model'
+    client = AIClient(Settings())
+    for eff in (None, "high", "xhigh", "max"):
+        # between_tools takes no other field and 400s at effort xhigh/max
+        assert client._primary_params("main", eff, "claude-sonnet-5-5") == {
+            "thinking": {"type": "between_tools"}}
+    # no thinking-off mode at all: adaptive at the lowest effort
+    for model in ("claude-opus-5-5", "claude-fable-5-1"):
+        assert client._primary_params("main", None, model) == {
+            "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
+    # older main models keep the explicit disable
+    assert client._primary_params("main", None, "claude-sonnet-5") == {
+        "thinking": {"type": "disabled"}}
+    assert client._primary_params("smart", "high", "claude-sonnet-5-5") == {
+        "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+
+
 def test_openrouter_models_array_capped():
     # prod !779: smart overridden to openai/gpt-5.6-terra + a 3-entry fallback
     # chain -> 4 models -> OpenRouter 400 "'models' array must have 3 items or

@@ -74,6 +74,11 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   never add `effort` there. Elevated cyber safeguards mean a review of auth/crypto
   code can return `stop_reason:"refusal"` -> AIError (review fails cleanly, the
   investigator just skips); server-side `fallbacks` would fix it if it ever bites.
+- **claude-sonnet-5-5 rejects `thinking:{"type":"disabled"}`** (400, prod 2026-09-29).
+  Its thinking-off mode is `{"type":"between_tools"}` — no other field alongside it,
+  legal only at effort `high` or below (so still no `effort` on main). Models with no
+  off mode at all (opus-5-5, fable, mythos) get adaptive + effort `low` on the main
+  tier. `_primary_params` picks per model; new models need a branch there.
 - **Anthropic prompt caching is OPT-IN** — the investigator's `agent_loop` sets
   `cache_control` breakpoints on the gateway path (static prefix = tools+system+diff,
   plus one rolling breakpoint on the latest tool-result turn; ≤4 per request is the
