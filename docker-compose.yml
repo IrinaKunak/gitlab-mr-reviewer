@@ -14,7 +14,7 @@ services:
       - GITLAB_TOKEN_2=${GITLAB_TOKEN_2:-}
       - XGITLABTOKEN_2=${XGITLABTOKEN_2:-}
 
-      # AI Provider (Anthropic via Cloudflare AI Gateway + OpenRouter fallback)
+      # AI Provider: anthropic (gateway, OpenRouter on failure) | openrouter | gemini
       - AI_PROVIDER=${AI_PROVIDER:-anthropic}
       - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-}
       - ANTHROPIC_API_KEY_GATEWAY=${ANTHROPIC_API_KEY_GATEWAY:-}

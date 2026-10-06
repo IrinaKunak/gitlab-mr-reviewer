@@ -162,6 +162,8 @@ async def lifespan(app: FastAPI):
                 settings.bridge_enabled, settings.tester_report,
                 settings.review_repo_tools, settings.dialogue_enabled,
                 settings.ai_provider)
+    if settings.ai_provider == "openrouter" and not settings.openrouter_token:
+        logger.error("AI_PROVIDER=openrouter but OPENROUTER_API_TOKEN is empty")
     if settings.ai_provider == "gemini" and not shutil.which("gemini"):
         logger.error("AI_PROVIDER=gemini but the gemini CLI is not installed — "
                      "this rollback path requires the v1 Docker image (master branch)")

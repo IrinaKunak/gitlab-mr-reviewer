@@ -6,6 +6,7 @@ Primary:  Anthropic Messages API via Cloudflare AI Gateway.
 Fallback: OpenRouter's Anthropic-compatible /api/v1/messages with a `models` array
           (same-class Claude slug first, then cross-vendor) — reuses the same SDK.
           CF Dynamic Routing cannot target OpenRouter, so failover is client-side.
+          AI_PROVIDER=openrouter skips the gateway and sends every tier there.
 
 Preserved wrapper behaviors: response cache (sha256 + TTL, success-only), rate
 limiting (now an asyncio lock, not a /tmp file), timeout with a distinct error,
@@ -78,6 +79,21 @@ def _routing_chain(model: str, chain: list[str]) -> list[str]:
     """Preferred model first, then its fallbacks, deduped and length-capped."""
     ordered = [model] + [m for m in chain if m != model] if model else list(chain)
     return ordered[:MAX_OPENROUTER_MODELS]
+
+
+def uses_openrouter(provider: str, model: str) -> bool:
+    """OpenRouter is the route when chosen explicitly, or when the model id is
+    vendor-prefixed (the CF gateway cannot serve openai/gpt-*, google/gemini-*)."""
+    return provider == "openrouter" or "/" in model
+
+
+def openrouter_model(model: str, chain: list[str]) -> str:
+    """Id to send to OpenRouter. A slash id is used as-is; a plain Claude id
+    (AI_PROVIDER=openrouter with the default ANTHROPIC_*_MODEL) maps to the
+    head of that tier's OPENROUTER_FALLBACK_* chain."""
+    if "/" in model:
+        return model
+    return chain[0] if chain else model
 
 
 def _strip_cache_control(messages: list[dict]) -> list[dict]:
@@ -377,6 +393,9 @@ class AIClient:
         """Single-shot completion with primary -> fallback failover."""
         self.guard_input_size(system, user_content)
         model = overrides.model_for_tier(tier, self.cfg)
+        via_openrouter = uses_openrouter(self.cfg.ai_provider, model)
+        if via_openrouter:
+            model = openrouter_model(model, self.cfg.fallback_chain(tier))
 
         cache_key = self._cache_key(model, system, user_content)
         if use_cache and not json_schema:
@@ -394,10 +413,9 @@ class AIClient:
                                f"user={user_content[:2000]}")
 
         started = time.monotonic()
-        if "/" in model:
-            # vendor-prefixed runtime override (e.g. openai/gpt-5.6-terra):
-            # the CF gateway can't serve it — route via OpenRouter, with the
-            # tier's regular chain behind it as backup
+        if via_openrouter:
+            # AI_PROVIDER=openrouter, or a vendor-prefixed id the CF gateway
+            # cannot serve. The tier chain rides along as OpenRouter failover.
             chain = _routing_chain(model, self.cfg.fallback_chain(tier))
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout,
@@ -466,7 +484,7 @@ class AIClient:
         client = self.fallback
         if client is None:
             raise (self._wrap(cause) if cause is not None
-                   else AIError("cross-vendor model override requires OPENROUTER_API_TOKEN"))
+                   else AIError("OpenRouter routing requires OPENROUTER_API_TOKEN"))
         chain = _routing_chain("", chain or self.cfg.fallback_chain(tier))
         if json_schema:
             system = (f"{system}\n\nRespond with ONLY valid JSON matching this schema, "
@@ -535,7 +553,9 @@ class AIClient:
         handlers = {tool.name: tool.handler for tool in tools}
         api_tools = [tool.to_api() for tool in tools]
         model = overrides.model_for_tier(tier, self.cfg)
-        via_openrouter = "/" in model  # vendor-prefixed runtime override
+        via_openrouter = uses_openrouter(self.cfg.ai_provider, model)
+        if via_openrouter:
+            model = openrouter_model(model, self.cfg.fallback_chain(tier))
         # cache the static prefix (tools + system + the MR diff/context render
         # ahead of it): every iteration re-sends it, so without this the whole
         # investigation is billed at full input price on each turn
@@ -553,8 +573,7 @@ class AIClient:
             if via_openrouter:
                 if self.fallback is None:
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise AIError(
-                        "cross-vendor model override requires OPENROUTER_API_TOKEN")
+                    raise AIError("OpenRouter routing requires OPENROUTER_API_TOKEN")
                 request = {"model": model, "system": system,
                            "messages": _strip_thinking(_strip_cache_control(messages)),
                            "max_tokens": max_tokens, "tools": api_tools,

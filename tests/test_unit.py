@@ -54,6 +54,36 @@ def test_tier_mapping_and_fallback_chains():
     assert cfg.fallback_chain("smart")[0].startswith("anthropic/")
 
 
+def test_openrouter_provider_skips_gateway(tmp_path):
+    """AI_PROVIDER=openrouter routes a plain Claude id straight to OpenRouter."""
+    cfg = Settings()
+    cfg.ai_provider = "openrouter"
+    cfg.ai_cache_dir = str(tmp_path)
+    cfg.model_main = "claude-sonnet-5"
+    cfg.fallback_main = [
+        "anthropic/claude-sonnet-5",
+        "google/gemini-3.6-flash",
+        "deepseek/deepseek-v4-pro",
+    ]
+    client = AIClient(cfg)
+    seen: dict = {}
+
+    async def fake_fallback(tier, system, messages, max_tokens, json_schema,
+                            timeout, cause, chain=None):
+        seen["chain"] = chain
+        seen["primary_built"] = client._primary is not None
+        return ai_mod.AIResult(text="ok", model=chain[0], provider="openrouter")
+
+    client._fallback_complete = fake_fallback
+    result = asyncio.run(client.complete("main", "sys", "diff", use_cache=False))
+    assert result.provider == "openrouter"
+    assert seen["chain"][0] == "anthropic/claude-sonnet-5"
+    assert seen["primary_built"] is False
+    # default provider still keeps plain Claude ids on the gateway
+    assert ai_mod.uses_openrouter("anthropic", "claude-sonnet-5") is False
+    assert ai_mod.uses_openrouter("anthropic", "openai/gpt-5.6-terra") is True
+
+
 # --- ai_client helpers ---
 
 def test_extract_json_variants():

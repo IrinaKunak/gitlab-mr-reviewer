@@ -8,6 +8,7 @@ Stages (PIPELINE_V2=on):
 PIPELINE_V2=off: v1-parity single review (one main-tier call, output in
 REVIEW_LANGUAGE directly), same user-facing strings as v1.
 AI_PROVIDER=gemini: legacy gemini-wrapper.sh subprocess path (rollback hatch).
+AI_PROVIDER=openrouter: every tier goes to OpenRouter, not only after a gateway failure.
 """
 
 from __future__ import annotations
