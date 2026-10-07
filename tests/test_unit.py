@@ -24,18 +24,15 @@ def test_proxy_precedence(monkeypatch):
     monkeypatch.setenv("HTTP_PROXY", "http://p:1")
     monkeypatch.setenv("SOCKS_PROXY", "s:2")
     cfg = Settings()
-    assert cfg.proxy_url == "http://p:1"
-    assert cfg.requests_proxies == {"http": "http://p:1", "https": "http://p:1"}
+    assert cfg.network.proxy_url == "http://p:1"
+    assert cfg.network.requests_proxies == {"http": "http://p:1", "https": "http://p:1"}
     monkeypatch.delenv("HTTP_PROXY")
     cfg = Settings()
-    assert cfg.proxy_url == "socks5://s:2"
-    assert cfg.requests_proxies["https"] == "socks5h://s:2"
+    assert cfg.network.proxy_url == "socks5://s:2"
+    assert cfg.network.requests_proxies["https"] == "socks5h://s:2"
 
 
-def test_instances_routing_keyed_by_webhook_token(monkeypatch):
-    for key in list(__import__("os").environ):
-        if key.startswith(("GITLAB_", "XGITLABTOKEN")):
-            monkeypatch.delenv(key, raising=False)
+def test_instances_routing_keyed_by_webhook_token(clean_env, monkeypatch):
     monkeypatch.setenv("GITLAB_URL", "https://a")
     monkeypatch.setenv("GITLAB_TOKEN", "t1")
     monkeypatch.setenv("XGITLABTOKEN", "hook1")
@@ -43,23 +40,27 @@ def test_instances_routing_keyed_by_webhook_token(monkeypatch):
     monkeypatch.setenv("GITLAB_TOKEN_2", "t2")
     monkeypatch.setenv("XGITLABTOKEN_2", "hook2")
     cfg = Settings()
-    assert cfg.gitlab_instances["hook1"]["name"] == "primary"
-    assert cfg.gitlab_instances["hook2"]["url"] == "https://b"
+    assert cfg.gitlab.routes["hook1"]["name"] == "primary"
+    assert cfg.gitlab.routes["hook2"]["url"] == "https://b"
+    # stage 8: the numbered env trios still work, with a deprecation warning
+    from reviewer.config import deprecated_env_vars_in_use
+    [message] = deprecated_env_vars_in_use(cfg)
+    assert "GITLAB_URL_2" in message and "config.yaml" in message and "IGNORED" not in message
 
 
 def test_tier_mapping_and_fallback_chains():
     cfg = Settings()
-    assert cfg.model_for_tier("fast") == cfg.model_fast
+    assert cfg.model_for_tier("fast") == cfg.llm.tiers.fast.model
     assert cfg.fallback_chain("smart")[0].startswith("anthropic/")
 
 
 def test_openrouter_provider_skips_gateway(tmp_path):
     """AI_PROVIDER=openrouter routes a plain Claude id straight to OpenRouter."""
     cfg = Settings()
-    cfg.ai_provider = "openrouter"
-    cfg.ai_cache_dir = str(tmp_path)
-    cfg.model_main = "claude-sonnet-5"
-    cfg.fallback_main = [
+    cfg.llm.provider = "openrouter"
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    cfg.llm.tiers.main.model = "claude-sonnet-5"
+    cfg.llm.tiers.main.fallback = [
         "anthropic/claude-sonnet-5",
         "google/gemini-3.6-flash",
         "deepseek/deepseek-v4-pro",
@@ -94,8 +95,8 @@ def test_extract_json_variants():
 
 def test_cache_roundtrip(tmp_path):
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
-    cfg.ai_cache_ttl = 3600
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    cfg.llm.cache_ttl = 3600
     client = AIClient(cfg)
     key = client._cache_key("m", "sys", "user")
     assert client._cache_get(key) is None
@@ -111,10 +112,10 @@ def test_cache_roundtrip(tmp_path):
 def test_debug_log_failure_is_nonfatal(tmp_path):
     # regression: unwritable logs/ mount raised Errno 13 inside _debug and killed the review
     cfg = Settings()
-    cfg.ai_debug = True
+    cfg.llm.debug = True
     blocker = tmp_path / "blocker"
     blocker.write_text("")  # file where a directory is needed -> mkdir raises OSError
-    cfg.ai_log_dir = str(blocker / "logs")
+    cfg.storage.log_dir = str(blocker / "logs")
     client = AIClient(cfg)
     client._debug("request", "payload")  # must not raise
     assert client._debug_failed
@@ -130,7 +131,7 @@ def test_truncated_empty_response_retries_with_larger_budget(tmp_path):
     from reviewer.ai_client import TRUNCATION_MARKER
 
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
+    cfg.storage.ai_cache_dir = str(tmp_path)
     client = AIClient(cfg)
     budgets = []
 
@@ -166,27 +167,27 @@ def test_truncated_empty_response_retries_with_larger_budget(tmp_path):
 def test_gateway_auth_modes():
     # mode 1: real key + cfut token -> both x-api-key and cf-aig-authorization
     cfg = Settings()
-    cfg.anthropic_api_url = "https://gateway.example/anthropic"
-    cfg.anthropic_api_key = "sk-ant-real"
-    cfg.anthropic_gateway_key = "cfut_abc123"
+    cfg.llm.anthropic.api_url = "https://gateway.example/anthropic"
+    cfg.llm.anthropic.api_key = "sk-ant-real"
+    cfg.llm.anthropic.gateway_key = "cfut_abc123"
     primary = AIClient(cfg).primary
     assert primary.api_key == "sk-ant-real"
     assert primary.default_headers.get("cf-aig-authorization") == "Bearer cfut_abc123"
 
     # mode 2: cfut only (Unified Billing) -> header + dummy x-api-key
     cfg2 = Settings()
-    cfg2.anthropic_api_url = "https://gateway.example/anthropic"
-    cfg2.anthropic_api_key = ""
-    cfg2.anthropic_gateway_key = "cfut_abc123"
+    cfg2.llm.anthropic.api_url = "https://gateway.example/anthropic"
+    cfg2.llm.anthropic.api_key = ""
+    cfg2.llm.anthropic.gateway_key = "cfut_abc123"
     primary2 = AIClient(cfg2).primary
     assert primary2.api_key == "gateway"
     assert primary2.default_headers.get("cf-aig-authorization") == "Bearer cfut_abc123"
 
     # mode 3 / legacy: real key stored in the GATEWAY var -> plain x-api-key
     cfg3 = Settings()
-    cfg3.anthropic_api_url = "https://gateway.example/anthropic"
-    cfg3.anthropic_api_key = ""
-    cfg3.anthropic_gateway_key = "sk-ant-real"
+    cfg3.llm.anthropic.api_url = "https://gateway.example/anthropic"
+    cfg3.llm.anthropic.api_key = ""
+    cfg3.llm.anthropic.gateway_key = "sk-ant-real"
     primary3 = AIClient(cfg3).primary
     assert primary3.api_key == "sk-ant-real"
     assert primary3.default_headers.get("cf-aig-authorization") is None
@@ -262,7 +263,7 @@ def test_token_estimate_matches_measured_diff_ratio():
 
 def test_input_size_guard():
     cfg = Settings()
-    cfg.ai_max_input_tokens = 10
+    cfg.llm.max_input_tokens = 10
     client = AIClient(cfg)
     with pytest.raises(ai_mod.AIInputTooLargeError):
         client.guard_input_size("x" * 1000)
@@ -346,7 +347,7 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     assert "$" in tracker.summary_line()
 
     # persist + aggregate roundtrip
-    monkeypatch.setattr(usage.settings, "ai_log_dir", str(tmp_path))
+    monkeypatch.setattr(usage.settings.storage, "log_dir", str(tmp_path))
     mr = {"gitlab_config": {"name": "primary"}, "project_path": "g/p", "mr_iid": 7}
     usage.persist(tracker, mr)
     usage.persist(tracker, mr)
@@ -397,7 +398,7 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     from reviewer import openrouter_models, usage
     from reviewer.config import settings
 
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
 
     raw = {"data": [
         {"id": "z-ai/glm-5", "pricing": {"prompt": "0.0000006", "completion": "0.0000022"}},
@@ -421,7 +422,7 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     # unpriced tier model would silently cost $0 in the stats
     assert usage.price_of("claude-opus-5") == (5.0, 25.0)
     assert usage.price_of("anthropic/claude-opus-5") == (5.0, 25.0)
-    assert usage.price_of(Settings().model_smart) != (0.0, 0.0)
+    assert usage.price_of(Settings().llm.tiers.smart.model) != (0.0, 0.0)
     # a genuinely unknown model is $0 (fail-open), not a crash
     assert usage.price_of("totally/unknown") == (0.0, 0.0)
 
@@ -443,8 +444,8 @@ def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
     from reviewer.ai_client import ToolDef
 
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
-    cfg.ai_rate_limit = 0
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    cfg.llm.rate_limit = 0
     monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
                         lambda tier, c: c.model_for_tier(tier))
     client = AIClient(cfg)
@@ -507,11 +508,11 @@ def test_openrouter_agent_loop_keeps_cache_control_for_claude(tmp_path, monkeypa
 
     def run(head_model):
         cfg = Settings()
-        cfg.ai_provider = "openrouter"
-        cfg.ai_cache_dir = str(tmp_path)
-        cfg.ai_rate_limit = 0
-        cfg.model_smart = "claude-opus-5"
-        cfg.fallback_smart = [head_model, "moonshotai/kimi-k3"]
+        cfg.llm.provider = "openrouter"
+        cfg.storage.ai_cache_dir = str(tmp_path)
+        cfg.llm.rate_limit = 0
+        cfg.llm.tiers.smart.model = "claude-opus-5"
+        cfg.llm.tiers.smart.fallback = [head_model, "moonshotai/kimi-k3"]
         monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
                             lambda tier, c: c.model_for_tier(tier))
         client = AIClient(cfg)
@@ -591,8 +592,8 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
 
     # _to_result and agent_loop must both pick the cache fields off the wire
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
-    cfg.ai_rate_limit = 0
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    cfg.llm.rate_limit = 0
     # a dev-machine cache/model_overrides.json must not reroute this test
     monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
                         lambda tier, c: c.model_for_tier(tier))
@@ -635,11 +636,11 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     from reviewer import overrides
     from reviewer.config import settings as live_settings
 
-    monkeypatch.setattr(live_settings, "state_dir", str(tmp_path))
+    monkeypatch.setattr(live_settings.storage, "state_dir", str(tmp_path))
 
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
-    assert overrides.model_for_tier("smart", cfg) == cfg.model_smart  # env default
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    assert overrides.model_for_tier("smart", cfg) == cfg.llm.tiers.smart.model  # env default
     overrides.save({"smart": "openai/gpt-5.6-terra", "junk": "ignored"})
     assert overrides.model_for_tier("smart", cfg) == "openai/gpt-5.6-terra"
     assert overrides.load()["fast"] == ""  # untouched tiers stay on defaults
@@ -669,15 +670,15 @@ def test_basic_auth(monkeypatch):
     from reviewer.config import settings
     from reviewer.server import basic_auth_ok, stats_access_allowed
 
-    monkeypatch.setattr(settings, "stats_user", "max")
-    monkeypatch.setattr(settings, "stats_password", "pw123")
+    monkeypatch.setattr(settings.server, "stats_user", "max")
+    monkeypatch.setattr(settings.server, "stats_password", "pw123")
     good = "Basic " + base64.b64encode(b"max:pw123").decode()
     bad = "Basic " + base64.b64encode(b"max:nope").decode()
     assert basic_auth_ok(good) is True
     assert basic_auth_ok(bad) is False
     assert basic_auth_ok("Bearer xyz") is False
     # with basic configured, unauthenticated local access is no longer allowed
-    monkeypatch.setattr(settings, "stats_token", "")
+    monkeypatch.setattr(settings.server, "stats_token", "")
     assert stats_access_allowed(good, "", "203.0.113.7") is True
     assert stats_access_allowed("", "", None) is False
 
@@ -687,12 +688,12 @@ def test_stats_access_control(monkeypatch):
     from reviewer.server import stats_access_allowed
 
     # no token configured: only direct (non-proxied) requests pass
-    monkeypatch.setattr(settings, "stats_token", "")
+    monkeypatch.setattr(settings.server, "stats_token", "")
     assert stats_access_allowed("", "", None) is True
     assert stats_access_allowed("", "", "203.0.113.7") is False
 
     # token configured: Bearer header or ?token= must match exactly
-    monkeypatch.setattr(settings, "stats_token", "s3cret")
+    monkeypatch.setattr(settings.server, "stats_token", "s3cret")
     assert stats_access_allowed("Bearer s3cret", "", "203.0.113.7") is True
     assert stats_access_allowed("", "s3cret", "203.0.113.7") is True
     assert stats_access_allowed("Bearer wrong", "", None) is False
@@ -709,7 +710,7 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
     from reviewer.ai_client import AIClient
 
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
+    cfg.storage.ai_cache_dir = str(tmp_path)
     client = AIClient(cfg)
 
     tool_block = SimpleNamespace(type="tool_use", name="nope", input={}, id="t1")
@@ -742,18 +743,18 @@ def test_tester_report_targets(monkeypatch):
     from reviewer.config import settings
     from reviewer.pipeline import tester_report_targets
 
-    monkeypatch.setattr(settings, "bridge_chat_id", "-100bridge")
-    monkeypatch.setattr(settings, "telegram_enabled", True)
-    monkeypatch.setattr(settings, "telegram_chat_ids", ["-100team", "-100extra"])
-    monkeypatch.setattr(settings, "tester_report_chat_ids", [])
+    monkeypatch.setattr(settings.bridge, "chat_id", "-100bridge")
+    monkeypatch.setattr(settings.notify.telegram, "enabled", True)
+    monkeypatch.setattr(settings.notify.telegram, "chat_ids", ["-100team", "-100extra"])
+    monkeypatch.setattr(settings.notify.telegram, "tester_report_chat_ids", [])
     assert tester_report_targets() == ["-100bridge", "-100team", "-100extra"]
 
     # explicit override narrows the team targets; dedupe against bridge
-    monkeypatch.setattr(settings, "tester_report_chat_ids", ["-100team", "-100bridge"])
+    monkeypatch.setattr(settings.notify.telegram, "tester_report_chat_ids", ["-100team", "-100bridge"])
     assert tester_report_targets() == ["-100bridge", "-100team"]
 
     # telegram off -> only the bridge copy
-    monkeypatch.setattr(settings, "telegram_enabled", False)
+    monkeypatch.setattr(settings.notify.telegram, "enabled", False)
     assert tester_report_targets() == ["-100bridge"]
 
 
@@ -781,7 +782,7 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     from reviewer.config import settings
     from reviewer.pipeline import Pipeline
 
-    monkeypatch.setattr(settings, "review_language", "ru")
+    monkeypatch.setattr(settings.pipeline, "language", "ru")
     answers = iter([
         "I appreciate your message, but you haven't provided a document.",
         "Обзор: всё в порядке.",
@@ -832,7 +833,7 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
     from reviewer import review_state
     from reviewer.config import settings
 
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
 
     assert review_state.get_last_sha("primary", 1, 2) is None
     review_state.set_last_sha("primary", 1, 2, "abc123")
@@ -956,9 +957,9 @@ def test_investigator_degrades_before_cloning(monkeypatch):
     from reviewer.config import settings
     from reviewer.pipeline import Pipeline
 
-    monkeypatch.setattr(settings, "ai_max_input_tokens", 10_000)
+    monkeypatch.setattr(settings.llm, "max_input_tokens", 10_000)
     p = Pipeline(client=AIClient(Settings()))
-    monkeypatch.setattr(p.ai.cfg, "ai_max_input_tokens", 10_000)
+    monkeypatch.setattr(p.ai.cfg.llm, "max_input_tokens", 10_000)
     triage, mr_data = {"jira_keys": [], "summary": "s", "risk_areas": []}, {"mr_iid": 779}
 
     huge, small = "x" * 200_000, "y" * 6_000
@@ -1048,7 +1049,7 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
     from reviewer.config import settings
     from reviewer.pipeline import Pipeline
 
-    monkeypatch.setattr(settings, "review_language", "ru")
+    monkeypatch.setattr(settings.pipeline, "language", "ru")
     tiers = []
 
     class StubAI:
@@ -1165,10 +1166,10 @@ def test_extract_jira_keys():
 
 def test_format_review_comment_language(monkeypatch):
     from reviewer.config import settings
-    monkeypatch.setattr(settings, "review_language", "ru")
+    monkeypatch.setattr(settings.pipeline, "language", "ru")
     comment = gitlab_io.format_review_comment("текст обзора")
     assert "Автоматический обзор кода" in comment
-    monkeypatch.setattr(settings, "review_language", "en")
+    monkeypatch.setattr(settings.pipeline, "language", "en")
     assert "Automated Code Review" in gitlab_io.format_review_comment("review")
 
 
@@ -1244,8 +1245,8 @@ def test_float_env_empty_string(monkeypatch):
     monkeypatch.setenv("AI_RATE_LIMIT", "")
     monkeypatch.setenv("REPO_CACHE_MAX_GB", "")
     cfg = Settings()
-    assert cfg.ai_rate_limit == 2.0
-    assert cfg.repo_cache_max_gb == 30.0
+    assert cfg.llm.rate_limit == 2.0
+    assert cfg.repo_cache.max_gb == 30.0
 
 
 def test_redact_credentials_in_git_errors():
@@ -1296,13 +1297,13 @@ def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):
     cache = rc.RepoCache(cache_dir=str(tmp_path / "cache"))
 
     # default mode: worktree removed, bare repo kept for the next MR
-    monkeypatch.setattr(rc.settings, "repo_cache_ephemeral", False)
+    monkeypatch.setattr(rc.settings.repo_cache, "ephemeral", False)
     wt1 = add_worktree("app-mr1-aaa-wt")
     asyncio.run(cache.release(wt1))
     assert not wt1.exists() and repo_dir.exists()
 
     # ephemeral mode: bare repo dropped too
-    monkeypatch.setattr(rc.settings, "repo_cache_ephemeral", True)
+    monkeypatch.setattr(rc.settings.repo_cache, "ephemeral", True)
     wt2 = add_worktree("app-mr2-bbb-wt")
     asyncio.run(cache.release(wt2))
     assert not wt2.exists() and not repo_dir.exists()
@@ -1435,7 +1436,7 @@ def test_dialogue_answers_in_thread(monkeypatch):
     from reviewer.ai_client import AIResult
     from reviewer.config import settings
 
-    monkeypatch.setattr(settings, "review_language", "en")
+    monkeypatch.setattr(settings.pipeline, "language", "en")
     posted: list[tuple] = []
 
     stub_mr = SimpleNamespace(
@@ -1501,7 +1502,7 @@ def test_dialogue_answers_in_thread(monkeypatch):
     assert len(posted) == 1
 
     # per-MR budget: once exhausted the bot stays silent
-    monkeypatch.setattr(settings, "dialogue_max_replies_per_mr", 1)
+    monkeypatch.setattr(settings.pipeline, "dialogue_max_replies_per_mr", 1)
     assert p._dialogue_budget_ok("primary", 1, 10) is False
     assert p._dialogue_budget_ok("primary", 1, 11) is True
 
@@ -1588,13 +1589,13 @@ def test_dialogue_and_review_tools_flags(monkeypatch):
                 "DIALOGUE_MAX_REPLIES_PER_MR"):
         monkeypatch.delenv(var, raising=False)
     cfg = Settings()
-    assert cfg.review_repo_tools is True and cfg.dialogue_enabled is True
-    assert cfg.review_max_tool_calls == 8
-    assert cfg.dialogue_max_replies_per_mr == 20
+    assert cfg.pipeline.stages.review_repo_tools is True and cfg.pipeline.stages.dialogue is True
+    assert cfg.pipeline.review_max_tool_calls == 8
+    assert cfg.pipeline.dialogue_max_replies_per_mr == 20
     monkeypatch.setenv("REVIEW_REPO_TOOLS", "off")
     monkeypatch.setenv("MR_DIALOGUE", "off")
     cfg = Settings()
-    assert cfg.review_repo_tools is False and cfg.dialogue_enabled is False
+    assert cfg.pipeline.stages.review_repo_tools is False and cfg.pipeline.stages.dialogue is False
 
 
 # --- repo tool engines: ripgrep + ctags symbol index ---
@@ -1683,7 +1684,7 @@ def test_cache_sweep_spares_state_files(tmp_path):
     # dashboard overrides silently reverted on the next restart
     import os
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
+    cfg.storage.ai_cache_dir = str(tmp_path)
     client = AIClient(cfg)
     old = time.time() - 72 * 3600
     stale_entry = tmp_path / ("a" * 64)
@@ -1702,18 +1703,18 @@ def test_cache_sweep_spares_state_files(tmp_path):
 def test_state_files_live_outside_ai_cache_dir(tmp_path, monkeypatch):
     from reviewer import openrouter_models, overrides, review_state
     from reviewer.config import settings
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
+    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings.storage, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
     for mod in (overrides, review_state, openrouter_models):
         assert mod._store.path.parent == tmp_path / "state"
-    assert Settings().ai_cache_dir != Settings().state_dir
+    assert Settings().storage.ai_cache_dir != Settings().storage.state_dir
 
 
 def test_state_migration_moves_legacy_files(tmp_path):
     from reviewer import state_layout
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path / "cache" / "ai")
-    cfg.state_dir = str(tmp_path / "state")
+    cfg.storage.ai_cache_dir = str(tmp_path / "cache" / "ai")
+    cfg.storage.state_dir = str(tmp_path / "state")
     legacy = tmp_path / "cache"
     legacy.mkdir()
     (legacy / "model_overrides.json").write_text('{"smart": "openai/x"}', encoding="utf-8")
@@ -1753,9 +1754,9 @@ def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
     from reviewer.ai_client import ToolDef
 
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
-    cfg.ai_rate_limit = 0
-    cfg.ai_cache_alert_min_input = 1000
+    cfg.storage.ai_cache_dir = str(tmp_path)
+    cfg.llm.rate_limit = 0
+    cfg.llm.cache_alert_min_input = 1000
     monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
                         lambda tier, c: c.model_for_tier(tier))
     alerts: list[tuple[str, str]] = []
@@ -1891,7 +1892,7 @@ def test_webhook_500_hides_exception_text(monkeypatch):
     async def fake_alert(*a, **k):
         return True
 
-    monkeypatch.setattr(server.settings, "gitlab_instances",
+    monkeypatch.setattr(server.settings.gitlab, "routes",
                         {"hook": {"name": "primary", "url": "https://x"}})
     monkeypatch.setattr(server.gitlab_io, "parse_merge_request_webhook", boom)
     monkeypatch.setattr(server.telegram_io, "notify_error", fake_alert)
@@ -1915,16 +1916,16 @@ def test_retired_gemini_aliases_are_no_longer_read(monkeypatch):
     monkeypatch.setenv("GEMINI_CACHE_DIR", "/tmp/old-cache")
     monkeypatch.setenv("GEMINI_PROMPT", "old checklist")
     cfg = Settings()
-    assert cfg.ai_timeout == 300
-    assert cfg.ai_debug is False
-    assert cfg.ai_cache_dir == "cache/ai"
-    assert cfg.review_prompt_en == ""
+    assert cfg.llm.timeout == 300
+    assert cfg.llm.debug is False
+    assert cfg.storage.ai_cache_dir == "cache/ai"
+    assert cfg.pipeline.review_prompt == ""
     assert not hasattr(cfg, "pipeline_v2")
 
 
 def test_review_prompt_override_has_a_non_legacy_name(monkeypatch):
     monkeypatch.setenv("REVIEW_PROMPT", "custom checklist")
-    assert Settings().review_prompt_en == "custom checklist"
+    assert Settings().pipeline.review_prompt == "custom checklist"
 
 
 def test_retired_env_vars_are_reported_with_successor(monkeypatch):
@@ -1939,26 +1940,25 @@ def test_retired_env_vars_are_reported_with_successor(monkeypatch):
         "GEMINI_PROMPT is no longer read — rename it to REVIEW_PROMPT"]
 
 
-def test_startup_warns_about_retired_vars_and_unsupported_provider(
-        monkeypatch, caplog, tmp_path):
+def test_startup_warns_about_retired_and_deprecated_vars(monkeypatch, caplog, tmp_path):
     from fastapi.testclient import TestClient
 
     from reviewer import server
     from reviewer.config import settings
     # lifespan runs state_layout.migrate: keep it off the developer's cache/
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
-    monkeypatch.setattr(settings, "ai_provider", "gemini")
-    monkeypatch.setattr(settings, "gitlab_instances", {})
-    monkeypatch.setattr(settings, "bridge_enabled", False)
+    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings.storage, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
+    monkeypatch.setattr(settings.gitlab, "routes", {})
+    monkeypatch.setattr(settings.bridge, "enabled", False)
     monkeypatch.setenv("PIPELINE_V2", "off")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID_3", "-100x")
     monkeypatch.setattr(server, "review_queue", server.ReviewQueue(
         workers=0, dedupe_ttl=600))
     with caplog.at_level("WARNING", logger="reviewer.server"), TestClient(server.app) as client:
         flags = client.get("/").json()["flags"]
     assert "pipeline_v2" not in flags
-    assert "AI_PROVIDER=gemini is not supported" in caplog.text
     assert "PIPELINE_V2 is no longer read" in caplog.text
+    assert "TELEGRAM_CHAT_ID_3" in caplog.text and "deprecated" in caplog.text
 
 
 def test_single_entry_point_runs_uvicorn_on_port_5000(monkeypatch):
@@ -2027,7 +2027,7 @@ def test_json_store_follows_path_change(tmp_path):
 def test_review_state_survives_corrupt_file(tmp_path, monkeypatch):
     from reviewer import review_state
     from reviewer.config import settings
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
     (tmp_path / "reviewed_shas.json").write_text("{not json", encoding="utf-8")
     assert review_state.get_last_sha("primary", 1, 2) is None  # -> full review
     review_state.set_last_sha("primary", 1, 2, "abc")
@@ -2038,7 +2038,7 @@ def test_review_state_survives_corrupt_file(tmp_path, monkeypatch):
 def test_ai_cache_write_is_atomic_and_sweeps_orphan_temps(tmp_path):
     import os
     cfg = Settings()
-    cfg.ai_cache_dir = str(tmp_path)
+    cfg.storage.ai_cache_dir = str(tmp_path)
     client = AIClient(cfg)
     key = "c" * 64
     client._cache_put(key, "answer")
@@ -2052,3 +2052,212 @@ def test_ai_cache_write_is_atomic_and_sweeps_orphan_temps(tmp_path):
     client._cleanup_cache()
     assert not orphan.exists()
     assert (tmp_path / key).exists()
+
+
+# --- stage 8: typed config, fail-fast validation, legacy aliases, config.yaml ---
+
+@pytest.fixture
+def clean_env(monkeypatch, tmp_path):
+    """No config env vars at all (the developer's .env is already in os.environ)."""
+    from reviewer import config
+    legacy = [f"{p}{s}" for s in config.LEGACY_INSTANCE_SLOTS
+              for p in ("GITLAB_URL", "GITLAB_TOKEN", "XGITLABTOKEN")]
+    legacy += [f"TELEGRAM_CHAT_ID{s}" for s in config.LEGACY_CHAT_SLOTS]
+    for name in [*config.ENV_FIELDS, *legacy]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "config.yaml"))
+    return tmp_path / "config.yaml"
+
+
+def test_config_bad_values_stop_startup_naming_the_env_var(clean_env, monkeypatch):
+    # #9: v1 silently replaced AI_TIMEOUT=abc with 300 and INVESTIGATOR=maybe with off
+    from reviewer.config import load_settings
+    monkeypatch.setenv("AI_TIMEOUT", "abc")
+    monkeypatch.setenv("INVESTIGATOR", "maybe")
+    monkeypatch.setenv("AI_PROVIDER", "gemini")  # retired in stage 6 -> error, not "runs as anthropic"
+    with pytest.raises(SystemExit) as exc:
+        load_settings()
+    text = str(exc.value)
+    assert "llm.timeout (env AI_TIMEOUT)" in text and "'abc'" in text
+    assert "env INVESTIGATOR" in text and "'maybe'" in text
+    assert "env AI_PROVIDER" in text
+
+
+def test_config_instance_without_token_is_an_error(clean_env, monkeypatch):
+    # v1 skipped a half-configured instance silently: its webhooks then hit
+    # "unknown token" with nothing in the startup log saying why
+    from reviewer.config import load_settings
+    monkeypatch.setenv("GITLAB_URL_2", "https://b")
+    monkeypatch.setenv("XGITLABTOKEN_2", "hook2")
+    with pytest.raises(SystemExit) as exc:
+        load_settings()
+    assert "gitlab.legacy_instances.0.token" in str(exc.value)
+
+
+def test_config_empty_env_values_mean_default(clean_env, monkeypatch):
+    # v1 compose passed ${VAR:-} through as "" — that must keep meaning "default"
+    monkeypatch.setenv("AI_WORKERS", "")
+    monkeypatch.setenv("ANTHROPIC_SMART_MODEL", "")
+    monkeypatch.setenv("GITLAB_URL_2", "")
+    cfg = Settings()
+    assert cfg.server.workers == 2
+    assert cfg.llm.tiers.smart.model == "claude-opus-5"
+    assert cfg.gitlab.instances == []
+
+
+def test_config_legacy_telegram_chats_and_new_csv(clean_env, monkeypatch):
+    from reviewer.config import deprecated_env_vars_in_use
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID_2", "-2")
+    cfg = Settings()
+    assert cfg.notify.telegram.chat_ids == ["-1", "-2"]
+    monkeypatch.setenv("TELEGRAM_CHAT_IDS", "-7, -8")
+    cfg = Settings()
+    assert cfg.notify.telegram.chat_ids == ["-7", "-8"]
+    assert "IGNORED" in deprecated_env_vars_in_use(cfg)[0]
+
+
+YAML_CONFIG = """
+gitlab:
+  instances:
+    - name: primary
+      url: https://lab.example
+      token: ${LAB_TOKEN}
+      webhook_token: ${LAB_HOOK:-fallback-hook}
+llm:
+  tiers:
+    smart: {model: openai/gpt-5.6-terra}
+  prices:
+    z-ai/glm-5: [0.6, 2.2]
+notify:
+  telegram:
+    chat_ids: ["-100a"]
+"""
+
+
+def test_config_yaml_instances_tiers_prices(clean_env, monkeypatch):
+    from reviewer import usage
+    from reviewer.config import deprecated_env_vars_in_use
+    clean_env.write_text(YAML_CONFIG, encoding="utf-8")
+    monkeypatch.setenv("LAB_TOKEN", "glpat-secret")
+    monkeypatch.setenv("GITLAB_URL", "https://legacy")  # yaml wins, legacy is reported
+    monkeypatch.setenv("GITLAB_TOKEN", "t")
+    monkeypatch.setenv("XGITLABTOKEN", "h")
+    monkeypatch.setenv("ANTHROPIC_MAIN_MODEL", "claude-sonnet-5-5")  # env beats yaml/defaults
+    cfg = Settings()
+    assert cfg.gitlab.routes == {"fallback-hook": {
+        "name": "primary", "url": "https://lab.example", "token": "glpat-secret"}}
+    assert "IGNORED" in deprecated_env_vars_in_use(cfg)[0]
+    assert cfg.model_for_tier("smart") == "openai/gpt-5.6-terra"
+    assert cfg.fallback_chain("smart")[0] == "anthropic/claude-opus-5"  # default chain kept
+    assert cfg.model_for_tier("main") == "claude-sonnet-5-5"
+    assert cfg.llm.prices == {"z-ai/glm-5": (0.6, 2.2)}
+    assert cfg.notify.telegram.chat_ids == ["-100a"]
+    monkeypatch.setattr(usage.settings.llm, "prices", cfg.llm.prices)
+    assert usage._load_prices()["z-ai/glm-5"] == (0.6, 2.2)
+
+
+def test_config_yaml_unknown_tier_or_key_is_an_error(clean_env):
+    from reviewer.config import load_settings
+    clean_env.write_text("llm:\n  tiers:\n    huge: {model: x}\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="llm.tiers.huge"):
+        load_settings()
+    clean_env.write_text("pipeline:\n  stages:\n    investigatr: true\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="investigatr"):
+        load_settings()
+    clean_env.write_text("llm: [unclosed\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="config.yaml"):
+        load_settings()
+    clean_env.unlink()
+    with pytest.raises(ValueError, match="unknown tier"):
+        Settings().model_for_tier("huge")
+
+
+def test_config_model_prices_env(clean_env, monkeypatch):
+    from reviewer.config import load_settings
+    monkeypatch.setenv("MODEL_PRICES", "claude-sonnet-5=3/15, x/y=0.5/1")
+    assert Settings().llm.prices == {"claude-sonnet-5": (3.0, 15.0), "x/y": (0.5, 1.0)}
+    monkeypatch.setenv("MODEL_PRICES", "claude-sonnet-5=3")  # v1 logged and skipped it
+    with pytest.raises(SystemExit, match="MODEL_PRICES"):
+        load_settings()
+
+
+def test_config_prod_env_gives_the_v1_configuration(clean_env, monkeypatch):
+    # 8.6: the production .env shape (secrets replaced) yields the same values
+    # the v1 dataclass produced — expected values written out from the old
+    # _bool/_int/_csv rules, not from the new code
+    prod = {
+        "GITLAB_URL": "https://lab.smysl.pro", "GITLAB_TOKEN": "glpat-1", "XGITLABTOKEN": "hook-1",
+        "GITLAB_URL_2": "https://lab.catzwolf.ru", "GITLAB_TOKEN_2": "glpat-2",
+        "XGITLABTOKEN_2": "hook-2",
+        "AI_PROVIDER": "anthropic", "ANTHROPIC_API_URL": "https://gw/anthropic",
+        "ANTHROPIC_API_KEY": "sk-ant-x", "ANTHROPIC_API_KEY_GATEWAY": "cfut_x",
+        "ANTHROPIC_FAST_MODEL": "claude-haiku-4-5", "ANTHROPIC_MAIN_MODEL": "claude-sonnet-5",
+        "ANTHROPIC_SMART_MODEL": "claude-opus-5", "OPENROUTER_API_TOKEN": "sk-or-x",
+        "INVESTIGATOR": "on", "BRIDGE": "on", "TESTER_REPORT": "on",
+        "REVIEW_REPO_TOOLS": "on", "MR_DIALOGUE": "on", "REVIEW_BRIDGE_CHAT_ID": "-100bridge",
+        "AI_DEBUG": "false", "REPO_CACHE_MAX_GB": "25",
+        "TELEGRAM": "on", "TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "-100team",
+        "REVIEW_LANGUAGE": "ru", "REVIEW_FOR_CONFLICT": "false", "DEBUG": "false",
+    }
+    for name, value in prod.items():
+        monkeypatch.setenv(name, value)
+    cfg = Settings()
+    assert cfg.gitlab.routes == {
+        "hook-1": {"name": "primary", "url": "https://lab.smysl.pro", "token": "glpat-1"},
+        "hook-2": {"name": "instance_2", "url": "https://lab.catzwolf.ru", "token": "glpat-2"},
+    }
+    assert (cfg.llm.provider, cfg.llm.anthropic.api_url, cfg.llm.anthropic.api_key,
+            cfg.llm.anthropic.gateway_key, cfg.llm.openrouter.token) == (
+        "anthropic", "https://gw/anthropic", "sk-ant-x", "cfut_x", "sk-or-x")
+    assert [cfg.model_for_tier(t) for t in ("fast", "main", "smart")] == [
+        "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+    assert cfg.fallback_chain("main") == [
+        "anthropic/claude-sonnet-5", "google/gemini-3.6-flash", "deepseek/deepseek-v4-pro"]
+    stages = cfg.pipeline.stages
+    assert (stages.investigator, cfg.bridge.enabled, stages.tester_report,
+            stages.review_repo_tools, stages.dialogue) == (True, True, True, True, True)
+    assert (cfg.llm.cache_ttl, cfg.llm.timeout, cfg.llm.agent_timeout, cfg.llm.rate_limit,
+            cfg.llm.max_input_tokens, cfg.llm.cache_alert_min_input, cfg.llm.debug) == (
+        3600, 300, 600, 2.0, 300_000, 100_000, False)
+    assert (cfg.storage.ai_cache_dir, cfg.storage.state_dir, cfg.storage.log_dir) == (
+        "cache/ai", "state", "logs")
+    assert (cfg.server.workers, cfg.server.debug, cfg.dedupe.ttl, cfg.dedupe.burst_seconds) == (
+        2, False, 600, 30)
+    assert (cfg.repo_cache.dir, cfg.repo_cache.max_gb, cfg.repo_cache.ephemeral) == (
+        "repos", 25.0, False)
+    assert (cfg.pipeline.language, cfg.pipeline.review_for_conflict, cfg.pipeline.review_prompt,
+            cfg.pipeline.review_max_tool_calls, cfg.pipeline.dialogue_max_replies_per_mr,
+            cfg.pipeline.investigator_max_iterations) == ("ru", False, "", 8, 20, 30)
+    assert (cfg.notify.telegram.enabled, cfg.notify.telegram.token,
+            cfg.notify.telegram.chat_ids, cfg.notify.telegram.tester_report_chat_ids) == (
+        True, "123:abc", ["-100team"], [])
+    assert (cfg.bridge.chat_id, cfg.bridge.question_timeout, cfg.bridge.answer_grace,
+            cfg.bridge.max_questions_per_mr, cfg.bridge.rate_per_hour,
+            cfg.bridge.answer_bot_id) == ("-100bridge", 240, 6.0, 10, 25, "")
+    assert cfg.network.proxy_url is None and cfg.llm.prices == {}
+
+
+def test_config_masked_dump_hides_secrets(clean_env, monkeypatch):
+    from reviewer.config import masked_dump
+    monkeypatch.setenv("GITLAB_URL", "https://a")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-very-secret")
+    monkeypatch.setenv("XGITLABTOKEN", "hook-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-very-secret")
+    dump = str(masked_dump(Settings()))
+    assert "very-secret" not in dump and "hook-secret" not in dump
+    assert "https://a" in dump and "max_input_tokens" in dump
+
+
+def test_config_yaml_referencing_gitlab_token_env_is_not_deprecated(clean_env, monkeypatch):
+    # config.example.yaml keeps secrets in the familiar GITLAB_TOKEN/XGITLABTOKEN
+    # vars; only GITLAB_URL[_N] marks a legacy env-defined instance
+    from reviewer.config import deprecated_env_vars_in_use
+    clean_env.write_text(
+        "gitlab:\n  instances:\n    - {name: primary, url: https://a, "
+        "token: '${GITLAB_TOKEN}', webhook_token: '${XGITLABTOKEN}'}\n", encoding="utf-8")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-1")
+    monkeypatch.setenv("XGITLABTOKEN", "hook-1")
+    cfg = Settings()
+    assert cfg.gitlab.routes["hook-1"]["token"] == "glpat-1"
+    assert deprecated_env_vars_in_use(cfg) == []

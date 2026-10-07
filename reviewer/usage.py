@@ -11,7 +11,6 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +21,8 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 # $ per MTok (input, output). Override/extend via MODEL_PRICES,
-# e.g. MODEL_PRICES="claude-sonnet-5=3/15,google/gemini-4-flash=2/8"
+# e.g. MODEL_PRICES="claude-sonnet-5=3/15,google/gemini-4-flash=2/8", or
+# config.yaml llm.prices
 DEFAULT_PRICES: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-sonnet-5": (2.0, 10.0),      # intro pricing through 2026-08-31
@@ -47,17 +47,8 @@ DEFAULT_PRICES: dict[str, tuple[float, float]] = {
 
 
 def _load_prices() -> dict[str, tuple[float, float]]:
-    prices = dict(DEFAULT_PRICES)
-    for item in os.getenv("MODEL_PRICES", "").split(","):
-        if "=" not in item:
-            continue
-        model, _, pair = item.partition("=")
-        inp, _, outp = pair.partition("/")
-        try:
-            prices[model.strip()] = (float(inp), float(outp))
-        except ValueError:
-            logger.warning("MODEL_PRICES: cannot parse %r", item)
-    return prices
+    # MODEL_PRICES / config.yaml llm.prices are parsed and validated in config
+    return {**DEFAULT_PRICES, **settings.llm.prices}
 
 
 PRICES = _load_prices()
@@ -192,7 +183,7 @@ def record(**kwargs) -> None:
 
 
 def _usage_path() -> Path:
-    return Path(settings.ai_log_dir) / "usage.jsonl"
+    return Path(settings.storage.log_dir) / "usage.jsonl"
 
 
 def persist(tracker: UsageTracker, mr_data: dict) -> None:

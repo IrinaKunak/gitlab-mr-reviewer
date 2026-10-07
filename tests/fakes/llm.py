@@ -66,9 +66,9 @@ class ScriptedLLM:
 
     def guard_input_size(self, *parts: str) -> None:
         total = sum(estimate_tokens(p) for p in parts)
-        if total > settings.ai_max_input_tokens:
+        if total > settings.llm.max_input_tokens:
             raise AIInputTooLargeError(
-                f"input ~{total} tokens exceeds limit {settings.ai_max_input_tokens}")
+                f"input ~{total} tokens exceeds limit {settings.llm.max_input_tokens}")
 
     async def complete(self, tier: str, system: str, user_content: str, *,
                        max_tokens: int = 4096, effort: str | None = None,

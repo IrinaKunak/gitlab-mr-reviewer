@@ -24,11 +24,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__, gitlab_io, openrouter_models, overrides, state_layout, telegram_io, usage
 from .bridge import bridge
-from .config import retired_env_vars_in_use, settings
+from .config import deprecated_env_vars_in_use, retired_env_vars_in_use, settings
 from .pipeline import new_job_id, pipeline
 
 logging.basicConfig(
-    level=logging.DEBUG if settings.debug else logging.INFO,
+    level=logging.DEBUG if settings.server.debug else logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -125,8 +125,8 @@ class ReviewQueue:
                 self.queue.task_done()
 
 
-review_queue = ReviewQueue(settings.ai_workers, settings.dedupe_ttl,
-                           settings.dedupe_burst)
+review_queue = ReviewQueue(settings.server.workers, settings.dedupe.ttl,
+                           settings.dedupe.burst_seconds)
 
 _last_unknown_token_alert = 0.0
 _UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
@@ -145,7 +145,7 @@ async def _alert_unknown_token(event_type: str | None, token: str | None) -> Non
 
 async def _verify_instances() -> None:
     """Startup connectivity check (non-fatal, v1 behavior)."""
-    for config in settings.gitlab_instances.values():
+    for config in settings.gitlab.routes.values():
         try:
             gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, config)
             # remembered so note webhooks from the bot itself are dropped at
@@ -164,25 +164,19 @@ async def _verify_instances() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("GitLab MR Reviewer v%s starting", __version__)
-    logger.info("Instances: %s", [c["name"] for c in settings.gitlab_instances.values()])
+    logger.info("Instances: %s", [c["name"] for c in settings.gitlab.routes.values()])
     logger.info("Flags: investigator=%s bridge=%s tester_report=%s "
                 "review_repo_tools=%s dialogue=%s provider=%s",
-                settings.investigator,
-                settings.bridge_enabled, settings.tester_report,
-                settings.review_repo_tools, settings.dialogue_enabled,
-                settings.ai_provider)
-    if settings.ai_provider == "openrouter" and not settings.openrouter_token:
+                settings.pipeline.stages.investigator,
+                settings.bridge.enabled, settings.pipeline.stages.tester_report,
+                settings.pipeline.stages.review_repo_tools, settings.pipeline.stages.dialogue,
+                settings.llm.provider)
+    if settings.llm.provider == "openrouter" and not settings.llm.openrouter.token:
         logger.error("AI_PROVIDER=openrouter but OPENROUTER_API_TOKEN is empty")
-    if settings.ai_provider not in ("anthropic", "openrouter"):
-        # the gemini rollback path is gone (stage 6); anything else behaves
-        # like "anthropic" in ai_client — say so instead of failing silently
-        logger.error("AI_PROVIDER=%s is not supported (anthropic | openrouter) — "
-                     "running as anthropic; roll back to v1 by deploying master",
-                     settings.ai_provider)
-    for message in retired_env_vars_in_use():
+    for message in retired_env_vars_in_use() + deprecated_env_vars_in_use(settings):
         logger.warning("%s", message)
-    if settings.proxy_url:
-        logger.info("Proxy: %s", settings.proxy_url)
+    if settings.network.proxy_url:
+        logger.info("Proxy: %s", settings.network.proxy_url)
     state_layout.migrate(settings)  # before anything reads overrides/review state
     await review_queue.start()
     await bridge.start()
@@ -202,18 +196,18 @@ async def root() -> dict[str, Any]:
         "status": "GitLab MR Reviewer is running",
         "version": __version__,
         "flags": {
-            "investigator": settings.investigator,
-            "bridge": settings.bridge_enabled,
-            "tester_report": settings.tester_report,
-            "review_repo_tools": settings.review_repo_tools,
-            "dialogue": settings.dialogue_enabled,
+            "investigator": settings.pipeline.stages.investigator,
+            "bridge": settings.bridge.enabled,
+            "tester_report": settings.pipeline.stages.tester_report,
+            "review_repo_tools": settings.pipeline.stages.review_repo_tools,
+            "dialogue": settings.pipeline.stages.dialogue,
         },
     }
 
 
 def basic_auth_ok(authorization: str) -> bool:
     """Validate an HTTP Basic header against STATS_USER/STATS_PASSWORD."""
-    if not (settings.stats_user and settings.stats_password):
+    if not (settings.server.stats_user and settings.server.stats_password):
         return False
     scheme, _, blob = authorization.partition(" ")
     if scheme.lower() != "basic" or not blob:
@@ -222,8 +216,8 @@ def basic_auth_ok(authorization: str) -> bool:
         user, _, password = base64.b64decode(blob.strip()).decode().partition(":")
     except (ValueError, UnicodeDecodeError):
         return False
-    return (hmac.compare_digest(user, settings.stats_user)
-            and hmac.compare_digest(password, settings.stats_password))
+    return (hmac.compare_digest(user, settings.server.stats_user)
+            and hmac.compare_digest(password, settings.server.stats_password))
 
 
 def stats_access_allowed(authorization: str, query_token: str,
@@ -232,12 +226,12 @@ def stats_access_allowed(authorization: str, query_token: str,
     only direct local requests (proxied ones carry X-Forwarded-For) pass."""
     if basic_auth_ok(authorization):
         return True
-    token = settings.stats_token
+    token = settings.server.stats_token
     if token:
         if hmac.compare_digest(authorization, f"Bearer {token}"):
             return True
         return bool(query_token) and hmac.compare_digest(query_token, token)
-    if settings.stats_user and settings.stats_password:
+    if settings.server.stats_user and settings.server.stats_password:
         return False  # basic auth is configured and did not match
     return forwarded_for is None
 
@@ -249,7 +243,7 @@ def _dash_guard(request: Request) -> None:
             request.query_params.get("token", ""),
             request.headers.get("x-forwarded-for")):
         return
-    if settings.stats_user and settings.stats_password:
+    if settings.server.stats_user and settings.server.stats_password:
         # trigger the browser's native login prompt
         raise HTTPException(status_code=401, detail="Unauthorized",
                             headers={"WWW-Authenticate": 'Basic realm="mr-reviewer"'})
@@ -278,8 +272,8 @@ async def get_models(request: Request) -> dict[str, Any]:
     vendor-prefixed ids route via OpenRouter, priced from the live catalog)."""
     _dash_guard(request)
     ov = overrides.load()
-    defaults = {"fast": settings.model_fast, "main": settings.model_main,
-                "smart": settings.model_smart}
+    defaults = {"fast": settings.llm.tiers.fast.model, "main": settings.llm.tiers.main.model,
+                "smart": settings.llm.tiers.smart.model}
     catalog = await asyncio.to_thread(openrouter_models.refresh)
     or_models = [{"id": mid, "in": price[0], "out": price[1]}
                  for mid, price in sorted(catalog.items())]
@@ -313,7 +307,7 @@ async def handle_gitlab_webhook(request: Request):
     event_type = request.headers.get("X-Gitlab-Event")
     gitlab_token = request.headers.get("X-Gitlab-Token")
 
-    gitlab_config = settings.gitlab_instances.get(gitlab_token or "")
+    gitlab_config = settings.gitlab.routes.get(gitlab_token or "")
     if not gitlab_config:
         logger.warning("No GitLab instance found for webhook token: %s",
                        (gitlab_token or "")[:10])
@@ -328,7 +322,7 @@ async def handle_gitlab_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
 
     if event_type == "Note Hook":
-        if not settings.dialogue_enabled:
+        if not settings.pipeline.stages.dialogue:
             return {"status": "ignored", "reason": "dialogue disabled"}
         note_data = gitlab_io.parse_note_webhook(payload)
         if not note_data:

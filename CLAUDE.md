@@ -59,8 +59,15 @@ Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
   temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
   the cache sweep removes orphaned `<sha256>.*.tmp` too)
 - **reviewer/gitlab_io.py / telegram_io.py** — GitLab and Telegram I/O (SOCKS via proxies
-  dict); **reviewer/prompts.py** — English-only prompts (translation is a stage);
-  **reviewer/config.py** — env/flags
+  dict); **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **reviewer/config.py** — pydantic-settings, nested sections (`settings.gitlab`,
+  `.llm.tiers.{fast,main,smart}`, `.notify.telegram`, `.bridge`, `.pipeline.stages`,
+  `.repo_cache`, `.dedupe`, `.storage`, `.server`, `.network`). Sources: flat env
+  names (`ENV_FIELDS`, unchanged from v1) > optional `config.yaml` (`${VAR}` refs for
+  secrets) > defaults. Invalid values exit at startup naming the env var
+  (`load_settings`); `python -m reviewer.config` prints the effective config with
+  secrets masked. `gitlab.routes` (webhook token → instance dict) is the legacy shape
+  the pipeline still consumes until stage 9
 
 ## Model & thinking policy (hard-won, do not regress)
 
@@ -186,9 +193,15 @@ Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
 
 ## Configuration
 
-`.env` (mounted by compose, never baked into the image). Multi-instance GitLab via
-`GITLAB_URL[_2.._10]` / `GITLAB_TOKEN[_N]` / `XGITLABTOKEN[_N]` — webhook routing by
-`X-Gitlab-Token` header match.
+`.env` (mounted by compose, never baked into the image) is the only env source —
+compose has no `environment:` block any more (its `${VAR:-default}`s silently beat the
+code defaults). Optional `config.yaml` (template `config.example.yaml`, git-ignored,
+mount line commented in compose) holds structured data. Multi-instance GitLab:
+`config.yaml gitlab.instances[]`, or the deprecated env trios `GITLAB_URL[_2.._10]` /
+`GITLAB_TOKEN[_N]` / `XGITLABTOKEN[_N]` (startup WARNING; used only when the yaml
+defines none) — webhook routing by `X-Gitlab-Token` header match. Instance names
+(`primary`, `instance_N`) are part of the review-state key: keep them when migrating.
+Telegram channels: `TELEGRAM_CHAT_IDS=a,b` (deprecated: `TELEGRAM_CHAT_ID[_N]`).
 
 Key groups (see `.env.example` for the full annotated list):
 
@@ -235,7 +248,8 @@ on in-memory fakes (`tests/fakes/`: `FakeGitLab` behind the python-gitlab object
 AIManager answers, `FakeRepoCache` = project files in a temp dir under the real repo
 tools). The `world` fixture in `tests/conftest.py` is the ONLY place that patches module
 boundaries and sets prod-shaped flags (all v2 flags on incl. investigator/bridge/tester
-report, RU, Telegram on); `world.configure(...)` overrides settings per scenario and
+report, RU, Telegram on); `world.configure(llm__max_input_tokens=...)` overrides nested settings per scenario
+(`__` = `.`) and
 `world.clock.advance(s)` drives the queue's dedupe TTL / burst window. Scenarios cover
 trivial/normal/complex (investigator+bridge+tester report) MRs, incremental re-reviews,
 big-MR degradation, dialogue and dedupe; they assert external effects only (note texts,
@@ -253,6 +267,10 @@ in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.
 ```bash
 git pull && docker compose up -d --build
 ```
+
+- Config changes: validate before restarting —
+  `docker compose build && docker compose run --rm --no-deps gitlab-mr-reviewer python -m reviewer.config`
+  prints the effective config (secrets masked) or the errors that would stop startup.
 
 - Image is `python:3.12-slim` based — **no Node/Gemini CLI**. Full v1 rollback = deploy master.
   CMD is `python -m reviewer`.

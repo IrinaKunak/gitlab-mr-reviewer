@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 os.environ["AI_PROVIDER"] = "anthropic"
+# a developer's config.yaml must not leak in either; yaml tests point CONFIG_FILE at tmp
+os.environ["CONFIG_FILE"] = "/nonexistent/config.yaml"
 
 
 # --- characterization harness ------------------------------------------------
@@ -23,6 +25,16 @@ os.environ["AI_PROVIDER"] = "anthropic"
 # before reviewer.config's load_dotenv().
 
 WEBHOOK_TOKEN = "hook-token"
+
+
+def set_setting(monkeypatch, settings, path: str, value: Any) -> None:
+    """monkeypatch one nested setting by dotted path, e.g. "pipeline.stages.investigator"."""
+    *parents, leaf = path.split(".")
+    target = settings
+    for name in parents:
+        target = getattr(target, name)
+    assert leaf in type(target).model_fields, f"unknown setting {path}"
+    monkeypatch.setattr(target, leaf, value)
 
 
 @dataclass
@@ -53,9 +65,8 @@ class World:
     def configure(self, **values: Any) -> None:
         """Scenario-specific settings on top of the prod-shaped defaults."""
         from reviewer.config import settings
-        for name, value in values.items():
-            assert hasattr(settings, name), f"unknown setting {name}"
-            self.monkeypatch.setattr(settings, name, value)
+        for name, value in values.items():  # llm__max_input_tokens=... -> llm.max_input_tokens
+            set_setting(self.monkeypatch, settings, name.replace("__", "."), value)
 
     def send(self, payload: dict, event: str = "Merge Request Hook") -> dict:
         """POST a webhook, then run whatever it queued the way a worker does."""
@@ -98,22 +109,24 @@ def world(monkeypatch, tmp_path):
     repo = FakeRepoCache(gitlab, tmp_path / "repos")
     log_dir = tmp_path / "logs"
 
-    for name, value in {
-        "investigator": True, "bridge_enabled": True,
-        "tester_report": True, "review_repo_tools": True, "dialogue_enabled": True,
-        "bridge_chat_id": "bridge-chat", "tester_report_chat_ids": [],
-        "dialogue_max_replies_per_mr": 20,
-        "ai_provider": "anthropic", "review_language": "ru", "review_for_conflict": False,
-        "review_prompt_en": "", "ai_max_input_tokens": 300_000,
-        "telegram_enabled": True, "telegram_token": "test-token",
-        "telegram_chat_ids": ["chat-1"],
-        "state_dir": str(tmp_path / "state"), "ai_log_dir": str(log_dir),
-        "ai_cache_dir": str(tmp_path / "cache"),
-        "gitlab_instances": {WEBHOOK_TOKEN: {
+    for path, value in {
+        "pipeline.stages.investigator": True, "bridge.enabled": True,
+        "pipeline.stages.tester_report": True, "pipeline.stages.review_repo_tools": True,
+        "pipeline.stages.dialogue": True,
+        "bridge.chat_id": "bridge-chat", "notify.telegram.tester_report_chat_ids": [],
+        "pipeline.dialogue_max_replies_per_mr": 20,
+        "llm.provider": "anthropic", "pipeline.language": "ru",
+        "pipeline.review_for_conflict": False,
+        "pipeline.review_prompt": "", "llm.max_input_tokens": 300_000,
+        "notify.telegram.enabled": True, "notify.telegram.token": "test-token",
+        "notify.telegram.chat_ids": ["chat-1"],
+        "storage.state_dir": str(tmp_path / "state"), "storage.log_dir": str(log_dir),
+        "storage.ai_cache_dir": str(tmp_path / "cache"),
+        "gitlab.routes": {WEBHOOK_TOKEN: {
             "name": "primary", "url": "https://gitlab.test", "token": "t",
             "bot_username": gitlab.bot_username}},
     }.items():
-        monkeypatch.setattr(settings, name, value)
+        set_setting(monkeypatch, settings, path, value)
 
     monkeypatch.setattr(gitlab_io, "get_gitlab_client", gitlab.client)
     monkeypatch.setattr(telegram_io, "send_message", telegram.send_message)

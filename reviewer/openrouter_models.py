@@ -59,7 +59,7 @@ def _to_disk(value: tuple[Prices, float]) -> dict:
 
 # (prices, fetched_at) — memory copy of the disk cache
 _store: JsonStore[tuple[Prices, float]] = JsonStore(
-    lambda: Path(settings.state_dir) / "openrouter_models.json",
+    lambda: Path(settings.storage.state_dir) / "openrouter_models.json",
     parse=_from_disk, dump=_to_disk, empty=lambda: ({}, 0.0),
     label="OpenRouter catalog")
 
@@ -75,7 +75,7 @@ def price_for(model: str) -> tuple[float, float] | None:
 
 
 def _fetch_now() -> Prices:
-    proxy = settings.proxy_url
+    proxy = settings.network.proxy_url
     with httpx.Client(timeout=15, proxy=proxy) as client:
         resp = client.get(CATALOG_URL)
         resp.raise_for_status()

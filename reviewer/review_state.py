@@ -22,7 +22,7 @@ def _parse(data) -> dict[str, str]:
 
 
 _store: JsonStore[dict[str, str]] = JsonStore(
-    lambda: Path(settings.state_dir) / "reviewed_shas.json",
+    lambda: Path(settings.storage.state_dir) / "reviewed_shas.json",
     parse=_parse, empty=dict, label="review state")
 
 

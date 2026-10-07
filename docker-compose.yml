@@ -3,56 +3,16 @@ services:
     build: .
     ports:
       - "127.0.0.1:5000:5000"
-    environment:
-      # GitLab Configuration
-      - GITLAB_URL=${GITLAB_URL}
-      - GITLAB_TOKEN=${GITLAB_TOKEN}
-      - XGITLABTOKEN=${XGITLABTOKEN}
-
-      # Additional GitLab Instances
-      - GITLAB_URL_2=${GITLAB_URL_2:-}
-      - GITLAB_TOKEN_2=${GITLAB_TOKEN_2:-}
-      - XGITLABTOKEN_2=${XGITLABTOKEN_2:-}
-
-      # AI Provider: anthropic (gateway, OpenRouter on failure) | openrouter
-      - AI_PROVIDER=${AI_PROVIDER:-anthropic}
-      - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-}
-      - ANTHROPIC_API_KEY_GATEWAY=${ANTHROPIC_API_KEY_GATEWAY:-}
-      - ANTHROPIC_FAST_MODEL=${ANTHROPIC_FAST_MODEL:-claude-haiku-4-5}
-      - ANTHROPIC_MAIN_MODEL=${ANTHROPIC_MAIN_MODEL:-claude-sonnet-5}
-      - ANTHROPIC_SMART_MODEL=${ANTHROPIC_SMART_MODEL:-claude-opus-4-8}
-      - OPENROUTER_API_TOKEN=${OPENROUTER_API_TOKEN:-}
-
-      # Feature flags (rollout phases)
-      - INVESTIGATOR=${INVESTIGATOR:-off}
-      - BRIDGE=${BRIDGE:-off}
-      - TESTER_REPORT=${TESTER_REPORT:-off}
-
-      # Review Bridge
-      - REVIEW_BRIDGE_CHAT_ID=${REVIEW_BRIDGE_CHAT_ID:-}
-
-      # Telegram Configuration
-      - TELEGRAM=${TELEGRAM:-off}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - TELEGRAM_CHAT_ID_2=${TELEGRAM_CHAT_ID_2:-}
-      - TELEGRAM_CHAT_ID_3=${TELEGRAM_CHAT_ID_3:-}
-
-      # Proxy Configuration
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - SOCKS_PROXY=${SOCKS_PROXY:-}
-
-      # Review Configuration
-      - REVIEW_LANGUAGE=${REVIEW_LANGUAGE:-en}
-      - REVIEW_FOR_CONFLICT=${REVIEW_FOR_CONFLICT:-false}
-
-      # Debug Configuration (AI_DEBUG intentionally not pinned here so the
-      # mounted .env can provide it)
-      - DEBUG=${DEBUG:-false}
-
+    # All configuration comes from the mounted .env (+ optional config.yaml),
+    # read and validated by reviewer/config.py. There is deliberately no
+    # `environment:` block: its ${VAR:-default}s used to override the code's
+    # defaults (ANTHROPIC_SMART_MODEL:-claude-opus-4-8 vs claude-opus-5).
     volumes:
-      # Mount .env file if it exists (full config incl. instances 3..10)
       - ./.env:/app/.env:ro
+      # Structured config (GitLab instances, Telegram channels, model prices) —
+      # copy config.example.yaml to config.yaml, then uncomment. Don't mount a
+      # missing file: docker would create a directory in its place.
+      # - ./config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs
       - ./cache:/app/cache
       # Durable state (model overrides, reviewed SHAs) — NOT swept like cache/

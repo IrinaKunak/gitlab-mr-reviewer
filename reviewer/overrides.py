@@ -25,7 +25,7 @@ def _clean(data) -> dict[str, str]:
 
 
 _store: JsonStore[dict[str, str]] = JsonStore(
-    lambda: Path(settings.state_dir) / "model_overrides.json",
+    lambda: Path(settings.storage.state_dir) / "model_overrides.json",
     parse=_clean, empty=lambda: _clean({}), label="model overrides")
 
 

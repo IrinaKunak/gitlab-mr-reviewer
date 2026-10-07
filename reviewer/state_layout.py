@@ -25,7 +25,7 @@ STATE_FILES = ("model_overrides.json", "reviewed_shas.json", "openrouter_models.
 def legacy_dirs(cfg: Settings) -> list[Path]:
     """Where the old layout kept state: the AI cache dir itself (an explicit
     AI_CACHE_DIR kept as-is) and its parent (the default moved cache -> cache/ai)."""
-    ai_dir = Path(cfg.ai_cache_dir)
+    ai_dir = Path(cfg.storage.ai_cache_dir)
     return [ai_dir, ai_dir.parent]
 
 
@@ -36,7 +36,7 @@ def migrate(cfg: Settings) -> list[str]:
     and rollbacks are safe. Stale AI cache entries left in the old cache root
     by the layout change are removed.
     """
-    state_dir = Path(cfg.state_dir)
+    state_dir = Path(cfg.storage.state_dir)
     moved: list[str] = []
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -69,8 +69,8 @@ def migrate(cfg: Settings) -> list[str]:
 def _drop_orphaned_cache_entries(cfg: Settings) -> None:
     """The cache moved from `cache/` to `cache/ai/`; entries in the old root are
     never read again and nothing else would sweep them."""
-    old_root = Path(cfg.ai_cache_dir).parent
-    if old_root.resolve() == Path(cfg.ai_cache_dir).resolve():
+    old_root = Path(cfg.storage.ai_cache_dir).parent
+    if old_root.resolve() == Path(cfg.storage.ai_cache_dir).resolve():
         return
     try:
         for entry in old_root.iterdir():

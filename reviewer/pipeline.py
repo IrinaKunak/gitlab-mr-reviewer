@@ -88,7 +88,7 @@ TESTER_REPORT_COMMENT = {
 
 
 def _msg(table: dict[str, str], **kwargs) -> str:
-    template = table.get(settings.review_language, table["en"])
+    template = table.get(settings.pipeline.language, table["en"])
     return template.format(**kwargs) if kwargs else template
 
 
@@ -104,10 +104,10 @@ def tester_report_targets() -> list[str]:
     team channels where the testers actually are (TESTER_REPORT_CHAT_IDS, or
     all regular notification channels when unset)."""
     targets: list[str] = []
-    if settings.bridge_chat_id:
-        targets.append(settings.bridge_chat_id)
-    if settings.telegram_enabled:
-        for chat_id in settings.tester_report_chat_ids or settings.telegram_chat_ids:
+    if settings.bridge.chat_id:
+        targets.append(settings.bridge.chat_id)
+    if settings.notify.telegram.enabled:
+        for chat_id in settings.notify.telegram.tester_report_chat_ids or settings.notify.telegram.chat_ids:
             if chat_id not in targets:
                 targets.append(chat_id)
     return targets
@@ -234,7 +234,7 @@ class Pipeline:
             mr_data, project.path_with_namespace, has_conflicts,
             gitlab_instance=gitlab_config["url"]))
 
-        if has_conflicts and not settings.review_for_conflict:
+        if has_conflicts and not settings.pipeline.review_for_conflict:
             await gitlab_io.post_note(mr, _msg(CONFLICT_SKIP_MSG))
             logger.info("Skipped review for MR !%s due to conflicts", mr_data["mr_iid"])
             return
@@ -275,11 +275,11 @@ class Pipeline:
                 and (c.get("diff") or c.get("collapsed") or c.get("too_large")))
             projected = (estimate_tokens(diff_only)
                          + readable * FILE_CONTEXT_TOKENS_EST)
-            if projected > settings.ai_max_input_tokens:
+            if projected > settings.llm.max_input_tokens:
                 logger.info("MR !%s: skipping file-context fetch for %d files "
                             "(~%d tok projected > %d budget) — diffs only",
                             mr_data["mr_iid"], readable, projected,
-                            settings.ai_max_input_tokens)
+                            settings.llm.max_input_tokens)
                 content = diff_only + (
                     "\n\n[current file contents omitted — this MR is too large "
                     "to include them; the diffs above are complete]"
@@ -327,9 +327,9 @@ class Pipeline:
         # with it instead of asking the author to "confirm" them (dev feedback
         # 2026-07-31: a diff-only reviewer structurally cannot check anything
         # outside the diff, so prompt rules alone kept letting hedges through).
-        need_investigation = (settings.investigator and triage.get("needs_investigation")
+        need_investigation = (settings.pipeline.stages.investigator and triage.get("needs_investigation")
                               and triage.get("complexity") == "complex")
-        want_review_tools = (settings.review_repo_tools
+        want_review_tools = (settings.pipeline.stages.review_repo_tools
                              and triage.get("complexity") != "trivial")
         worktree = None
         if want_review_tools or need_investigation:
@@ -361,7 +361,7 @@ class Pipeline:
         _mark_reviewed(await self._deliver_review(
             mr, mr_data, project, gitlab_config, has_conflicts, review_out))
 
-        if investigation and settings.tester_report and investigation.get("tester_report"):
+        if investigation and settings.pipeline.stages.tester_report and investigation.get("tester_report"):
             report_ru = await self._translate_if_needed(
                 investigation["tester_report"], tier="main")
             await self._deliver_tester_report(project, mr, mr_data, report_ru)
@@ -407,7 +407,7 @@ class Pipeline:
                 "fast", prompts.TRIVIAL_REVIEW_SYSTEM + system_extra, user,
                 max_tokens=1024)
             return result.text
-        system = (settings.review_prompt_en or prompts.REVIEW_SYSTEM) + system_extra
+        system = (settings.pipeline.review_prompt or prompts.REVIEW_SYSTEM) + system_extra
         if triage.get("risk_areas"):
             system += "\nTriage flagged risk areas: " + ", ".join(triage["risk_areas"])
         if worktree is not None:
@@ -443,7 +443,7 @@ class Pipeline:
         # last resort: review the files that fit rather than nothing at all.
         # 80% of the budget in chars leaves room for the system prompt,
         # guidelines and header.
-        budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.8)
+        budget = int(settings.llm.max_input_tokens * CHARS_PER_TOKEN * 0.8)
         trimmed = await asyncio.to_thread(gitlab_io.extract_diff_only, changes, budget)
         logger.warning("MR !%s still too large — reviewing a %d-char subset",
                        mr_data["mr_iid"], len(trimmed))
@@ -473,7 +473,7 @@ class Pipeline:
         to. Returns None when the loop produced no usable review — the caller
         falls back to the plain single-shot path."""
         system = system + prompts.REVIEW_TOOLS_NOTE.format(
-            max_calls=settings.review_max_tool_calls)
+            max_calls=settings.pipeline.review_max_tool_calls)
         tools = self._repo_tools(worktree)
         last_exc: AIInputTooLargeError | None = None
         async for user in self._user_prompts(mr_data, review_content, diff_only, changes):
@@ -482,7 +482,7 @@ class Pipeline:
                     "main", system, user, tools,
                     # the prompt budgets N tool calls; the loop needs turns for
                     # them plus a final text-only answer
-                    max_iterations=settings.review_max_tool_calls + 2,
+                    max_iterations=settings.pipeline.review_max_tool_calls + 2,
                     max_tokens=16000)
             except AIInputTooLargeError as exc:
                 last_exc = exc
@@ -508,7 +508,7 @@ class Pipeline:
         is exactly what the review's own size guard just rejected — checking
         after the clone means cloning a whole repo only to give up."""
         system = prompts.INVESTIGATOR_SYSTEM.format(
-            max_iterations=settings.investigator_max_iterations)
+            max_iterations=settings.pipeline.investigator_max_iterations)
         for content in (review_content, diff_only):
             if not content:
                 continue
@@ -519,7 +519,7 @@ class Pipeline:
                 return content
             except AIInputTooLargeError:
                 continue
-        budget = int(settings.ai_max_input_tokens * CHARS_PER_TOKEN * 0.6)
+        budget = int(settings.llm.max_input_tokens * CHARS_PER_TOKEN * 0.6)
         logger.warning("MR !%s: investigating on a %d-char diff subset",
                        mr_data["mr_iid"], budget)
         return (diff_only or review_content)[:budget]
@@ -577,7 +577,7 @@ class Pipeline:
         if worktree is None:
             logger.warning("investigating without repo tools (no checkout)")
 
-        questions_left = settings.bridge_max_questions_per_mr
+        questions_left = settings.bridge.max_questions_per_mr
 
         async def ask_aimanager(question: str) -> str:
             nonlocal questions_left
@@ -600,12 +600,12 @@ class Pipeline:
                 handler=ask_aimanager))
 
         system = prompts.INVESTIGATOR_SYSTEM.format(
-            max_iterations=settings.investigator_max_iterations)
+            max_iterations=settings.pipeline.investigator_max_iterations)
         user = prompts.investigator_user_prompt(mr_data, review_content, triage, review_en)
         try:
             result = await self.ai.agent_loop(
                 "smart", system, user, tools,
-                max_iterations=settings.investigator_max_iterations,
+                max_iterations=settings.pipeline.investigator_max_iterations,
                 # 32k: adaptive thinking bills against max_tokens on the smart
                 # tier — 16k could be consumed before any visible text
                 max_tokens=32000, effort="high")
@@ -619,7 +619,7 @@ class Pipeline:
         return {"full_text": result.text, "impact": impact, "tester_report": report}
 
     async def _translate_if_needed(self, text: str, tier: str) -> str:
-        if settings.review_language != "ru" or not text:
+        if settings.pipeline.language != "ru" or not text:
             return text
         # long documents overwhelm Haiku: it starts leaving half the prose in
         # English mid-sentence (dev feedback 2026-07-23) — main tier handles them
@@ -720,7 +720,7 @@ class Pipeline:
             result = await self.ai.agent_loop(
                 "main", prompts.DIALOGUE_SYSTEM, user,
                 self._repo_tools(worktree) if worktree is not None else [],
-                max_iterations=settings.review_max_tool_calls + 2,
+                max_iterations=settings.pipeline.review_max_tool_calls + 2,
                 max_tokens=4000)
         finally:
             if worktree is not None:
@@ -758,7 +758,7 @@ class Pipeline:
             self._dialogue_replies = {
                 k: v for k, v in self._dialogue_replies.items()
                 if v and now - v[-1] < DIALOGUE_WINDOW_SECONDS}
-        return len(stamps) < settings.dialogue_max_replies_per_mr
+        return len(stamps) < settings.pipeline.dialogue_max_replies_per_mr
 
     def _dialogue_replied(self, instance: str, project_id, mr_iid) -> None:
         self._dialogue_replies.setdefault(
@@ -786,7 +786,7 @@ class Pipeline:
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
             return False
-        if settings.telegram_enabled:
+        if settings.notify.telegram.enabled:
             await telegram_io.notify(telegram_io.format_mr_message(
                 mr_data, project.path_with_namespace, has_conflicts,
                 review_text, gitlab_config["url"]))

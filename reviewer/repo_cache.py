@@ -62,8 +62,8 @@ def _redact(text: str) -> str:
 
 
 def _proxy_args() -> list[str]:
-    proxy = settings.http_proxy or (
-        f"socks5h://{settings.socks_proxy}" if settings.socks_proxy else "")
+    proxy = settings.network.http_proxy or (
+        f"socks5h://{settings.network.socks_proxy}" if settings.network.socks_proxy else "")
     return ["-c", f"http.proxy={proxy}"] if proxy else []
 
 
@@ -85,8 +85,8 @@ def _run_git(*args: str, token: str | None = None, timeout: int = 600) -> str:
 
 class RepoCache:
     def __init__(self, cache_dir: str | None = None, max_gb: float | None = None):
-        self.root = Path(cache_dir or settings.repo_cache_dir)
-        self.max_bytes = int((max_gb or settings.repo_cache_max_gb) * 1024**3)
+        self.root = Path(cache_dir or settings.repo_cache.dir)
+        self.max_bytes = int((max_gb or settings.repo_cache.max_gb) * 1024**3)
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._evict_lock = threading.Lock()
 
@@ -144,7 +144,7 @@ class RepoCache:
         # same lock as checkout_mr: never drop a bare repo mid-checkout of another MR
         async with self._locks[str(repo_dir)]:
             await asyncio.to_thread(self._remove_worktree_sync, repo_dir, worktree)
-            if settings.repo_cache_ephemeral:
+            if settings.repo_cache.ephemeral:
                 await asyncio.to_thread(self._drop_repo, repo_dir)
 
     def _drop_repo(self, repo_dir: Path) -> None:

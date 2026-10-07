@@ -10,6 +10,7 @@ dependencies = [
     "anthropic>=0.125,<1",
     "fastapi>=0.142,<1",
     "httpx[socks]>=0.28,<0.29",
+    "pydantic-settings[yaml]>=2.15,<3",
     "pysocks>=1.7,<2",
     "python-dotenv>=1.2,<2",
     "python-gitlab>=8.6,<9",

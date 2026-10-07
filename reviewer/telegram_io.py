@@ -22,20 +22,20 @@ _API = "https://api.telegram.org"
 
 def redact_token(text: str) -> str:
     """httpx exceptions embed the request URL, which contains the bot token."""
-    if settings.telegram_token:
-        return text.replace(settings.telegram_token, "***TOKEN***")
+    if settings.notify.telegram.token:
+        return text.replace(settings.notify.telegram.token, "***TOKEN***")
     return text
 
 
 def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     kwargs: dict[str, Any] = {"timeout": timeout}
-    if settings.proxy_url:
-        kwargs["proxy"] = settings.proxy_url
+    if settings.network.proxy_url:
+        kwargs["proxy"] = settings.network.proxy_url
     return httpx.AsyncClient(**kwargs)
 
 
 async def send_message(chat_id: str, text: str, *, parse_mode: str | None = "Markdown") -> bool:
-    if not settings.telegram_token:
+    if not settings.notify.telegram.token:
         return False
     data: dict[str, Any] = {"chat_id": chat_id, "text": text,
                             "disable_web_page_preview": True}
@@ -44,12 +44,12 @@ async def send_message(chat_id: str, text: str, *, parse_mode: str | None = "Mar
     try:
         async with _client() as client:
             response = await client.post(
-                f"{_API}/bot{settings.telegram_token}/sendMessage", json=data)
+                f"{_API}/bot{settings.notify.telegram.token}/sendMessage", json=data)
             if response.status_code != 200 and parse_mode:
                 # Markdown parse failures are common with code in MR titles — retry plain
                 data.pop("parse_mode", None)
                 response = await client.post(
-                    f"{_API}/bot{settings.telegram_token}/sendMessage", json=data)
+                    f"{_API}/bot{settings.notify.telegram.token}/sendMessage", json=data)
             response.raise_for_status()
         return True
     except Exception as exc:  # noqa: BLE001 — notifications must never break the pipeline
@@ -58,12 +58,12 @@ async def send_message(chat_id: str, text: str, *, parse_mode: str | None = "Mar
 
 
 async def send_document(chat_id: str, filename: str, content: bytes, caption: str = "") -> bool:
-    if not settings.telegram_token:
+    if not settings.notify.telegram.token:
         return False
     try:
         async with _client(timeout=60.0) as client:
             response = await client.post(
-                f"{_API}/bot{settings.telegram_token}/sendDocument",
+                f"{_API}/bot{settings.notify.telegram.token}/sendDocument",
                 data={"chat_id": chat_id, "caption": caption[:1024]},
                 files={"document": (filename, content, "text/markdown")},
             )
@@ -76,14 +76,14 @@ async def send_document(chat_id: str, filename: str, content: bytes, caption: st
 
 async def notify(message: str, is_error: bool = False) -> bool:
     """Broadcast to all configured notification channels (v1 behavior)."""
-    if not settings.telegram_enabled or not settings.telegram_token or not settings.telegram_chat_ids:
+    if not settings.notify.telegram.enabled or not settings.notify.telegram.token or not settings.notify.telegram.chat_ids:
         logger.debug("Telegram notifications disabled or not configured")
         return False
     if is_error:
-        prefix = "🚨 **ERROR** 🚨\n" if settings.review_language == "en" else "🚨 **ОШИБКА** 🚨\n"
+        prefix = "🚨 **ERROR** 🚨\n" if settings.pipeline.language == "en" else "🚨 **ОШИБКА** 🚨\n"
         message = prefix + message
     sent = 0
-    for chat_id in settings.telegram_chat_ids:
+    for chat_id in settings.notify.telegram.chat_ids:
         if await send_message(chat_id, message):
             sent += 1
     return sent > 0
@@ -109,9 +109,9 @@ _ERROR_TITLES = {
 
 async def notify_error(error_type: str, error_details: str,
                        context: dict[str, Any] | None = None) -> bool:
-    if not settings.telegram_enabled:
+    if not settings.notify.telegram.enabled:
         return False
-    titles = _ERROR_TITLES.get(settings.review_language, _ERROR_TITLES["en"])
+    titles = _ERROR_TITLES.get(settings.pipeline.language, _ERROR_TITLES["en"])
     parts = [f"**{titles.get(error_type, titles['general'])}**",
              f"**Details:** {error_details}"]
     context = context or {}
@@ -131,7 +131,7 @@ def format_mr_message(mr_data: dict, project_name: str, has_conflicts: bool = Fa
                       review_content: str | None = None,
                       gitlab_instance: str | None = None) -> str:
     """v1 notification format, preserved verbatim."""
-    lang = settings.review_language
+    lang = settings.pipeline.language
     if has_conflicts:
         status_emoji = "⚠️"
         status_text = "MR with CONFLICTS" if lang == "en" else "MR С КОНФЛИКТАМИ"

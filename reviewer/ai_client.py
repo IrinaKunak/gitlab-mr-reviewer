@@ -240,7 +240,7 @@ class AIClient:
         self._alert = alert  # (error_type, details) -> ops notification; None = log only
         self._rate_lock = asyncio.Lock()
         self._last_call = 0.0
-        self._cache_dir = Path(self.cfg.ai_cache_dir)
+        self._cache_dir = Path(self.cfg.storage.ai_cache_dir)
         self._debug_logger: logging.Logger | None = None
         self._debug_failed = False
         self._primary: AsyncAnthropic | None = None
@@ -250,8 +250,8 @@ class AIClient:
 
     def _http_client(self, timeout: float) -> DefaultAsyncHttpxClient:
         kwargs: dict[str, Any] = {"timeout": timeout}
-        if self.cfg.proxy_url:
-            kwargs["proxy"] = self.cfg.proxy_url
+        if self.cfg.network.proxy_url:
+            kwargs["proxy"] = self.cfg.network.proxy_url
         return DefaultAsyncHttpxClient(**kwargs)
 
     @property
@@ -265,18 +265,18 @@ class AIClient:
         3. real key only           -> plain x-api-key (unauthenticated gateway / direct API)
         """
         if self._primary is None:
-            real_key = self.cfg.anthropic_api_key
-            gateway_key = self.cfg.anthropic_gateway_key
+            real_key = self.cfg.llm.anthropic.api_key
+            gateway_key = self.cfg.llm.anthropic.gateway_key
             if not real_key and gateway_key and not gateway_key.startswith("cfut_"):
                 # legacy single-var setup: a real key stored in the GATEWAY var
                 real_key, gateway_key = gateway_key, ""
             headers = ({"cf-aig-authorization": f"Bearer {gateway_key}"}
                        if gateway_key.startswith("cfut_") else None)
             self._primary = AsyncAnthropic(
-                base_url=self.cfg.anthropic_api_url or None,
+                base_url=self.cfg.llm.anthropic.api_url or None,
                 api_key=real_key or ("gateway" if headers else None),
                 default_headers=headers,
-                http_client=self._http_client(self.cfg.ai_timeout),
+                http_client=self._http_client(self.cfg.llm.timeout),
                 # 1, not 2: a timed-out big request is still billed server-side —
                 # retries multiply cost; real outages go to the OpenRouter fallback
                 max_retries=1,
@@ -285,13 +285,13 @@ class AIClient:
 
     @property
     def fallback(self) -> AsyncAnthropic | None:
-        if not self.cfg.openrouter_token:
+        if not self.cfg.llm.openrouter.token:
             return None
         if self._fallback is None:
             self._fallback = AsyncAnthropic(
                 base_url="https://openrouter.ai/api",
-                auth_token=self.cfg.openrouter_token,
-                http_client=self._http_client(self.cfg.ai_timeout),
+                auth_token=self.cfg.llm.openrouter.token,
+                http_client=self._http_client(self.cfg.llm.timeout),
                 max_retries=1,
             )
         return self._fallback
@@ -315,7 +315,7 @@ class AIClient:
         """Warn (and alert once per review) when an agent loop paid full price
         for every turn. Fail-open: monitoring must never break a review."""
         if not prompt_cache_broken(iterations, total_in, total_cr, total_cc,
-                                   self.cfg.ai_cache_alert_min_input):
+                                   self.cfg.llm.cache_alert_min_input):
             return
         details = (f"{tier} tier, {model} via {provider}: {iterations} turns, "
                    f"in={total_in + total_cc} cached=0 — every turn re-billed the "
@@ -377,7 +377,7 @@ class AIClient:
     def _cache_get(self, key: str) -> str | None:
         path = self._cache_dir / key
         try:
-            if path.is_file() and (time.time() - path.stat().st_mtime) < self.cfg.ai_cache_ttl:
+            if path.is_file() and (time.time() - path.stat().st_mtime) < self.cfg.llm.cache_ttl:
                 return path.read_text(encoding="utf-8")
         except OSError:
             pass
@@ -409,17 +409,17 @@ class AIClient:
 
     async def _rate_limit(self) -> None:
         async with self._rate_lock:
-            wait = self.cfg.ai_rate_limit - (time.monotonic() - self._last_call)
+            wait = self.cfg.llm.rate_limit - (time.monotonic() - self._last_call)
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_call = time.monotonic()
 
     def _debug(self, direction: str, payload: str) -> None:
-        if not self.cfg.ai_debug or self._debug_failed:
+        if not self.cfg.llm.debug or self._debug_failed:
             return
         try:
             if self._debug_logger is None:
-                log_dir = Path(self.cfg.ai_log_dir)
+                log_dir = Path(self.cfg.storage.log_dir)
                 log_dir.mkdir(parents=True, exist_ok=True)
                 handler = RotatingFileHandler(
                     log_dir / "ai-debug.log", maxBytes=20_000_000, backupCount=3, encoding="utf-8")
@@ -439,9 +439,9 @@ class AIClient:
 
     def guard_input_size(self, *parts: str) -> None:
         total = sum(estimate_tokens(p) for p in parts)
-        if total > self.cfg.ai_max_input_tokens:
+        if total > self.cfg.llm.max_input_tokens:
             raise AIInputTooLargeError(
-                f"input ~{total} tokens exceeds limit {self.cfg.ai_max_input_tokens}")
+                f"input ~{total} tokens exceeds limit {self.cfg.llm.max_input_tokens}")
 
     async def complete(
         self,
@@ -458,7 +458,7 @@ class AIClient:
         """Single-shot completion with primary -> fallback failover."""
         self.guard_input_size(system, user_content)
         model = overrides.model_for_tier(tier, self.cfg)
-        via_openrouter = uses_openrouter(self.cfg.ai_provider, model)
+        via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
         if via_openrouter:
             model = openrouter_model(model, self.cfg.fallback_chain(tier))
 
@@ -618,7 +618,7 @@ class AIClient:
         handlers = {tool.name: tool.handler for tool in tools}
         api_tools = [tool.to_api() for tool in tools]
         model = overrides.model_for_tier(tier, self.cfg)
-        via_openrouter = uses_openrouter(self.cfg.ai_provider, model)
+        via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
         if via_openrouter:
             model = openrouter_model(model, self.cfg.fallback_chain(tier))
         # cache the static prefix (tools + system + the MR diff/context render
@@ -653,7 +653,7 @@ class AIClient:
                 }
             try:
                 target = self.fallback if via_openrouter else self.primary
-                response = await self._call(target, request, self.cfg.ai_agent_timeout)
+                response = await self._call(target, request, self.cfg.llm.agent_timeout)
                 provider = "openrouter" if via_openrouter else "gateway"
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
                 if not _should_fallback(exc):
@@ -671,7 +671,7 @@ class AIClient:
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": chain}}
                 try:
-                    response = await self._call(client, request, self.cfg.ai_agent_timeout)
+                    response = await self._call(client, request, self.cfg.llm.agent_timeout)
                     provider = "openrouter"
                 except Exception as exc2:  # noqa: BLE001
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)

@@ -159,3 +159,6 @@ sessions/
 # local debug artifacts
 log-from-prod.txt
 /usage.jsonl
+
+# site config (instances, channels) — template is config.example.yaml
+config.yaml

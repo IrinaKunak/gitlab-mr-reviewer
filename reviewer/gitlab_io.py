@@ -95,7 +95,7 @@ def summarize_skipped(entries: list[str]) -> str:
 
 def get_gitlab_client(gitlab_config: dict) -> gitlab.Gitlab:
     session = requests.Session()
-    proxies = settings.requests_proxies
+    proxies = settings.network.requests_proxies
     if proxies:
         session.proxies = proxies
     gl = gitlab.Gitlab(
@@ -501,7 +501,7 @@ def format_review_comment(review_text: str) -> str:
         "ru": "*Этот обзор был создан автоматически с помощью ИИ. "
               "Пожалуйста, изучите отзывы и устраните все проблемы перед слиянием.*",
     }
-    lang = settings.review_language
+    lang = settings.pipeline.language
     return (f"{headers.get(lang, headers['en'])}\n\n{review_text.strip()}\n\n---\n"
             f"{footers.get(lang, footers['en'])}\n")
 
