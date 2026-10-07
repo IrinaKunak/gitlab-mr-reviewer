@@ -36,10 +36,10 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# legacy root-level scripts (test_*.py, create_test_mr*.py, ...) are removed in
-# refactoring stage 6; lint only the service and its tests until then
+# the manual helpers in scripts/ (v1-era, run by hand against live GitLab)
+# are not linted, except the webhook bulk tool that operators re-run
 include = ["reviewer/**/*.py", "tests/**/*.py", "w-server.py",
-           "add_webhooks_to_all_projects.py"]
+           "scripts/add_webhooks_to_all_projects.py"]
 
 [tool.ruff.lint]
 # pyflakes + pycodestyle errors (ruff defaults), import order, pyupgrade, bugbear

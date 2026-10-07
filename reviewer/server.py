@@ -15,7 +15,6 @@ import base64
 import hmac
 import json
 import logging
-import shutil
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -25,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__, gitlab_io, openrouter_models, overrides, state_layout, telegram_io, usage
 from .bridge import bridge
-from .config import settings
+from .config import retired_env_vars_in_use, settings
 from .pipeline import new_job_id, pipeline
 
 logging.basicConfig(
@@ -166,17 +165,22 @@ async def _verify_instances() -> None:
 async def lifespan(app: FastAPI):
     logger.info("GitLab MR Reviewer v%s starting", __version__)
     logger.info("Instances: %s", [c["name"] for c in settings.gitlab_instances.values()])
-    logger.info("Flags: pipeline_v2=%s investigator=%s bridge=%s tester_report=%s "
+    logger.info("Flags: investigator=%s bridge=%s tester_report=%s "
                 "review_repo_tools=%s dialogue=%s provider=%s",
-                settings.pipeline_v2, settings.investigator,
+                settings.investigator,
                 settings.bridge_enabled, settings.tester_report,
                 settings.review_repo_tools, settings.dialogue_enabled,
                 settings.ai_provider)
     if settings.ai_provider == "openrouter" and not settings.openrouter_token:
         logger.error("AI_PROVIDER=openrouter but OPENROUTER_API_TOKEN is empty")
-    if settings.ai_provider == "gemini" and not shutil.which("gemini"):
-        logger.error("AI_PROVIDER=gemini but the gemini CLI is not installed — "
-                     "this rollback path requires the v1 Docker image (master branch)")
+    if settings.ai_provider not in ("anthropic", "openrouter"):
+        # the gemini rollback path is gone (stage 6); anything else behaves
+        # like "anthropic" in ai_client — say so instead of failing silently
+        logger.error("AI_PROVIDER=%s is not supported (anthropic | openrouter) — "
+                     "running as anthropic; roll back to v1 by deploying master",
+                     settings.ai_provider)
+    for message in retired_env_vars_in_use():
+        logger.warning("%s", message)
     if settings.proxy_url:
         logger.info("Proxy: %s", settings.proxy_url)
     state_layout.migrate(settings)  # before anything reads overrides/review state
@@ -198,7 +202,6 @@ async def root() -> dict[str, Any]:
         "status": "GitLab MR Reviewer is running",
         "version": __version__,
         "flags": {
-            "pipeline_v2": settings.pipeline_v2,
             "investigator": settings.investigator,
             "bridge": settings.bridge_enabled,
             "tester_report": settings.tester_report,
@@ -375,9 +378,3 @@ async def handle_gitlab_webhook(request: Request):
         "merge_request": mr_data["mr_iid"],
         "instance": gitlab_config["name"],
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=5000)

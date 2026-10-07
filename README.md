@@ -50,7 +50,7 @@ for the public webhook URL.
 
 ### GitLab webhook
 
-Per project (or bulk via `add_webhooks_to_all_projects.py`):
+Per project (or bulk via `scripts/add_webhooks_to_all_projects.py`):
 
 - URL: `https://<your-domain>/webhook`
 - Secret Token: the matching `XGITLABTOKEN[_N]` value (this is how instances are routed)
@@ -60,12 +60,13 @@ Per project (or bulk via `add_webhooks_to_all_projects.py`):
 
 | Flag | What it enables |
 |------|-----------------|
-| `PIPELINE_V2` | tiered pipeline (triage → review → translate); off = v1-parity single pass |
 | `INVESTIGATOR` | Opus agentic analysis for complex MRs (clones the repo, read-only tools) |
 | `BRIDGE` | AIManager Q&A in the Review Bridge Telegram group |
 | `TESTER_REPORT` | tester verification guides (.md on the MR + Telegram) |
 
-Any flag can be turned off and the container restarted for instant rollback.
+Any flag can be turned off and the container restarted for instant rollback. The
+tiered pipeline itself is not a flag any more: rolling back to v1 means deploying
+`master` or the `v2-pre-cleanup` tag.
 
 ## 🔍 Endpoints
 
@@ -93,12 +94,13 @@ pricing changes.
 uv sync                             # runtime + dev deps from uv.lock into .venv
 source .venv/bin/activate
 python -m pytest tests/ -q          # offline unit tests, no API keys needed
-DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
+DEBUG=true python -m reviewer      # serves on 0.0.0.0:5000
 ```
 
-Testing utilities: `test_webhooks.py` (create test MRs in the configured test repos),
+Manual helpers live in `scripts/` (run against live GitLab, not part of the test
+suite): `create_test_mrs.py` (create test MRs in the configured test repos),
 `add_webhooks_to_all_projects.py --dry-run` (bulk webhook management),
-`test_gitlab_connection.py`, `test_webhook_local.py`.
+`check_gitlab_connection.py`, `check_webhook_routing.py`, `trigger_webhook.py`.
 
 ## 🧯 Troubleshooting
 
@@ -113,8 +115,8 @@ Testing utilities: `test_webhooks.py` (create test MRs in the configured test re
   `DEDUPE_TTL` / `DEDUPE_BURST_SECONDS`. Same-SHA retries are suppressed for 10 min.
 - **An MR you never want reviewed** (huge infra branches): add `[no-review]` to its
   title or a `no-review` label
-- **Full rollback to v1** — deploy the `master` branch (the v2 image has no Gemini CLI;
-  `AI_PROVIDER=gemini` works only with the v1 image)
+- **Full rollback to v1** — deploy the `master` branch (or the `v2-pre-cleanup` tag for
+  v2 with the parity/gemini paths); the current image has no Gemini CLI or v1 mode
 
 ## 📊 Production status
 

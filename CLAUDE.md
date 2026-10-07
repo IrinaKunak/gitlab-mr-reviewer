@@ -14,7 +14,8 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 
 ## Architecture (`reviewer/` package)
 
-`w-server.py` is a thin shim so `uvicorn w-server:app` keeps working.
+Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
+`w-server.py` is only an import shim so `uvicorn w-server:app` keeps working.
 
 - **reviewer/server.py** — FastAPI app: `POST /webhook` (MR events, contract unchanged
   from v1, **plus Note Hook** → dialogue jobs on the same queue, deduped by note id and
@@ -29,8 +30,9 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   repo checkout is shared by the tool-assisted review and the investigator;
   `process_note` answers developer replies in MR discussion threads (main tier + repo
   tools, `NO_REPLY` sentinel, per-MR daily reply budget); per-review usage tracking
-  (`kind: review|dialogue` in usage.jsonl); v1-parity path when `PIPELINE_V2=off`;
-  legacy `AI_PROVIDER=gemini` subprocess path as rollback hatch
+  (`kind: review|dialogue` in usage.jsonl). The v1-parity (`PIPELINE_V2=off`) and
+  `AI_PROVIDER=gemini` paths were removed in refactoring stage 6 (tag `v2-pre-cleanup`
+  still has them)
 - **reviewer/ai_client.py** — Anthropic SDK via Cloudflare AI Gateway with OpenRouter
   fallback (Anthropic-compatible `/api/v1/messages`, `models` array failover); response
   cache, rate limiting, agent tool loop, empty-response retry, usage recording
@@ -147,7 +149,7 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 - **MR dialogue** (`MR_DIALOGUE=on`): replying to a bot comment or @mentioning the bot
   in an MR triggers a Note Hook → the bot answers in the same thread, checking the
   repo before answering ("Пусть сам подтверждает"). Requires `note_events` on project
-  webhooks — `add_webhooks_to_all_projects.py` enables it and also UPDATES existing
+  webhooks — `scripts/add_webhooks_to_all_projects.py` enables it and also UPDATES existing
   hooks (re-run it once after deploying). Guards: own-note drop (startup-captured
   bot_username + worker re-check), only bot-threads/mentions answered,
   already-answered check, `DIALOGUE_MAX_REPLIES_PER_MR` (20/day), `NO_REPLY` sentinel
@@ -189,8 +191,12 @@ Key groups (see `.env.example` for the full annotated list):
 - **AI**: `AI_PROVIDER=anthropic`, `ANTHROPIC_API_URL` (CF gateway `/anthropic` route),
   `ANTHROPIC_API_KEY` (real key, x-api-key) + `ANTHROPIC_API_KEY_GATEWAY` (cfut_, sent as
   `cf-aig-authorization: Bearer`), model tiers, `OPENROUTER_API_TOKEN` + fallback chains
-- **Flags**: `PIPELINE_V2`, `INVESTIGATOR`, `BRIDGE`, `TESTER_REPORT` — all ON in prod;
-  all off = v1-parity. Rollback = flip a flag + `docker compose up -d`.
+- **Flags**: `INVESTIGATOR`, `BRIDGE`, `TESTER_REPORT` — all ON in prod; turning one
+  off = flip it + `docker compose up -d`. The tiered pipeline is not a flag: rollback
+  to v1 = deploy `master` (or the `v2-pre-cleanup` tag for v2 with the parity/gemini
+  paths). `PIPELINE_V2` and the `GEMINI_*` aliases are ignored; startup logs a WARNING
+  per retired variable still set (`config.RETIRED_ENV_VARS`, e.g. `GEMINI_PROMPT` →
+  `REVIEW_PROMPT`).
   `REVIEW_REPO_TOOLS` / `MR_DIALOGUE` default ON (env `off` to disable);
   `REVIEW_MAX_TOOL_CALLS` (8) budgets both the review's checks and dialogue replies.
 - **Bridge**: `REVIEW_BRIDGE_CHAT_ID`, `BRIDGE_QUESTION_TIMEOUT`, `BRIDGE_MAX_QUESTIONS_PER_MR`
@@ -207,7 +213,7 @@ source .venv/bin/activate
 .venv/bin/python -m pytest tests/ -q     # offline, no API keys needed — keep it green
 .venv/bin/ruff check                     # lint (rules in pyproject.toml)
 (.venv/bin/mypy || true) | .venv/bin/mypy-baseline filter   # fails only on NEW errors
-DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
+DEBUG=true python -m reviewer             # 0.0.0.0:5000
 ```
 
 - Dependencies live in `pyproject.toml` (ranges) + `uv.lock` (exact pins); there is no
@@ -244,6 +250,7 @@ git pull && docker compose up -d --build
 ```
 
 - Image is `python:3.12-slim` based — **no Node/Gemini CLI**. Full v1 rollback = deploy master.
+  CMD is `python -m reviewer`.
 - Compose binds `127.0.0.1:5000` — public access only via the reverse proxy (Caddy, TLS).
 - Volumes `./logs ./cache ./state ./repos` must be writable by the container user (`useradd -r`
   → UID 999): `sudo chown -R 999:999 logs cache state repos` on first deploy. `state/`
@@ -269,9 +276,12 @@ git pull && docker compose up -d --build
 
 ## Testing utilities
 
-- `python test_webhooks.py` — create test MRs in the configured test repos
+Manual helpers live in `scripts/` (live GitLab, not part of the test suite; not
+linted except the webhook tool):
+
+- `python scripts/create_test_mrs.py` — create test MRs in the configured test repos
   (`spikerwork/test-repo` on primary, `gitlab-instance-0d55f60d/max-test` on instance_2)
-- `python add_webhooks_to_all_projects.py [--dry-run|--instance N|--test-endpoint]` —
+- `python scripts/add_webhooks_to_all_projects.py [--dry-run|--instance N|--test-endpoint]` —
   bulk webhook management across all projects/instances
 - To exercise the investigator/bridge: MR with multi-file auth/payment-ish logic and a
   Jira key in the branch name; trivial one-file MRs stop at the Haiku tier by design.

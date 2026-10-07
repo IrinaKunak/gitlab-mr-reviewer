@@ -1910,3 +1910,70 @@ def test_webhook_500_hides_exception_text(monkeypatch):
     assert body["detail"] == "internal error"
     assert len(body["job_id"]) == 8
     assert "10.0.0.5" not in resp.text and "/srv/app" not in resp.text
+
+
+# --- stage 6: legacy gemini / v1-parity paths removed ---
+
+def test_retired_gemini_aliases_are_no_longer_read(monkeypatch):
+    for name in ("AI_TIMEOUT", "AI_DEBUG", "AI_CACHE_DIR", "REVIEW_PROMPT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GEMINI_TIMEOUT", "5")
+    monkeypatch.setenv("GEMINI_DEBUG", "true")
+    monkeypatch.setenv("GEMINI_CACHE_DIR", "/tmp/old-cache")
+    monkeypatch.setenv("GEMINI_PROMPT", "old checklist")
+    cfg = Settings()
+    assert cfg.ai_timeout == 300
+    assert cfg.ai_debug is False
+    assert cfg.ai_cache_dir == "cache/ai"
+    assert cfg.review_prompt_en == ""
+    assert not hasattr(cfg, "pipeline_v2")
+
+
+def test_review_prompt_override_has_a_non_legacy_name(monkeypatch):
+    monkeypatch.setenv("REVIEW_PROMPT", "custom checklist")
+    assert Settings().review_prompt_en == "custom checklist"
+
+
+def test_retired_env_vars_are_reported_with_successor(monkeypatch):
+    from reviewer.config import RETIRED_ENV_VARS, retired_env_vars_in_use
+    for name in RETIRED_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    assert retired_env_vars_in_use() == []
+    monkeypatch.setenv("PIPELINE_V2", "on")
+    monkeypatch.setenv("GEMINI_PROMPT", "x")
+    assert retired_env_vars_in_use() == [
+        "PIPELINE_V2 is no longer read",
+        "GEMINI_PROMPT is no longer read — rename it to REVIEW_PROMPT"]
+
+
+def test_startup_warns_about_retired_vars_and_unsupported_provider(
+        monkeypatch, caplog, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from reviewer import server
+    from reviewer.config import settings
+    # lifespan runs state_layout.migrate: keep it off the developer's cache/
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
+    monkeypatch.setattr(settings, "ai_provider", "gemini")
+    monkeypatch.setattr(settings, "gitlab_instances", {})
+    monkeypatch.setattr(settings, "bridge_enabled", False)
+    monkeypatch.setenv("PIPELINE_V2", "off")
+    monkeypatch.setattr(server, "review_queue", server.ReviewQueue(
+        workers=0, dedupe_ttl=600))
+    with caplog.at_level("WARNING", logger="reviewer.server"), TestClient(server.app) as client:
+        flags = client.get("/").json()["flags"]
+    assert "pipeline_v2" not in flags
+    assert "AI_PROVIDER=gemini is not supported" in caplog.text
+    assert "PIPELINE_V2 is no longer read" in caplog.text
+
+
+def test_single_entry_point_runs_uvicorn_on_port_5000(monkeypatch):
+    import uvicorn
+
+    from reviewer import __main__ as entry
+    from reviewer.server import app
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: calls.append((a, kw)))
+    entry.main()
+    assert calls == [((app,), {"host": "0.0.0.0", "port": 5000})]

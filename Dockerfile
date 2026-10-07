@@ -1,4 +1,4 @@
-# GitLab MR Reviewer v2 — plain Python image (Node.js/Gemini CLI no longer needed)
+# GitLab MR Reviewer v2 — plain Python image
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -29,8 +29,7 @@ RUN uv sync --frozen --no-dev --no-cache
 ENV PATH="/app/.venv/bin:$PATH"
 
 COPY reviewer/ ./reviewer/
-COPY w-server.py gemini-wrapper.sh ./
-RUN chmod +x gemini-wrapper.sh
+COPY w-server.py ./
 
 RUN mkdir -p /app/logs /app/cache/ai /app/state /app/repos && \
     chown -R appuser:appuser /app /home/appuser
@@ -47,4 +46,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 EXPOSE 5000
 
-CMD ["/app/.venv/bin/python", "-m", "uvicorn", "w-server:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["/app/.venv/bin/python", "-m", "reviewer"]

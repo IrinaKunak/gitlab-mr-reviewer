@@ -99,7 +99,7 @@ def world(monkeypatch, tmp_path):
     log_dir = tmp_path / "logs"
 
     for name, value in {
-        "pipeline_v2": True, "investigator": True, "bridge_enabled": True,
+        "investigator": True, "bridge_enabled": True,
         "tester_report": True, "review_repo_tools": True, "dialogue_enabled": True,
         "bridge_chat_id": "bridge-chat", "tester_report_chat_ids": [],
         "dialogue_max_replies_per_mr": 20,

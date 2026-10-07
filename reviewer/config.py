@@ -1,7 +1,8 @@
 """Configuration: env loading, GitLab instances, model tiers, feature flags.
 
-Env var names are kept compatible with v1 (.env / docker-compose contracts).
-Legacy GEMINI_* knobs are read as fallbacks for their AI_* successors.
+Env var names are kept compatible with v1 (.env / docker-compose contracts),
+except the GEMINI_* aliases and PIPELINE_V2, retired with the legacy review
+paths in refactoring stage 6 (see RETIRED_ENV_VARS).
 """
 
 from __future__ import annotations
@@ -20,16 +21,16 @@ def _bool(name: str, default: bool = False) -> bool:
     )
 
 
-def _int(name: str, default: int, legacy: str | None = None) -> int:
-    raw = os.getenv(name) or (os.getenv(legacy) if legacy else None)
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name)
     try:
         return int(raw) if raw else default
     except ValueError:
         return default
 
 
-def _float(name: str, default: float, legacy: str | None = None) -> float:
-    raw = os.getenv(name) or (os.getenv(legacy) if legacy else None)
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
     try:
         return float(raw) if raw else default
     except ValueError:
@@ -38,6 +39,28 @@ def _float(name: str, default: float, legacy: str | None = None) -> float:
 
 def _csv(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
+
+# env vars that no longer do anything -> name of the successor (or "" if none).
+# Set in a .env they are ignored silently, so startup logs a WARNING per name.
+RETIRED_ENV_VARS = {
+    "PIPELINE_V2": "",  # the tiered pipeline is the only path now
+    "GEMINI_API_KEY": "",
+    "GEMINI_CACHE_TTL": "AI_CACHE_TTL",
+    "GEMINI_CACHE_DIR": "AI_CACHE_DIR",
+    "GEMINI_TIMEOUT": "AI_TIMEOUT",
+    "GEMINI_RATE_LIMIT": "AI_RATE_LIMIT",
+    "GEMINI_DEBUG": "AI_DEBUG",
+    "GEMINI_LOG_DIR": "AI_LOG_DIR",
+    "GEMINI_PROMPT": "REVIEW_PROMPT",
+    "GEMINI_PROMPT_RU": "",  # parity mode only
+}
+
+
+def retired_env_vars_in_use() -> list[str]:
+    """One message per retired variable still present in the environment."""
+    return [f"{name} is no longer read" + (f" — rename it to {new}" if new else "")
+            for name, new in RETIRED_ENV_VARS.items() if os.getenv(name)]
 
 
 def load_gitlab_instances() -> dict[str, dict]:
@@ -84,26 +107,23 @@ class Settings:
         "OPENROUTER_FALLBACK_SMART",
         "anthropic/claude-opus-5,openai/gpt-5.6-terra,moonshotai/kimi-k3"))
 
-    # --- AI behavior (legacy GEMINI_* read as fallback) ---
-    ai_cache_ttl: int = field(default_factory=lambda: _int("AI_CACHE_TTL", 3600, "GEMINI_CACHE_TTL"))
+    # --- AI behavior ---
+    ai_cache_ttl: int = field(default_factory=lambda: _int("AI_CACHE_TTL", 3600))
     # disposable response cache — swept by age. Durable state (overrides,
     # reviewed SHAs, model catalog) lives in STATE_DIR: sharing one dir let the
     # 48h sweep delete model_overrides.json and reviewed_shas.json
-    ai_cache_dir: str = field(default_factory=lambda: os.getenv(
-        "AI_CACHE_DIR", os.getenv("GEMINI_CACHE_DIR", "cache/ai")))
+    ai_cache_dir: str = field(default_factory=lambda: os.getenv("AI_CACHE_DIR", "cache/ai"))
     state_dir: str = field(default_factory=lambda: os.getenv("STATE_DIR", "state"))
     # agent loops reading at least this many input tokens with zero cache reads
     # get a WARNING + Telegram alert (0 disables): a silently broken prompt
     # cache re-bills the whole prefix every turn
     ai_cache_alert_min_input: int = field(default_factory=lambda: _int(
         "AI_CACHE_ALERT_MIN_INPUT", 100_000))
-    ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 300, "GEMINI_TIMEOUT"))
+    ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 300))
     ai_agent_timeout: int = field(default_factory=lambda: _int("AI_AGENT_TIMEOUT", 600))
-    ai_rate_limit: float = field(default_factory=lambda: _float(
-        "AI_RATE_LIMIT", 2.0, "GEMINI_RATE_LIMIT"))
-    ai_debug: bool = field(default_factory=lambda: _bool("AI_DEBUG", _bool("GEMINI_DEBUG")))
-    ai_log_dir: str = field(default_factory=lambda: os.getenv(
-        "AI_LOG_DIR", os.getenv("GEMINI_LOG_DIR", "logs")))
+    ai_rate_limit: float = field(default_factory=lambda: _float("AI_RATE_LIMIT", 2.0))
+    ai_debug: bool = field(default_factory=lambda: _bool("AI_DEBUG"))
+    ai_log_dir: str = field(default_factory=lambda: os.getenv("AI_LOG_DIR", "logs"))
     # every current tier model has a 1M context window — 150k was a v1/Gemini-era
     # holdover that refused real MRs outright ("MR too large to analyze")
     ai_max_input_tokens: int = field(default_factory=lambda: _int("AI_MAX_INPUT_TOKENS", 300_000))
@@ -111,12 +131,11 @@ class Settings:
     dedupe_ttl: int = field(default_factory=lambda: _int("DEDUPE_TTL", 600))
     dedupe_burst: int = field(default_factory=lambda: _int("DEDUPE_BURST_SECONDS", 30))
 
-    # legacy single-model review prompt overrides (used in parity mode / checklist content)
-    review_prompt_en: str = field(default_factory=lambda: os.getenv("GEMINI_PROMPT", ""))
-    review_prompt_ru: str = field(default_factory=lambda: os.getenv("GEMINI_PROMPT_RU", ""))
+    # replaces the main-tier REVIEW_SYSTEM prompt (English; per-team focus
+    # belongs in the repo's .ai-review.md instead)
+    review_prompt_en: str = field(default_factory=lambda: os.getenv("REVIEW_PROMPT", ""))
 
     # --- feature flags (per rollout phase) ---
-    pipeline_v2: bool = field(default_factory=lambda: _bool("PIPELINE_V2"))
     investigator: bool = field(default_factory=lambda: _bool("INVESTIGATOR"))
     bridge_enabled: bool = field(default_factory=lambda: _bool("BRIDGE"))
     tester_report: bool = field(default_factory=lambda: _bool("TESTER_REPORT"))
