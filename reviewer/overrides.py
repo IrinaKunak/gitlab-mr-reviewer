@@ -9,46 +9,33 @@ claude-* ids keep using the CF gateway.
 
 from __future__ import annotations
 
-import json
 import logging
-import threading
 from pathlib import Path
 
 from .config import settings
+from .json_store import JsonStore
 
 logger = logging.getLogger(__name__)
 
 TIERS = ("fast", "main", "smart")
-_lock = threading.Lock()
-_cache: dict[str, str] | None = None
 
 
-def _path() -> Path:
-    return Path(settings.state_dir) / "model_overrides.json"
+def _clean(data) -> dict[str, str]:
+    return {t: str((data or {}).get(t) or "").strip() for t in TIERS}
+
+
+_store: JsonStore[dict[str, str]] = JsonStore(
+    lambda: Path(settings.state_dir) / "model_overrides.json",
+    parse=_clean, empty=lambda: _clean({}), label="model overrides")
 
 
 def load() -> dict[str, str]:
-    global _cache
-    if _cache is None:
-        try:
-            data = json.loads(_path().read_text(encoding="utf-8"))
-            _cache = {t: str(data.get(t) or "").strip() for t in TIERS}
-        except (OSError, ValueError):
-            _cache = {t: "" for t in TIERS}
-    return dict(_cache)
+    return dict(_store.read())
 
 
 def save(new: dict) -> dict[str, str]:
     """Persist overrides (empty string clears a tier). Fail-open on disk errors."""
-    global _cache
-    clean = {t: str((new or {}).get(t) or "").strip() for t in TIERS}
-    with _lock:
-        try:
-            _path().parent.mkdir(parents=True, exist_ok=True)
-            _path().write_text(json.dumps(clean), encoding="utf-8")
-        except OSError as exc:
-            logger.warning("model overrides not persisted (%s) — in-memory only", exc)
-        _cache = clean
+    clean = _store.write(_clean(new))
     logger.info("model overrides: %s", {t: v for t, v in clean.items() if v} or "cleared")
     return dict(clean)
 

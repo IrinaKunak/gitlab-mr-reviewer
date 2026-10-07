@@ -398,8 +398,6 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     from reviewer.config import settings
 
     monkeypatch.setattr(settings, "state_dir", str(tmp_path))
-    monkeypatch.setattr(openrouter_models, "_cache", None)
-    monkeypatch.setattr(openrouter_models, "_fetched_at", 0.0)
 
     raw = {"data": [
         {"id": "z-ai/glm-5", "pricing": {"prompt": "0.0000006", "completion": "0.0000022"}},
@@ -413,8 +411,7 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     assert "openrouter/auto" not in parsed             # negative sentinel filtered
 
     # feed the catalog in and confirm cost_usd uses it for an unknown model
-    monkeypatch.setattr(openrouter_models, "_cache", parsed)
-    monkeypatch.setattr(openrouter_models, "_fetched_at", 1e18)  # never stale
+    openrouter_models._store.write((parsed, 1e18))  # never stale
     assert usage.price_of("z-ai/glm-5") == (0.6, 2.2)
     cost = usage.cost_usd("z-ai/glm-5", 1_000_000, 1_000_000)
     assert abs(cost - (0.6 + 2.2)) < 1e-9
@@ -432,7 +429,7 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     def _boom():
         raise RuntimeError("no network")
     monkeypatch.setattr(openrouter_models, "_fetch_now", _boom)
-    monkeypatch.setattr(openrouter_models, "_fetched_at", 0.0)  # force a refresh attempt
+    openrouter_models._store.write((parsed, 0.0))  # stale -> forces a refresh attempt
     assert openrouter_models.refresh() == parsed  # falls back to cache, no raise
 
 
@@ -639,7 +636,6 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     from reviewer.config import settings as live_settings
 
     monkeypatch.setattr(live_settings, "state_dir", str(tmp_path))
-    monkeypatch.setattr(overrides, "_cache", None)
 
     cfg = Settings()
     cfg.ai_cache_dir = str(tmp_path)
@@ -665,8 +661,6 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     assert result.provider == "openrouter"
     assert captured["model"] == "openai/gpt-5.6-terra"
     assert captured["extra_body"]["models"][0] == "openai/gpt-5.6-terra"
-
-    monkeypatch.setattr(overrides, "_cache", None)  # don't leak into other tests
 
 
 def test_basic_auth(monkeypatch):
@@ -839,7 +833,6 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
     from reviewer.config import settings
 
     monkeypatch.setattr(settings, "state_dir", str(tmp_path))
-    monkeypatch.setattr(review_state, "_cache", None)  # drop module-level cache
 
     assert review_state.get_last_sha("primary", 1, 2) is None
     review_state.set_last_sha("primary", 1, 2, "abc123")
@@ -848,7 +841,7 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
     assert review_state.get_last_sha("primary", 1, 2) == "def456"
 
     # survives a cold start (persisted to the cache volume)
-    monkeypatch.setattr(review_state, "_cache", None)
+    review_state._store.invalidate()
     assert review_state.get_last_sha("primary", 1, 2) == "def456"
 
     # bounded: oldest entries evicted beyond MAX_ENTRIES
@@ -1712,7 +1705,7 @@ def test_state_files_live_outside_ai_cache_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
     for mod in (overrides, review_state, openrouter_models):
-        assert mod._path().parent == tmp_path / "state"
+        assert mod._store.path.parent == tmp_path / "state"
     assert Settings().ai_cache_dir != Settings().state_dir
 
 
@@ -1977,3 +1970,85 @@ def test_single_entry_point_runs_uvicorn_on_port_5000(monkeypatch):
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: calls.append((a, kw)))
     entry.main()
     assert calls == [((app,), {"host": "0.0.0.0", "port": 5000})]
+
+
+def test_json_store_corrupt_file_reads_as_empty(tmp_path, caplog):
+    # stage 7 (#11): a half-written / hand-edited state file must not break
+    # reviews — it reads as empty (full review, no overrides), with a warning
+    from reviewer.json_store import JsonStore
+    path = tmp_path / "state.json"
+    path.write_text('{"a": "x", "b"', encoding="utf-8")  # truncated mid-write
+    store = JsonStore(path, parse=dict, empty=dict, label="test state")
+    with caplog.at_level("WARNING"):
+        assert store.read() == {}
+    assert "corrupt" in caplog.text
+    # valid JSON of the wrong shape is "corrupt" too, not a crash
+    path.write_text("[1, 2]", encoding="utf-8")
+    store.invalidate()
+    assert store.read() == {}
+    # a later write replaces the bad file
+    store.write({"a": "y"})
+    store.invalidate()
+    assert store.read() == {"a": "y"}
+
+
+def test_json_store_failed_write_keeps_old_file(tmp_path, monkeypatch):
+    # stage 7 (#11): write_text truncated the file first, so a crash/full disk
+    # mid-write left it broken; now the old file survives and no temp is left
+    import json as _json
+
+    from reviewer import json_store
+    path = tmp_path / "state.json"
+    store = json_store.JsonStore(path, parse=dict, empty=dict)
+    store.write({"k": "old"})
+
+    def boom(*args, **kwargs):
+        raise OSError("No space left on device")
+    monkeypatch.setattr(json_store.os, "fsync", boom)
+    assert store.write({"k": "new"}) == {"k": "new"}  # fail-open: kept in memory
+    assert store.read() == {"k": "new"}
+    assert _json.loads(path.read_text(encoding="utf-8")) == {"k": "old"}
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]  # temp cleaned up
+
+
+def test_json_store_follows_path_change(tmp_path):
+    # path is resolved on use: switching STATE_DIR (tests, future reload) reads
+    # the new file instead of serving the old dir's in-memory copy
+    from reviewer.json_store import JsonStore
+    where = {"dir": tmp_path / "a"}
+    store = JsonStore(lambda: where["dir"] / "s.json", parse=dict, empty=dict)
+    store.write({"x": "1"})
+    where["dir"] = tmp_path / "b"
+    assert store.read() == {}
+    where["dir"] = tmp_path / "a"
+    assert store.read() == {"x": "1"}
+
+
+def test_review_state_survives_corrupt_file(tmp_path, monkeypatch):
+    from reviewer import review_state
+    from reviewer.config import settings
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    (tmp_path / "reviewed_shas.json").write_text("{not json", encoding="utf-8")
+    assert review_state.get_last_sha("primary", 1, 2) is None  # -> full review
+    review_state.set_last_sha("primary", 1, 2, "abc")
+    review_state._store.invalidate()
+    assert review_state.get_last_sha("primary", 1, 2) == "abc"
+
+
+def test_ai_cache_write_is_atomic_and_sweeps_orphan_temps(tmp_path):
+    import os
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    client = AIClient(cfg)
+    key = "c" * 64
+    client._cache_put(key, "answer")
+    assert client._cache_get(key) == "answer"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [key]
+    # a temp left by a crash mid-write is swept like an expired entry
+    orphan = tmp_path / f"{'d' * 64}.abc_123.tmp"
+    orphan.write_text("partial", encoding="utf-8")
+    old = time.time() - 72 * 3600
+    os.utime(orphan, (old, old))
+    client._cleanup_cache()
+    assert not orphan.exists()
+    assert (tmp_path / key).exists()

@@ -33,6 +33,7 @@ from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 from . import overrides, telegram_io, usage
 from .config import Settings
 from .config import settings as default_settings
+from .json_store import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,8 @@ def extract_json(text: str) -> dict | None:
 
 
 CACHE_KEY_RE = re.compile(r"[0-9a-f]{64}")  # _cache_key output: sha256 hexdigest
+# a cache entry, or the temp file atomic_write_text left behind if it died mid-write
+CACHE_SWEEP_RE = re.compile(r"[0-9a-f]{64}(\.[^.]+\.tmp)?")
 
 
 def prompt_cache_broken(iterations: int, input_tokens: int, cache_read: int,
@@ -384,8 +387,7 @@ class AIClient:
         if not text:
             return
         try:
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            (self._cache_dir / key).write_text(text, encoding="utf-8")
+            atomic_write_text(self._cache_dir / key, text)  # no torn entry is ever read
             self._cleanup_cache()
         except OSError as exc:
             logger.warning("cache write failed: %s", exc)
@@ -397,7 +399,7 @@ class AIClient:
         cutoff = time.time() - max_age_hours * 3600
         try:
             for entry in self._cache_dir.iterdir():
-                if (entry.is_file() and CACHE_KEY_RE.fullmatch(entry.name)
+                if (entry.is_file() and CACHE_SWEEP_RE.fullmatch(entry.name)
                         and entry.stat().st_mtime < cutoff):
                     entry.unlink(missing_ok=True)
         except OSError:

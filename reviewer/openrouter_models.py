@@ -12,32 +12,26 @@ a network fetch. Refreshes happen out-of-band from the /admin/models endpoint.
 
 from __future__ import annotations
 
-import json
 import logging
-import threading
 import time
 from pathlib import Path
 
 import httpx
 
 from .config import settings
+from .json_store import JsonStore
 
 logger = logging.getLogger(__name__)
 
 CATALOG_URL = "https://openrouter.ai/api/v1/models"
 TTL_SECONDS = 6 * 3600
-_lock = threading.Lock()
-_cache: dict[str, tuple[float, float]] | None = None
-_fetched_at = 0.0
+
+Prices = dict[str, tuple[float, float]]
 
 
-def _path() -> Path:
-    return Path(settings.state_dir) / "openrouter_models.json"
-
-
-def _parse(data: dict) -> dict[str, tuple[float, float]]:
+def _parse(data: dict) -> Prices:
     """OpenRouter prices are $/token strings; store $/MTok (input, output)."""
-    out: dict[str, tuple[float, float]] = {}
+    out: Prices = {}
     for model in data.get("data", []):
         mid = model.get("id")
         pricing = model.get("pricing") or {}
@@ -53,31 +47,34 @@ def _parse(data: dict) -> dict[str, tuple[float, float]]:
     return out
 
 
-def _load_disk() -> tuple[dict[str, tuple[float, float]], float]:
-    try:
-        blob = json.loads(_path().read_text(encoding="utf-8"))
-        prices = {k: (float(v[0]), float(v[1])) for k, v in blob.get("prices", {}).items()}
-        return prices, float(blob.get("fetched_at", 0))
-    except (OSError, ValueError, TypeError, KeyError, IndexError):
-        return {}, 0.0
+def _from_disk(blob) -> tuple[Prices, float]:
+    prices = {k: (float(v[0]), float(v[1])) for k, v in blob.get("prices", {}).items()}
+    return prices, float(blob.get("fetched_at", 0))
 
 
-def catalog() -> dict[str, tuple[float, float]]:
+def _to_disk(value: tuple[Prices, float]) -> dict:
+    prices, fetched_at = value
+    return {"fetched_at": fetched_at, "prices": {k: [v[0], v[1]] for k, v in prices.items()}}
+
+
+# (prices, fetched_at) — memory copy of the disk cache
+_store: JsonStore[tuple[Prices, float]] = JsonStore(
+    lambda: Path(settings.state_dir) / "openrouter_models.json",
+    parse=_from_disk, dump=_to_disk, empty=lambda: ({}, 0.0),
+    label="OpenRouter catalog")
+
+
+def catalog() -> Prices:
     """Cached catalog (memory → disk). Read-only; never hits the network."""
-    global _cache, _fetched_at
-    if _cache is None:
-        with _lock:
-            if _cache is None:
-                _cache, _fetched_at = _load_disk()
-    return dict(_cache)
+    return dict(_store.read()[0])
 
 
 def price_for(model: str) -> tuple[float, float] | None:
     """(input, output) $/MTok for an OpenRouter model id, or None if unknown."""
-    return catalog().get(model)
+    return _store.read()[0].get(model)
 
 
-def _fetch_now() -> dict[str, tuple[float, float]]:
+def _fetch_now() -> Prices:
     proxy = settings.proxy_url
     with httpx.Client(timeout=15, proxy=proxy) as client:
         resp = client.get(CATALOG_URL)
@@ -85,27 +82,18 @@ def _fetch_now() -> dict[str, tuple[float, float]]:
         return _parse(resp.json())
 
 
-def refresh(force: bool = False) -> dict[str, tuple[float, float]]:
+def refresh(force: bool = False) -> Prices:
     """Fetch the catalog if stale (or forced). Fail-open to the cached copy.
     Call from request handlers (async → to_thread), NOT the pricing hot path."""
-    global _cache, _fetched_at
     now = time.time()
-    current = catalog()
-    if not force and current and (now - _fetched_at) < TTL_SECONDS:
-        return current
+    current, fetched_at = _store.read()
+    if not force and current and (now - fetched_at) < TTL_SECONDS:
+        return dict(current)
     try:
         prices = _fetch_now()
     except Exception as exc:  # noqa: BLE001 — availability only; never fatal
         logger.warning("OpenRouter model catalog refresh failed (%s) — using cache", exc)
-        return current
-    with _lock:
-        _cache = prices
-        _fetched_at = now
-        try:
-            _path().parent.mkdir(parents=True, exist_ok=True)
-            _path().write_text(json.dumps({"fetched_at": now, "prices": {
-                k: [v[0], v[1]] for k, v in prices.items()}}), encoding="utf-8")
-        except OSError as exc:
-            logger.warning("OpenRouter catalog not persisted (%s)", exc)
+        return dict(current)
+    _store.write((prices, now))
     logger.info("OpenRouter model catalog refreshed: %d models", len(prices))
-    return prices
+    return dict(prices)

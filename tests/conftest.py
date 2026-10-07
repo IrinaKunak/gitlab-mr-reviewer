@@ -88,7 +88,7 @@ def world(monkeypatch, tmp_path):
     on) wired to in-memory GitLab / LLM / Telegram / bridge / repo checkout."""
     from fastapi.testclient import TestClient
 
-    from reviewer import gitlab_io, overrides, review_state, server, telegram_io
+    from reviewer import gitlab_io, server, telegram_io
     from reviewer import pipeline as pipeline_mod
     from reviewer.config import settings
     from tests.fakes import FakeBridge, FakeGitLab, FakeRepoCache, FakeTelegram, ScriptedLLM
@@ -114,11 +114,6 @@ def world(monkeypatch, tmp_path):
             "bot_username": gitlab.bot_username}},
     }.items():
         monkeypatch.setattr(settings, name, value)
-
-    # module-level caches of state files: drop them so every scenario starts
-    # from its own empty STATE_DIR (no "already reviewed" sha, no overrides)
-    monkeypatch.setattr(review_state, "_cache", None)
-    monkeypatch.setattr(overrides, "_cache", None)
 
     monkeypatch.setattr(gitlab_io, "get_gitlab_client", gitlab.client)
     monkeypatch.setattr(telegram_io, "send_message", telegram.send_message)

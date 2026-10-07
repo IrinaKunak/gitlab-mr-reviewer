@@ -9,57 +9,42 @@ the next review is a full one.
 
 from __future__ import annotations
 
-import json
-import logging
-import threading
 from pathlib import Path
 
 from .config import settings
-
-logger = logging.getLogger(__name__)
+from .json_store import JsonStore
 
 MAX_ENTRIES = 500  # oldest-inserted dropped beyond this
-_lock = threading.Lock()
-_cache: dict[str, str] | None = None
 
 
-def _path() -> Path:
-    return Path(settings.state_dir) / "reviewed_shas.json"
+def _parse(data) -> dict[str, str]:
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+_store: JsonStore[dict[str, str]] = JsonStore(
+    lambda: Path(settings.state_dir) / "reviewed_shas.json",
+    parse=_parse, empty=dict, label="review state")
 
 
 def _key(instance: str, project_id, mr_iid) -> str:
     return f"{instance}:{project_id}:{mr_iid}"
 
 
-def _load() -> dict[str, str]:
-    global _cache
-    if _cache is None:
-        try:
-            data = json.loads(_path().read_text(encoding="utf-8"))
-            _cache = {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            _cache = {}
-    return _cache
-
-
 def get_last_sha(instance: str, project_id, mr_iid) -> str | None:
-    with _lock:
-        return _load().get(_key(instance, project_id, mr_iid)) or None
+    return _store.read().get(_key(instance, project_id, mr_iid)) or None
 
 
 def set_last_sha(instance: str, project_id, mr_iid, sha: str) -> None:
-    global _cache
     if not sha:
         return
-    with _lock:
-        state = dict(_load())
-        state.pop(_key(instance, project_id, mr_iid), None)  # re-insert as newest
-        state[_key(instance, project_id, mr_iid)] = sha
+    key = _key(instance, project_id, mr_iid)
+
+    def _put(old: dict[str, str]) -> dict[str, str]:
+        state = dict(old)
+        state.pop(key, None)  # re-insert as newest
+        state[key] = sha
         while len(state) > MAX_ENTRIES:
             state.pop(next(iter(state)))
-        try:
-            _path().parent.mkdir(parents=True, exist_ok=True)
-            _path().write_text(json.dumps(state), encoding="utf-8")
-        except OSError as exc:
-            logger.warning("review state not persisted (%s) — in-memory only", exc)
-        _cache = state
+        return state
+
+    _store.update(_put)

@@ -53,6 +53,11 @@ Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
 - **reviewer/usage.py** — per-review token/cost accounting (contextvar tracker), model
   price table (`MODEL_PRICES` override), `logs/usage.jsonl`, `/stats` aggregation,
   Telegram usage footer
+- **reviewer/json_store.py** — `JsonStore`: the one implementation behind the state files
+  (`review_state`, `overrides`, `openrouter_models`): lazy read, lock, fail-open (a
+  corrupt file reads as empty, an unwritable one stays in memory), atomic writes via
+  temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
+  the cache sweep removes orphaned `<sha256>.*.tmp` too)
 - **reviewer/gitlab_io.py / telegram_io.py** — GitLab and Telegram I/O (SOCKS via proxies
   dict); **reviewer/prompts.py** — English-only prompts (translation is a stage);
   **reviewer/config.py** — env/flags
@@ -235,9 +240,10 @@ report, RU, Telegram on); `world.configure(...)` overrides settings per scenario
 trivial/normal/complex (investigator+bridge+tester report) MRs, incremental re-reviews,
 big-MR degradation, dialogue and dedupe; they assert external effects only (note texts,
 messages, AI tiers, usage) and never call private methods. An unscripted AI call or
-bridge question fails the test. Module-level
-state caches (`review_state._cache`, `overrides._cache`) must be reset there, or
-scenarios leak "already reviewed" state into each other.
+bridge question fails the test. State stores
+(`JsonStore`) resolve their path from `settings.state_dir` on every access, so pointing
+it at the scenario's temp dir is enough — no module caches to reset; use
+`<module>._store.invalidate()` to simulate a cold start.
 
 Every bug fix gets a regression test in `tests/test_unit.py`. When checking pytest results
 in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.
