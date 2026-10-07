@@ -1,0 +1,55 @@
+[project]
+name = "gitlab-mr-reviewer"
+version = "2.0.0"
+description = "Tiered Claude review pipeline for GitLab merge requests (FastAPI webhook service)"
+readme = "README.md"
+requires-python = ">=3.11"
+# Ranges allow patch/minor updates; exact versions are pinned in uv.lock,
+# which is what the Docker image installs (`uv sync --frozen`).
+dependencies = [
+    "anthropic>=0.125,<1",
+    "fastapi>=0.142,<1",
+    "httpx[socks]>=0.28,<0.29",
+    "pysocks>=1.7,<2",
+    "python-dotenv>=1.2,<2",
+    "python-gitlab>=8.6,<9",
+    "requests>=2.34,<3",
+    "uvicorn>=0.54,<1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4",
+    "mypy-baseline>=0.7",
+    "pytest>=9.1",
+    "ruff>=0.16",
+    "types-requests",
+]
+
+[tool.uv]
+# an application, not a library: install deps only, never build the project
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# legacy root-level scripts (test_*.py, create_test_mr*.py, ...) are removed in
+# refactoring stage 6; lint only the service and its tests until then
+include = ["reviewer/**/*.py", "tests/**/*.py", "w-server.py",
+           "add_webhooks_to_all_projects.py"]
+
+[tool.ruff.lint]
+# pyflakes + pycodestyle errors (ruff defaults), import order, pyupgrade, bugbear
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.mypy]
+# non-strict for now (strict typing is stage 21); existing errors live in
+# mypy-baseline.txt and CI fails only on NEW ones: mypy | mypy-baseline filter
+python_version = "3.11"
+files = ["reviewer"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true

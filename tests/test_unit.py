@@ -1250,10 +1250,14 @@ def test_redact_credentials_in_git_errors():
     assert "https://***@lab.x" in _redact(msg)
 
 
-def test_requirements_declare_runtime_deps():
-    reqs = open("requirements.txt").read()
-    for dep in ("anthropic", "httpx[socks]"):
-        assert dep in reqs, f"{dep} missing from requirements.txt"
+def test_pyproject_declares_runtime_deps():
+    import tomllib
+
+    with open("pyproject.toml", "rb") as fh:
+        deps = " ".join(tomllib.load(fh)["project"]["dependencies"])
+    for dep in ("anthropic", "httpx[socks]", "fastapi", "python-gitlab", "uvicorn",
+                "requests"):
+        assert dep in deps, f"{dep} missing from pyproject.toml"
 
 
 def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):

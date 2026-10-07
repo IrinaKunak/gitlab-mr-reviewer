@@ -90,8 +90,8 @@ pricing changes.
 ## 🛠️ Development
 
 ```bash
+uv sync                             # runtime + dev deps from uv.lock into .venv
 source .venv/bin/activate
-pip install -r requirements.txt
 python -m pytest tests/ -q          # offline unit tests, no API keys needed
 DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
 ```

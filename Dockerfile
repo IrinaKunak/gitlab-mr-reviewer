@@ -19,11 +19,14 @@ WORKDIR /app
 
 RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
-COPY requirements.txt .
-
-RUN python -m venv /app/.venv
+# exact versions from uv.lock (--frozen: fail if pyproject and lock disagree)
+COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock ./
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_COMPILE_BYTECODE=0 \
+    UV_LINK_MODE=copy
+RUN uv sync --frozen --no-dev --no-cache
 ENV PATH="/app/.venv/bin:$PATH"
-RUN pip install --no-cache-dir -r requirements.txt
 
 COPY reviewer/ ./reviewer/
 COPY w-server.py gemini-wrapper.sh ./
