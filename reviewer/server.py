@@ -21,13 +21,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import (__version__, gitlab_io, openrouter_models, overrides, state_layout,
                telegram_io, usage)
 from .bridge import bridge
 from .config import settings
-from .pipeline import pipeline
+from .pipeline import new_job_id, pipeline
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -53,6 +53,16 @@ class ReviewQueue:
 
     def submit(self, mr_data: dict) -> bool:
         """Returns False if this exact MR state was queued recently (webhook retry)."""
+        # one id per queued job: log lines, TG alerts and the neutral MR
+        # error note all carry it, so a user report maps back to the log
+        mr_data["job_id"] = new_job_id()
+        accepted = self._submit(mr_data)
+        if accepted:
+            logger.info("job %s: queued %s for MR !%s", mr_data["job_id"],
+                        mr_data.get("kind") or "review", mr_data.get("mr_iid"))
+        return accepted
+
+    def _submit(self, mr_data: dict) -> bool:
         now = time.monotonic()
         self._seen = {key: stamp for key, stamp in self._seen.items()
                       if now - stamp < self.dedupe_ttl}
@@ -343,10 +353,15 @@ async def handle_gitlab_webhook(request: Request):
     try:
         mr_data = gitlab_io.parse_merge_request_webhook(payload)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Error handling webhook: %s", exc)
+        # the caller is GitLab (its hook log is visible to project maintainers):
+        # exception text stays in our log/alert, the response carries only an id
+        job_id = new_job_id()
+        logger.exception("job %s: error handling webhook", job_id)
         await telegram_io.notify_error("webhook_error", str(exc),
-                                       {"event_type": event_type or "unknown"})
-        raise HTTPException(status_code=500, detail=str(exc))
+                                       {"event_type": event_type or "unknown",
+                                        "job_id": job_id})
+        return JSONResponse(status_code=500,
+                            content={"detail": "internal error", "job_id": job_id})
 
     if not mr_data:
         return {"status": "ignored", "reason": "Invalid or unsupported MR action"}

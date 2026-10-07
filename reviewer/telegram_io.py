@@ -121,6 +121,8 @@ async def notify_error(error_type: str, error_details: str,
         parts.append(f"**MR:** !{context['mr_iid']}")
     if "gitlab_instance" in context:
         parts.append(f"**Instance:** {context['gitlab_instance']}")
+    if "job_id" in context:
+        parts.append(f"**Job:** {context['job_id']}")
     parts.append(f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return await notify("\n".join(parts), is_error=True)
 

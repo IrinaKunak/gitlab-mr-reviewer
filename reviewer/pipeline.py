@@ -19,6 +19,7 @@ import os
 import subprocess
 import tempfile
 import time
+import uuid
 from typing import Any
 
 import gitlab as gitlab_lib
@@ -65,13 +66,16 @@ TIMEOUT_MSG = {
     "en": "⏱️ Code review timed out. The changes might be too large to analyze.",
     "ru": "⏱️ Тайм-аут обзора кода. Возможно, изменения слишком большие для анализа.",
 }
-FAILED_MSG = {
-    "en": "❌ Code review failed: {error}",
-    "ru": "❌ Обзор кода не удался: {error}",
-}
+# MR comments are visible to every project member: error paths post only a
+# neutral line with the job id — exception text (internal URLs, provider
+# errors, disk paths) goes to the log and the internal Telegram alert only
 GENERAL_ERROR_MSG = {
-    "en": "❌ An error occurred during code review: {error}",
-    "ru": "❌ Произошла ошибка при обзоре кода: {error}",
+    "en": "❌ Code review was not completed, job id: {job_id}",
+    "ru": "❌ Ревью не выполнено, id задачи: {job_id}",
+}
+POST_FAILED_MSG = {
+    "en": "❌ Failed to post the review comment, job id: {job_id}",
+    "ru": "❌ Не удалось опубликовать комментарий с обзором, id задачи: {job_id}",
 }
 TESTER_REPORT_COMMENT = {
     "en": "## 🧪 Tester Report\n\nA verification guide for this MR is attached: {link}",
@@ -82,6 +86,11 @@ TESTER_REPORT_COMMENT = {
 def _msg(table: dict[str, str], **kwargs) -> str:
     template = table.get(settings.review_language, table["en"])
     return template.format(**kwargs) if kwargs else template
+
+
+def new_job_id() -> str:
+    """Short id that ties a queued job's log lines, alerts and MR error note."""
+    return uuid.uuid4().hex[:8]
 
 
 def tester_report_targets() -> list[str]:
@@ -123,32 +132,35 @@ class Pipeline:
         if not gitlab_config:
             logger.error("No GitLab configuration found in mr_data")
             return
+        job_id = mr_data.setdefault("job_id", new_job_id())
         ctx = {"project_id": mr_data.get("project_id"), "mr_iid": mr_data.get("mr_iid"),
-               "gitlab_instance": gitlab_config.get("name", "unknown")}
+               "gitlab_instance": gitlab_config.get("name", "unknown"), "job_id": job_id}
+        logger.info("job %s: review MR !%s in project %s on %s", job_id,
+                    mr_data.get("mr_iid"), mr_data.get("project_id"), ctx["gitlab_instance"])
         tracker = usage.UsageTracker()
         tracker_token = usage.current_tracker.set(tracker)
         try:
             await self._process_inner(mr_data, gitlab_config, ctx)
         except gitlab_lib.exceptions.GitlabError as exc:
-            logger.error("GitLab API error: %s", exc)
+            logger.error("job %s: GitLab API error: %s", job_id, exc)
             await telegram_io.notify_error("gitlab_api_error", str(exc), ctx)
         except AIInputTooLargeError:
             await telegram_io.notify_error("ai_failure", "MR too large to analyze", ctx)
             await self._safe_note(mr_data, gitlab_config, _msg(TOO_LARGE_MSG))
         except AITimeoutError:
-            logger.error("AI analysis timed out")
+            logger.error("job %s: AI analysis timed out", job_id)
             await telegram_io.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
             await self._safe_note(mr_data, gitlab_config, _msg(TIMEOUT_MSG))
         except AIError as exc:
-            logger.error("AI analysis failed: %s", exc)
+            logger.error("job %s: AI analysis failed: %s", job_id, exc)
             await telegram_io.notify_error("ai_failure", str(exc)[:300], ctx)
             await self._safe_note(mr_data, gitlab_config,
-                                  _msg(FAILED_MSG, error=str(exc)[:300]))
+                                  _msg(GENERAL_ERROR_MSG, job_id=job_id))
         except Exception as exc:  # noqa: BLE001 — top-level pipeline guard
-            logger.exception("Error in quality check")
+            logger.exception("job %s: error in quality check", job_id)
             await telegram_io.notify_error("general", str(exc), ctx)
             await self._safe_note(mr_data, gitlab_config,
-                                  _msg(GENERAL_ERROR_MSG, error=str(exc)))
+                                  _msg(GENERAL_ERROR_MSG, job_id=job_id))
         finally:
             usage.current_tracker.reset(tracker_token)
             usage.persist(tracker, mr_data)
@@ -660,12 +672,15 @@ class Pipeline:
         if not gitlab_config:
             logger.error("No GitLab configuration found in note_data")
             return
+        job_id = note_data.setdefault("job_id", new_job_id())
+        logger.info("job %s: dialogue for note %s in MR !%s", job_id,
+                    note_data.get("note_id"), note_data.get("mr_iid"))
         tracker = usage.UsageTracker()
         tracker_token = usage.current_tracker.set(tracker)
         try:
             await self._process_note_inner(note_data, gitlab_config)
         except Exception:  # noqa: BLE001 — a failed reply must not spam the thread
-            logger.exception("dialogue failed for note %s in MR !%s",
+            logger.exception("job %s: dialogue failed for note %s in MR !%s", job_id,
                              note_data.get("note_id"), note_data.get("mr_iid"))
         finally:
             usage.current_tracker.reset(tracker_token)
@@ -782,17 +797,14 @@ class Pipeline:
             await gitlab_io.post_note(mr, comment)
             logger.info("Posted review for MR !%s", mr_data["mr_iid"])
         except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to post review comment: %s", exc)
+            job_id = mr_data.get("job_id", "?")
+            logger.error("job %s: failed to post review comment: %s", job_id, exc)
             await telegram_io.notify_error(
                 "gitlab_api_error", f"Failed to post review comment: {exc}",
                 {"project_id": mr_data["project_id"], "mr_iid": mr_data["mr_iid"],
-                 "gitlab_instance": gitlab_config["name"]})
-            error_msg = {
-                "en": f"❌ Failed to post review comment: {exc}",
-                "ru": f"❌ Не удалось опубликовать комментарий с обзором: {exc}",
-            }
+                 "gitlab_instance": gitlab_config["name"], "job_id": job_id})
             try:
-                await gitlab_io.post_note(mr, _msg(error_msg))
+                await gitlab_io.post_note(mr, _msg(POST_FAILED_MSG, job_id=job_id))
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
             return False

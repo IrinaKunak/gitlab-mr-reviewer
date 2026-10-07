@@ -164,6 +164,12 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 - **Zero prompt-cache reads are alerted**: an agent loop of >1 turn reading
   ≥`AI_CACHE_ALERT_MIN_INPUT` (100k) input with 0 cache reads logs a WARNING and sends
   one Telegram alert per review (prod !493: 677k in, 0 cached on the tool review).
+- **Exception text never reaches GitLab** (MR notes are visible to every project member,
+  the hook log to maintainers): error paths post only «Ревью не выполнено, id задачи: …»,
+  a webhook 500 returns `{"detail": "internal error", "job_id": …}`. `str(exc)` goes to
+  the log and the internal Telegram alert only. Every queued job gets a short `job_id`
+  (`ReviewQueue.submit`) that appears in its log lines (`job <id>: …`), TG alerts and
+  the error note — grep the log for the id from a user's report.
 - **Debug/usage logging must never break a review** — logs dir can be unwritable
   (bind-mount ownership); all accounting is fail-open.
 - **Translator input is wrapped in `<document>` tags** and output must contain Cyrillic,

@@ -1789,3 +1789,106 @@ def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
     assert len(alerts) == 1
     assert alerts[0][0] == "prompt_cache"
     assert "cached=0" in alerts[0][1]
+
+
+# --- error text must not leak to MR comments / HTTP responses (review #4) ---
+
+_LEAKY = "connect to http://10.0.0.5:8080/internal failed, see /srv/app/secrets.py"
+
+
+def test_review_queue_assigns_job_id():
+    async def run():
+        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0)
+        mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
+              "mr_iid": 7, "last_commit": "abc"}
+        assert queue.submit(mr) is True
+        queued = queue.queue.get_nowait()
+        assert len(queued["job_id"]) == 8
+        other = {**mr, "last_commit": "def"}
+        queue.submit(other)
+        assert other["job_id"] != queued["job_id"]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("exc_factory", [
+    lambda: RuntimeError(_LEAKY),
+    lambda: ai_mod.AIError(_LEAKY),
+])
+def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
+    from reviewer import pipeline as pipeline_mod
+
+    notes, alerts = [], []
+
+    async def fake_inner(self, mr_data, gitlab_config, ctx):
+        raise exc_factory()
+
+    async def fake_note(self, mr_data, gitlab_config, body):
+        notes.append(body)
+
+    async def fake_alert(kind, details, ctx=None):
+        alerts.append((details, ctx))
+
+    monkeypatch.setattr(pipeline_mod.Pipeline, "_process_inner", fake_inner)
+    monkeypatch.setattr(pipeline_mod.Pipeline, "_safe_note", fake_note)
+    monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
+
+    mr_data = {"project_id": 1, "mr_iid": 2, "job_id": "deadbeef",
+               "gitlab_config": {"name": "primary", "url": "https://x"}}
+    asyncio.run(pipeline_mod.Pipeline(client=object()).process(mr_data))
+    assert len(notes) == 1
+    assert "10.0.0.5" not in notes[0] and "/srv/app" not in notes[0]
+    assert "deadbeef" in notes[0]
+    # details stay available internally
+    assert _LEAKY in alerts[0][0]
+    assert alerts[0][1]["job_id"] == "deadbeef"
+
+
+def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
+    from types import SimpleNamespace
+
+    from reviewer import pipeline as pipeline_mod
+
+    posted = []
+
+    async def fake_post(mr, body):
+        if not posted:
+            posted.append(None)
+            raise RuntimeError(_LEAKY)
+        posted.append(body)
+
+    async def fake_alert(*a, **k):
+        return True
+
+    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", fake_post)
+    monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
+    mr_data = {"project_id": 1, "mr_iid": 2, "job_id": "cafe0001"}
+    ok = asyncio.run(pipeline_mod.Pipeline(client=object())._deliver_review(
+        SimpleNamespace(), mr_data, SimpleNamespace(), {"name": "primary"},
+        False, "review"))
+    assert ok is False
+    assert "10.0.0.5" not in posted[1] and "cafe0001" in posted[1]
+
+
+def test_webhook_500_hides_exception_text(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from reviewer import server
+
+    def boom(payload):
+        raise ValueError(_LEAKY)
+
+    async def fake_alert(*a, **k):
+        return True
+
+    monkeypatch.setattr(server.settings, "gitlab_instances",
+                        {"hook": {"name": "primary", "url": "https://x"}})
+    monkeypatch.setattr(server.gitlab_io, "parse_merge_request_webhook", boom)
+    monkeypatch.setattr(server.telegram_io, "notify_error", fake_alert)
+    resp = TestClient(server.app).post(
+        "/webhook", json={"object_kind": "merge_request"},
+        headers={"X-Gitlab-Token": "hook", "X-Gitlab-Event": "Merge Request Hook"})
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["detail"] == "internal error"
+    assert len(body["job_id"]) == 8
+    assert "10.0.0.5" not in resp.text and "/srv/app" not in resp.text
