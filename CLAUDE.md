@@ -82,7 +82,9 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 - **Anthropic prompt caching is OPT-IN** — the investigator's `agent_loop` sets
   `cache_control` breakpoints on the gateway path (static prefix = tools+system+diff,
   plus one rolling breakpoint on the latest tool-result turn; ≤4 per request is the
-  API limit, markers are stripped for OpenRouter which auto-caches). Without it every
+  API limit). On OpenRouter the markers are kept for `anthropic/*` (Claude does NOT
+  auto-cache there — `AI_PROVIDER=openrouter` once billed !493 1.57M input, 0 cached,
+  $6.05) and stripped only for other vendors, which auto-cache. Without it every
   iteration re-billed the whole ~180k prefix — that alone made a Sonnet-as-smart
   investigation ~2x the price of the same loop on terra.
 - A response that is only the truncation marker is retried once at 4× budget and never cached.

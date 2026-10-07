@@ -96,6 +96,22 @@ def openrouter_model(model: str, chain: list[str]) -> str:
     return chain[0] if chain else model
 
 
+def wants_cache_control(via_openrouter: bool, model: str) -> bool:
+    """Explicit cache breakpoints: always on the gateway, and on OpenRouter for
+    anthropic/* — Claude does NOT auto-cache there (only OpenAI/Gemini/DeepSeek
+    do), so stripping the markers billed every agent turn at full price
+    (!493 via AI_PROVIDER=openrouter: 1.57M input, 0 cached, $6.05)."""
+    return not via_openrouter or model.startswith("anthropic/")
+
+
+def _openrouter_messages(messages: list[dict], model: str) -> list[dict]:
+    """Messages as sent to OpenRouter: thinking blocks always dropped,
+    cache_control kept only when the head model needs explicit caching."""
+    if not wants_cache_control(True, model):
+        messages = _strip_cache_control(messages)
+    return _strip_thinking(messages)
+
+
 def _strip_cache_control(messages: list[dict]) -> list[dict]:
     """Remove cache_control markers before sending to OpenRouter — cross-vendor
     models auto-cache and may reject Anthropic-specific block fields."""
@@ -560,7 +576,8 @@ class AIClient:
         # ahead of it): every iteration re-sends it, so without this the whole
         # investigation is billed at full input price on each turn
         first_turn: dict = {"type": "text", "text": user_content}
-        if not via_openrouter:
+        use_cache_control = wants_cache_control(via_openrouter, model)
+        if use_cache_control:
             first_turn["cache_control"] = dict(CACHE_CONTROL)
         messages: list[dict] = [{"role": "user", "content": [first_turn]}]
         rolling_cache: dict | None = None  # ≤4 breakpoints/request: keep one
@@ -575,7 +592,7 @@ class AIClient:
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
                     raise AIError("OpenRouter routing requires OPENROUTER_API_TOKEN")
                 request = {"model": model, "system": system,
-                           "messages": _strip_thinking(_strip_cache_control(messages)),
+                           "messages": _openrouter_messages(messages, model),
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": _routing_chain(
                                model, self.cfg.fallback_chain(tier))}}
@@ -601,7 +618,7 @@ class AIClient:
                     raise self._wrap(exc)
                 chain = _routing_chain("", self.cfg.fallback_chain(tier))
                 request = {"model": chain[0], "system": system,
-                           "messages": _strip_thinking(_strip_cache_control(messages)),
+                           "messages": _openrouter_messages(messages, chain[0]),
                            "max_tokens": max_tokens, "tools": api_tools,
                            "extra_body": {"models": chain}}
                 try:
@@ -653,7 +670,7 @@ class AIClient:
                         output, is_error = f"Tool error: {exc}", True
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(output)[:60_000], "is_error": is_error})
-            if results and not via_openrouter:
+            if results and use_cache_control:
                 # roll the second breakpoint forward so each turn also reads the
                 # growing history; drop the previous one (max 4 per request)
                 if rolling_cache is not None:

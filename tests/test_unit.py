@@ -498,6 +498,65 @@ def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
     assert stripped[0]["content"][0]["text"] == "big diff"  # content preserved
 
 
+def test_openrouter_agent_loop_keeps_cache_control_for_claude(tmp_path, monkeypatch):
+    # regression: AI_PROVIDER=openrouter stripped cache_control everywhere, but
+    # Claude does not auto-cache on OpenRouter — !493 billed 1.57M input tokens
+    # with 0 cached ($6.05). anthropic/* keeps the markers; others still strip.
+    import asyncio
+    from types import SimpleNamespace
+    from reviewer.ai_client import ToolDef
+
+    def run(head_model):
+        cfg = Settings()
+        cfg.ai_provider = "openrouter"
+        cfg.ai_cache_dir = str(tmp_path)
+        cfg.ai_rate_limit = 0
+        cfg.model_smart = "claude-opus-5"
+        cfg.fallback_smart = [head_model, "moonshotai/kimi-k3"]
+        monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
+                            lambda tier, c: c.model_for_tier(tier))
+        client = AIClient(cfg)
+        sent: list[dict] = []
+        turns = iter(["tool_use", "end_turn"])
+
+        async def fake_create(**kwargs):
+            sent.append(kwargs)
+            if next(turns) == "tool_use":
+                return SimpleNamespace(
+                    stop_reason="tool_use", model=head_model,
+                    content=[SimpleNamespace(type="tool_use", id="t1", name="t", input={})],
+                    usage=SimpleNamespace(input_tokens=5, output_tokens=5))
+            return SimpleNamespace(
+                stop_reason="end_turn", model=head_model,
+                content=[SimpleNamespace(type="text", text="done")],
+                usage=SimpleNamespace(input_tokens=5, output_tokens=5))
+
+        stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+        stub.with_options = lambda **kw: stub
+        client._fallback = stub
+
+        async def handler(**kw):
+            return "tool output"
+
+        asyncio.run(client.agent_loop(
+            "smart", "sys", "big diff", [ToolDef("t", "d", {}, handler)],
+            max_iterations=5))
+        return sent
+
+    def breakpoints(messages):
+        return [b for m in messages for b in m["content"]
+                if isinstance(b, dict) and "cache_control" in b]
+
+    claude = run("anthropic/claude-sonnet-5.5")
+    assert all(req["model"] == "anthropic/claude-sonnet-5.5" for req in claude)
+    assert claude[0]["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert len(breakpoints(claude[-1]["messages"])) == 2  # prefix + rolling turn
+
+    other = run("openai/gpt-5.6-terra")
+    assert all(breakpoints(req["messages"]) == [] for req in other)
+    assert ai_mod.wants_cache_control(False, "claude-sonnet-5-5") is True
+
+
 def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     # regression: gpt-5.6-terra via OpenRouter reported →9 input tokens on a
     # 3-iteration investigation (prod 2026-07-23) — wire-format input_tokens
