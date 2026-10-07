@@ -202,10 +202,22 @@ Key groups (see `.env.example` for the full annotated list):
 ## Development
 
 ```bash
+uv sync                                  # runtime + dev deps, exact versions from uv.lock
 source .venv/bin/activate
 .venv/bin/python -m pytest tests/ -q     # offline, no API keys needed — keep it green
+.venv/bin/ruff check                     # lint (rules in pyproject.toml)
+(.venv/bin/mypy || true) | .venv/bin/mypy-baseline filter   # fails only on NEW errors
 DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
 ```
+
+- Dependencies live in `pyproject.toml` (ranges) + `uv.lock` (exact pins); there is no
+  `requirements.txt`. Add a dep with `uv add <pkg>` (dev: `uv add --group dev <pkg>`) and
+  commit the lock — the image runs `uv sync --frozen`, so a stale lock fails the build.
+- mypy is non-strict; pre-existing errors are in `mypy-baseline.txt`. Fixing one →
+  `mypy | mypy-baseline sync` to shrink the baseline. Never sync to hide a new error.
+- CI: `.github/workflows/ci.yml` (origin is GitHub) runs ruff, mypy-baseline, pytest on
+  Python 3.12 for pushes to `v2`/`master` and PRs. Note the `(mypy || true) |` form:
+  Actions' bash has pipefail and mypy exits 1 while the baseline is non-empty.
 
 Every bug fix gets a regression test in `tests/test_unit.py`. When checking pytest results
 in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.

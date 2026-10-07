@@ -1,0 +1,6 @@
+reviewer/repo_cache.py:0: error: Argument 1 to "Popen" has incompatible type "list[str | None]"; expected "str | bytes | PathLike[str] | PathLike[bytes] | Sequence[str | bytes | PathLike[str] | PathLike[bytes]]"  [arg-type]
+reviewer/ai_client.py:0: error: Argument 1 to "_call" of "AIClient" has incompatible type "AsyncAnthropic | None"; expected "AsyncAnthropic"  [arg-type]
+reviewer/pipeline.py:0: error: Argument 1 to "to_thread" has incompatible type "Callable[[], dict[str, Any] | Response]"; expected "Callable[[], dict[str, Any]]"  [arg-type]
+reviewer/pipeline.py:0: error: Incompatible return value type (got "dict[str, Any] | Response", expected "dict[str, Any]")  [return-value]
+reviewer/pipeline.py:0: error: Argument 3 to "to_thread" has incompatible type "Any | None"; expected "str"  [arg-type]
+reviewer/pipeline.py:0: error: Argument 1 to "extract_diff_only" has incompatible type "dict[str, Any] | Response"; expected "dict[str, Any]"  [arg-type]

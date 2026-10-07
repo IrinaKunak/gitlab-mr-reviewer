@@ -45,6 +45,10 @@ include = ["reviewer/**/*.py", "tests/**/*.py", "w-server.py",
 # pyflakes + pycodestyle errors (ruff defaults), import order, pyupgrade, bugbear
 select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+# tests build stubs inside loops and call them within the same iteration
+"tests/**" = ["B023"]
+
 [tool.mypy]
 # non-strict for now (strict typing is stage 21); existing errors live in
 # mypy-baseline.txt and CI fails only on NEW ones: mypy | mypy-baseline filter

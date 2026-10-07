@@ -298,7 +298,7 @@ async def set_models(request: Request) -> dict[str, Any]:
     try:
         body = await request.json()
     except ValueError:
-        raise HTTPException(status_code=400, detail="invalid JSON body")
+        raise HTTPException(status_code=400, detail="invalid JSON body") from None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="expected an object")
     saved = overrides.save(body)
@@ -322,7 +322,7 @@ async def handle_gitlab_webhook(request: Request):
     except json.JSONDecodeError:
         logger.error("Invalid JSON in webhook payload")
         await telegram_io.notify_error("webhook_error", "Invalid JSON in webhook payload")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
 
     if event_type == "Note Hook":
         if not settings.dialogue_enabled:

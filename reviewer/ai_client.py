@@ -508,7 +508,7 @@ class AIClient:
                 result = self._to_result(response, "gateway")
         except _RETRYABLE + (anthropic.APIStatusError,) as exc:
             if not _should_fallback(exc):
-                raise self._wrap(exc)
+                raise self._wrap(exc) from exc
             logger.warning("primary failed (%s) -> openrouter fallback", type(exc).__name__)
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout, cause=exc)
@@ -656,13 +656,13 @@ class AIClient:
             except _RETRYABLE + (anthropic.APIStatusError,) as exc:
                 if not _should_fallback(exc):
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise self._wrap(exc)
+                    raise self._wrap(exc) from exc
                 logger.warning("agent_loop primary failed (%s), trying openrouter",
                                type(exc).__name__)
                 client = self.fallback
                 if client is None:
                     self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise self._wrap(exc)
+                    raise self._wrap(exc) from exc
                 chain = _routing_chain("", self.cfg.fallback_chain(tier))
                 request = {"model": chain[0], "system": system,
                            "messages": _openrouter_messages(messages, chain[0]),

@@ -207,8 +207,9 @@ def test_webhook_endpoint() -> bool:
             proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
         elif SOCKS_PROXY:
             try:
-                import socks
-                import urllib3.contrib.socks
+                # availability check only: requests needs both for socks5:// proxies
+                import socks  # noqa: F401
+                import urllib3.contrib.socks  # noqa: F401
 
                 proxy_host, proxy_port = SOCKS_PROXY.split(":")
                 proxies = {

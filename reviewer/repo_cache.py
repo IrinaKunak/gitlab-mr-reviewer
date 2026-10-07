@@ -190,7 +190,7 @@ class RepoCache:
                 sized.append((last_used, size, repo))
             if total <= self.max_bytes:
                 return
-            for last_used, size, repo in sorted(sized):
+            for _last_used, size, repo in sorted(sized):
                 logger.info("Evicting repo cache entry %s (%.1f MB)", repo, size / 1e6)
                 shutil.rmtree(repo, ignore_errors=True)
                 total -= size

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [v2, master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"  # same as the Docker image
+      - name: Install deps (exact versions from uv.lock)
+        run: uv sync --frozen
+      # repo tools degrade without these, but then their tests are skipped
+      - name: Install ripgrep and universal-ctags
+        run: sudo apt-get update && sudo apt-get install -y ripgrep universal-ctags
+      - name: ruff
+        run: uv run ruff check
+      - name: mypy (new errors only; old ones are in mypy-baseline.txt)
+        # mypy exits 1 while the baseline is non-empty; the filter decides
+        run: (uv run mypy || true) | uv run mypy-baseline filter
+      - name: pytest
+        run: uv run pytest tests/ -q
