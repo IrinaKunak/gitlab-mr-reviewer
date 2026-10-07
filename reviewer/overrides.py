@@ -1,7 +1,7 @@
 """Runtime per-tier model overrides, set from the dashboard admin panel.
 
 Defaults come from .env (ANTHROPIC_FAST/MAIN/SMART_MODEL); an override set
-here wins until cleared. Persisted to a JSON file on the cache volume so it
+here wins until cleared. Persisted to a JSON file on the state volume so it
 survives container restarts. A vendor-prefixed override (contains "/", e.g.
 openai/gpt-5.6-terra) is routed via OpenRouter by the AI client; plain
 claude-* ids keep using the CF gateway.
@@ -24,7 +24,7 @@ _cache: dict[str, str] | None = None
 
 
 def _path() -> Path:
-    return Path(settings.ai_cache_dir) / "model_overrides.json"
+    return Path(settings.state_dir) / "model_overrides.json"
 
 
 def load() -> dict[str, str]:

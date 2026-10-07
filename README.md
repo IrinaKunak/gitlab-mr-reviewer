@@ -39,9 +39,9 @@ Operational guidance for AI-assisted development: `CLAUDE.md`.
 ```bash
 git clone <your-repo-url> && cd gitlab-mr-reviewer
 cp .env.example .env      # fill in GitLab tokens, Anthropic/gateway keys, Telegram
-mkdir -p logs cache repos
+mkdir -p logs cache state repos
 docker compose up -d --build
-sudo chown -R 999:999 logs cache repos   # container runs as uid 999 (appuser)
+sudo chown -R 999:999 logs cache state repos   # container runs as uid 999 (appuser)
 curl http://localhost:5000/              # health + feature flags
 ```
 
@@ -103,7 +103,7 @@ Testing utilities: `test_webhooks.py` (create test MRs in the configured test re
 ## 🧯 Troubleshooting
 
 - **`Errno 13 Permission denied` on logs/cache/repos** — the bind-mounted volumes must
-  be writable by uid 999: `sudo chown -R 999:999 logs cache repos`
+  be writable by uid 999: `sudo chown -R 999:999 logs cache state repos`
 - **Review posted but empty / marker only** — check `logs/ai-debug.log` with
   `AI_DEBUG=true`; the client retries no-text responses automatically
 - **Bridge questions unanswered** — the bot must be a member of the bridge group with

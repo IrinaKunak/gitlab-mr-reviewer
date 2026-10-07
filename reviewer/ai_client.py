@@ -29,7 +29,7 @@ from typing import Any, Awaitable, Callable
 import anthropic
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
-from . import overrides, usage
+from . import overrides, telegram_io, usage
 from .config import Settings, settings as default_settings
 
 logger = logging.getLogger(__name__)
@@ -211,9 +211,28 @@ def extract_json(text: str) -> dict | None:
     return None
 
 
+CACHE_KEY_RE = re.compile(r"[0-9a-f]{64}")  # _cache_key output: sha256 hexdigest
+
+
+def prompt_cache_broken(iterations: int, input_tokens: int, cache_read: int,
+                        cache_creation: int, min_input: int) -> bool:
+    """A multi-turn agent loop that read a big prompt with zero cache reads.
+
+    Turn 1 can only create the cache, so single-turn loops never qualify.
+    Every later turn re-sends the whole prefix — 0 reads there means each
+    iteration was billed at full input price (!493: 677k in, 0 cached).
+    """
+    total = input_tokens + cache_read + cache_creation
+    return min_input > 0 and iterations > 1 and total >= min_input and cache_read == 0
+
+
+AlertFn = Callable[[str, str], Awaitable[Any]]
+
+
 class AIClient:
-    def __init__(self, cfg: Settings | None = None):
+    def __init__(self, cfg: Settings | None = None, alert: AlertFn | None = None):
         self.cfg = cfg or default_settings
+        self._alert = alert  # (error_type, details) -> ops notification; None = log only
         self._rate_lock = asyncio.Lock()
         self._last_call = 0.0
         self._cache_dir = Path(self.cfg.ai_cache_dir)
@@ -285,6 +304,28 @@ class AIClient:
                          input_tokens=total_in, output_tokens=total_out,
                          cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
+    async def _check_prompt_cache(self, tier: str, model: str, provider: str,
+                                  iterations: int, total_in: int,
+                                  total_cr: int, total_cc: int) -> None:
+        """Warn (and alert once per review) when an agent loop paid full price
+        for every turn. Fail-open: monitoring must never break a review."""
+        if not prompt_cache_broken(iterations, total_in, total_cr, total_cc,
+                                   self.cfg.ai_cache_alert_min_input):
+            return
+        details = (f"{tier} tier, {model} via {provider}: {iterations} turns, "
+                   f"in={total_in + total_cc} cached=0 — every turn re-billed the "
+                   f"full prompt. Check the tier's model override / AI_PROVIDER.")
+        logger.warning("prompt cache miss: %s", details)
+        tracker = usage.current_tracker.get()
+        if self._alert is None or (tracker is not None and tracker.cache_alerted):
+            return
+        if tracker is not None:
+            tracker.cache_alerted = True
+        try:
+            await self._alert("prompt_cache", details)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("prompt cache alert not sent: %s", exc)
+
     def _primary_params(self, tier: str, effort: str | None, model: str = "") -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
         params: dict[str, Any] = {}
@@ -348,10 +389,14 @@ class AIClient:
             logger.warning("cache write failed: %s", exc)
 
     def _cleanup_cache(self, max_age_hours: int = 48) -> None:
+        # only our own sha256-named entries: the sweep once shared a dir with
+        # model_overrides.json / reviewed_shas.json and deleted them after 48h
+        # idle, silently reverting dashboard overrides on the next restart
         cutoff = time.time() - max_age_hours * 3600
         try:
             for entry in self._cache_dir.iterdir():
-                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                if (entry.is_file() and CACHE_KEY_RE.fullmatch(entry.name)
+                        and entry.stat().st_mtime < cutoff):
                     entry.unlink(missing_ok=True)
         except OSError:
             pass
@@ -649,6 +694,8 @@ class AIClient:
                 logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
                             iteration + 1, response.stop_reason, total_in, total_out)
                 self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
+                await self._check_prompt_cache(tier, model, provider, iteration + 1,
+                                               total_in, total_cr, total_cc)
                 return AIResult(text=last_text.strip(), model=model, provider=provider,
                                 input_tokens=total_in, output_tokens=total_out,
                                 cache_read_tokens=total_cr,
@@ -681,9 +728,11 @@ class AIClient:
 
         logger.warning("agent_loop hit max_iterations=%d", max_iterations)
         self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
+        await self._check_prompt_cache(tier, model, provider, max_iterations,
+                                       total_in, total_cr, total_cc)
         return AIResult(text=last_text.strip(), model=model, provider=provider,
                         input_tokens=total_in, output_tokens=total_out,
                         cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
 
-ai_client = AIClient()
+ai_client = AIClient(alert=telegram_io.notify_error)

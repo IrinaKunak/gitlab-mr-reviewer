@@ -5,6 +5,7 @@
 temp/
 cache/
 repos/
+state/
 logs/
 
 # Mac

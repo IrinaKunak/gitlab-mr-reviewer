@@ -3,7 +3,7 @@
 Lets the dashboard offer ANY OpenRouter model as a tier override (not just the
 curated MODEL_PRICES list) and prices unknown models correctly for the cost
 stats. The catalog is fetched from the public /models endpoint, cached to the
-cache volume with a TTL, and read fail-open: no network / bad response just
+state volume with a TTL, and read fail-open: no network / bad response just
 means the curated list and $0-for-unknown behavior, never a broken review.
 
 Pricing hot path (usage.cost_usd) only ever READS the cache — it never triggers
@@ -32,7 +32,7 @@ _fetched_at = 0.0
 
 
 def _path() -> Path:
-    return Path(settings.ai_cache_dir) / "openrouter_models.json"
+    return Path(settings.state_dir) / "openrouter_models.json"
 
 
 def _parse(data: dict) -> dict[str, tuple[float, float]]:

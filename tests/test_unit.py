@@ -397,7 +397,7 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     from reviewer import openrouter_models, usage
     from reviewer.config import settings
 
-    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
     monkeypatch.setattr(openrouter_models, "_cache", None)
     monkeypatch.setattr(openrouter_models, "_fetched_at", 0.0)
 
@@ -634,7 +634,7 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     from reviewer import overrides
     from reviewer.config import settings as live_settings
 
-    monkeypatch.setattr(live_settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(live_settings, "state_dir", str(tmp_path))
     monkeypatch.setattr(overrides, "_cache", None)
 
     cfg = Settings()
@@ -830,7 +830,7 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
     from reviewer import review_state
     from reviewer.config import settings
 
-    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
     monkeypatch.setattr(review_state, "_cache", None)  # drop module-level cache
 
     assert review_state.get_last_sha("primary", 1, 2) is None
@@ -1665,3 +1665,127 @@ def test_symbol_index_lookup(tmp_path, monkeypatch):
     rc.clear_symbol_index(tmp_path)
     assert "unavailable" in rc.repo_find_symbol(tmp_path, "LeadSerializer")
     rc.clear_symbol_index(tmp_path)
+
+
+def test_cache_sweep_spares_state_files(tmp_path):
+    # regression (prod 2026-10): the 48h AI-cache sweep shared cache/ with the
+    # state files and deleted model_overrides.json / reviewed_shas.json, so
+    # dashboard overrides silently reverted on the next restart
+    import os
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    client = AIClient(cfg)
+    old = time.time() - 72 * 3600
+    stale_entry = tmp_path / ("a" * 64)
+    fresh_entry = tmp_path / ("b" * 64)
+    state_file = tmp_path / "model_overrides.json"
+    for path in (stale_entry, fresh_entry, state_file):
+        path.write_text("x", encoding="utf-8")
+    for path in (stale_entry, state_file):
+        os.utime(path, (old, old))
+    client._cleanup_cache()
+    assert not stale_entry.exists()  # expired cache entry swept
+    assert fresh_entry.exists()
+    assert state_file.exists()  # non-cache files are never touched
+
+
+def test_state_files_live_outside_ai_cache_dir(tmp_path, monkeypatch):
+    from reviewer import openrouter_models, overrides, review_state
+    from reviewer.config import settings
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
+    for mod in (overrides, review_state, openrouter_models):
+        assert mod._path().parent == tmp_path / "state"
+    assert Settings().ai_cache_dir != Settings().state_dir
+
+
+def test_state_migration_moves_legacy_files(tmp_path):
+    from reviewer import state_layout
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path / "cache" / "ai")
+    cfg.state_dir = str(tmp_path / "state")
+    legacy = tmp_path / "cache"
+    legacy.mkdir()
+    (legacy / "model_overrides.json").write_text('{"smart": "openai/x"}', encoding="utf-8")
+    (legacy / "reviewed_shas.json").write_text('{"k": "old"}', encoding="utf-8")
+    (legacy / ("c" * 64)).write_text("orphaned cache entry", encoding="utf-8")
+    (legacy / "notes.txt").write_text("unrelated", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "reviewed_shas.json").write_text('{"k": "new"}', encoding="utf-8")
+
+    moved = state_layout.migrate(cfg)
+
+    assert moved == ["model_overrides.json"]
+    assert (state / "model_overrides.json").read_text(encoding="utf-8") == '{"smart": "openai/x"}'
+    assert not (legacy / "model_overrides.json").exists()
+    # an existing state file always wins — the legacy copy is left alone
+    assert (state / "reviewed_shas.json").read_text(encoding="utf-8") == '{"k": "new"}'
+    assert (legacy / "reviewed_shas.json").exists()
+    assert not (legacy / ("c" * 64)).exists()  # old-root cache entry dropped
+    assert (legacy / "notes.txt").exists()
+    assert state_layout.migrate(cfg) == []  # idempotent
+
+
+def test_prompt_cache_broken_rule():
+    from reviewer.ai_client import prompt_cache_broken
+    assert prompt_cache_broken(3, 677_000, 0, 0, 100_000)  # !493 tool review
+    assert not prompt_cache_broken(1, 677_000, 0, 0, 100_000)  # turn 1 only creates
+    assert not prompt_cache_broken(3, 50_000, 0, 0, 100_000)  # small prompt
+    assert not prompt_cache_broken(3, 20_000, 600_000, 60_000, 100_000)  # cache works
+    assert not prompt_cache_broken(3, 677_000, 0, 0, 0)  # disabled
+
+
+def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from reviewer import usage
+    from reviewer.ai_client import ToolDef
+
+    cfg = Settings()
+    cfg.ai_cache_dir = str(tmp_path)
+    cfg.ai_rate_limit = 0
+    cfg.ai_cache_alert_min_input = 1000
+    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
+                        lambda tier, c: c.model_for_tier(tier))
+    alerts: list[tuple[str, str]] = []
+
+    async def alert(kind, details):
+        alerts.append((kind, details))
+
+    client = AIClient(cfg, alert=alert)
+
+    def make_stub():
+        turns = iter(["tool_use", "end_turn"])
+
+        async def fake_create(**kwargs):
+            if next(turns) == "tool_use":
+                return SimpleNamespace(
+                    stop_reason="tool_use", model="m",
+                    content=[SimpleNamespace(type="tool_use", id="t1", name="t", input={})],
+                    usage=SimpleNamespace(input_tokens=900, output_tokens=5))
+            return SimpleNamespace(
+                stop_reason="end_turn", model="m",
+                content=[SimpleNamespace(type="text", text="done")],
+                usage=SimpleNamespace(input_tokens=900, output_tokens=5))
+
+        stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+        stub.with_options = lambda **kw: stub
+        return stub
+
+    async def handler(**kw):
+        return "out"
+
+    async def review():
+        token = usage.current_tracker.set(usage.UsageTracker())
+        try:
+            for _ in range(2):  # tool review + investigator in one review
+                client._primary = make_stub()
+                await client.agent_loop("main", "sys", "diff",
+                                        [ToolDef("t", "d", {}, handler)], max_iterations=5)
+        finally:
+            usage.current_tracker.reset(token)
+
+    asyncio.run(review())
+    assert len(alerts) == 1
+    assert alerts[0][0] == "prompt_cache"
+    assert "cached=0" in alerts[0][1]

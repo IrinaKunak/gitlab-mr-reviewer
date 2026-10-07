@@ -92,7 +92,7 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   cross-vendor: gemini-3.5-flash-lite / gemini-3.6-flash / gpt-5.6-terra / kimi-k3 /
   deepseek. `anthropic/*` via OpenRouter hits the same upstream — cross-vendor entries
   are the real availability hedge.
-- **Runtime per-tier overrides** (dashboard → `cache/model_overrides.json`): a plain
+- **Runtime per-tier overrides** (dashboard → `state/model_overrides.json`): a plain
   `claude-*` id routes via the CF gateway; anything with a `/` (`openai/…`, `google/…`)
   routes via OpenRouter with the tier's fallback chain behind it. The dashboard offers
   the **entire** OpenRouter catalog (`reviewer/openrouter_models.py`, `GET /models`,
@@ -127,7 +127,7 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   old remarks every push): first review = whole diff; later pushes review only the
   `repository_compare(prev_sha, head_sha)` delta with `INCREMENTAL_REVIEW_NOTE`
   (unfixed earlier findings = author's decision); same-sha events (title/label edits)
-  are skipped entirely. State: `cache/reviewed_shas.json` (`review_state.py`,
+  are skipped entirely. State: `state/reviewed_shas.json` (`review_state.py`,
   bounded, fail-open → full review). A `re-review` label / `[re-review]` title marker
   forces a full fresh review (bypasses dedupe too — the label event's sha is one the
   TTL window would swallow). Infra MRs still need `[no-review]` in the title
@@ -155,6 +155,15 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
   the thread).
 - **Translation tier is length-routed**: >3500 chars goes to main tier — Haiku left
   long reviews half-English mid-sentence.
+- **Cache and state live in separate dirs** (prod bug 2026-10: the AI cache's 48h sweep
+  shared `cache/` with the state files and deleted `model_overrides.json` /
+  `reviewed_shas.json` — overrides silently reverted on restart). `AI_CACHE_DIR`
+  (`cache/ai`) is disposable and the sweep only touches sha256-named entries;
+  `STATE_DIR` (`state/`) is durable. `state_layout.migrate` moves legacy files at
+  startup (idempotent, an existing file in `state/` wins).
+- **Zero prompt-cache reads are alerted**: an agent loop of >1 turn reading
+  ≥`AI_CACHE_ALERT_MIN_INPUT` (100k) input with 0 cache reads logs a WARNING and sends
+  one Telegram alert per review (prod !493: 677k in, 0 cached on the tool review).
 - **Debug/usage logging must never break a review** — logs dir can be unwritable
   (bind-mount ownership); all accounting is fail-open.
 - **Translator input is wrapped in `<document>` tags** and output must contain Cyrillic,
@@ -203,8 +212,11 @@ git pull && docker compose up -d --build
 
 - Image is `python:3.12-slim` based — **no Node/Gemini CLI**. Full v1 rollback = deploy master.
 - Compose binds `127.0.0.1:5000` — public access only via the reverse proxy (Caddy, TLS).
-- Volumes `./logs ./cache ./repos` must be writable by the container user (`useradd -r`
-  → UID 999): `sudo chown -R 999:999 logs cache repos` on first deploy.
+- Volumes `./logs ./cache ./state ./repos` must be writable by the container user (`useradd -r`
+  → UID 999): `sudo chown -R 999:999 logs cache state repos` on first deploy. `state/`
+  is new (2026-10): on an existing host run `mkdir -p state && sudo chown 999:999 state`
+  BEFORE the first deploy with it, or docker creates it root-owned and state stops
+  persisting (startup logs `STATE_DIR ... is not writable`).
 - `.env` is mounted read-only; it is NOT in git (secrets) — transfer it manually.
 - The Telegram bot token is polled exclusively by this service (bridge listener) — nothing
   else may call `getUpdates` on it; the bot needs group privacy disabled (done) and must be

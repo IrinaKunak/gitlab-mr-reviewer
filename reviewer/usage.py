@@ -103,6 +103,7 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int,
 @dataclass
 class UsageTracker:
     calls: list[dict] = field(default_factory=list)
+    cache_alerted: bool = False  # one prompt-cache alert per review, not per loop
 
     def record(self, *, tier: str, model: str, provider: str,
                input_tokens: int, output_tokens: int,

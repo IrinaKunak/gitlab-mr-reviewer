@@ -3,7 +3,7 @@
 On the first review of an MR the whole diff is reviewed; on subsequent pushes
 only the delta since the last reviewed SHA is (developer feedback 2026-07-23:
 full re-reviews rehashed remarks about earlier commits on every push).
-Persisted to the cache volume; bounded; fail-open — losing state just means
+Persisted to the state volume; bounded; fail-open — losing state just means
 the next review is a full one.
 """
 
@@ -24,7 +24,7 @@ _cache: dict[str, str] | None = None
 
 
 def _path() -> Path:
-    return Path(settings.ai_cache_dir) / "reviewed_shas.json"
+    return Path(settings.state_dir) / "reviewed_shas.json"
 
 
 def _key(instance: str, project_id, mr_iid) -> str:

@@ -29,10 +29,11 @@ COPY reviewer/ ./reviewer/
 COPY w-server.py gemini-wrapper.sh ./
 RUN chmod +x gemini-wrapper.sh
 
-RUN mkdir -p /app/logs /app/cache /app/repos && \
+RUN mkdir -p /app/logs /app/cache/ai /app/state /app/repos && \
     chown -R appuser:appuser /app /home/appuser
 
-ENV AI_CACHE_DIR=/app/cache \
+ENV AI_CACHE_DIR=/app/cache/ai \
+    STATE_DIR=/app/state \
     AI_LOG_DIR=/app/logs \
     REPO_CACHE_DIR=/app/repos
 

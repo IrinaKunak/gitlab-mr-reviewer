@@ -23,7 +23,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from . import __version__, gitlab_io, openrouter_models, overrides, telegram_io, usage
+from . import (__version__, gitlab_io, openrouter_models, overrides, state_layout,
+               telegram_io, usage)
 from .bridge import bridge
 from .config import settings
 from .pipeline import pipeline
@@ -169,6 +170,7 @@ async def lifespan(app: FastAPI):
                      "this rollback path requires the v1 Docker image (master branch)")
     if settings.proxy_url:
         logger.info("Proxy: %s", settings.proxy_url)
+    state_layout.migrate(settings)  # before anything reads overrides/review state
     await review_queue.start()
     await bridge.start()
     verify_task = asyncio.create_task(_verify_instances())

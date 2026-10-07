@@ -95,12 +95,14 @@ _ERROR_TITLES = {
         "gitlab_api_error": "Ошибка GitLab API",
         "webhook_error": "Ошибка обработки webhook",
         "timeout": "Превышено время ожидания", "general": "Общая ошибка",
+        "prompt_cache": "Промпт-кэш не работает",
     },
     "en": {
         "ai_failure": "AI Error", "gemini_failure": "AI Error",
         "gitlab_api_error": "GitLab API Error",
         "webhook_error": "Webhook Processing Error",
         "timeout": "Timeout Error", "general": "General Error",
+        "prompt_cache": "Prompt cache miss",
     },
 }
 

@@ -86,8 +86,17 @@ class Settings:
 
     # --- AI behavior (legacy GEMINI_* read as fallback) ---
     ai_cache_ttl: int = field(default_factory=lambda: _int("AI_CACHE_TTL", 3600, "GEMINI_CACHE_TTL"))
+    # disposable response cache — swept by age. Durable state (overrides,
+    # reviewed SHAs, model catalog) lives in STATE_DIR: sharing one dir let the
+    # 48h sweep delete model_overrides.json and reviewed_shas.json
     ai_cache_dir: str = field(default_factory=lambda: os.getenv(
-        "AI_CACHE_DIR", os.getenv("GEMINI_CACHE_DIR", "cache")))
+        "AI_CACHE_DIR", os.getenv("GEMINI_CACHE_DIR", "cache/ai")))
+    state_dir: str = field(default_factory=lambda: os.getenv("STATE_DIR", "state"))
+    # agent loops reading at least this many input tokens with zero cache reads
+    # get a WARNING + Telegram alert (0 disables): a silently broken prompt
+    # cache re-bills the whole prefix every turn
+    ai_cache_alert_min_input: int = field(default_factory=lambda: _int(
+        "AI_CACHE_ALERT_MIN_INPUT", 100_000))
     ai_timeout: int = field(default_factory=lambda: _int("AI_TIMEOUT", 300, "GEMINI_TIMEOUT"))
     ai_agent_timeout: int = field(default_factory=lambda: _int("AI_AGENT_TIMEOUT", 600))
     ai_rate_limit: float = field(default_factory=lambda: _float(
