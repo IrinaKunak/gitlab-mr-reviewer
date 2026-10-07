@@ -18,7 +18,6 @@ from reviewer.config import Settings
 from reviewer.repo_cache import _safe_path, repo_grep, repo_list_tree, repo_read_file
 from reviewer.server import ReviewQueue
 
-
 # --- config ---
 
 def test_proxy_precedence(monkeypatch):
@@ -127,6 +126,7 @@ def test_truncated_empty_response_retries_with_larger_budget(tmp_path):
     # diff -> zero text blocks -> a junk marker-only comment was posted AND cached
     import asyncio
     from types import SimpleNamespace
+
     from reviewer.ai_client import TRUNCATION_MARKER
 
     cfg = Settings()
@@ -442,6 +442,7 @@ def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
     # cost ~2x more on the CF gateway than on auto-caching OpenRouter models)
     import asyncio
     from types import SimpleNamespace
+
     from reviewer.ai_client import ToolDef
 
     cfg = Settings()
@@ -504,6 +505,7 @@ def test_openrouter_agent_loop_keeps_cache_control_for_claude(tmp_path, monkeypa
     # with 0 cached ($6.05). anthropic/* keeps the markers; others still strip.
     import asyncio
     from types import SimpleNamespace
+
     from reviewer.ai_client import ToolDef
 
     def run(head_model):
@@ -564,6 +566,7 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     # prompt in cache_read_input_tokens, which we silently dropped
     import asyncio
     from types import SimpleNamespace
+
     from reviewer import usage
     from reviewer.ai_client import ToolDef
 
@@ -631,6 +634,7 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     # vendor-prefixed overrides must route via OpenRouter, claude-* via gateway
     import asyncio
     from types import SimpleNamespace
+
     from reviewer import overrides
     from reviewer.config import settings as live_settings
 
@@ -667,6 +671,7 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
 
 def test_basic_auth(monkeypatch):
     import base64
+
     from reviewer.config import settings
     from reviewer.server import basic_auth_ok, stats_access_allowed
 
@@ -705,6 +710,7 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
     # that hit max_iterations or died mid-loop vanished from the stats
     import asyncio
     from types import SimpleNamespace
+
     from reviewer import usage
     from reviewer.ai_client import AIClient
 
@@ -777,6 +783,7 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     # ("you haven't provided a markdown document") and it was posted as the review
     import asyncio
     from types import SimpleNamespace
+
     from reviewer.config import settings
     from reviewer.pipeline import Pipeline
 
@@ -803,6 +810,7 @@ def test_process_skips_merged_or_closed_mr(monkeypatch):
     # (push fix -> merge on green); the worker must not review it then
     import asyncio
     from types import SimpleNamespace
+
     from reviewer import pipeline as pipeline_mod
 
     for state in ("merged", "closed"):
@@ -854,6 +862,7 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
 def test_incremental_review_helpers():
     # prompt contract for the anti-pedantry overhaul (dev feedback 2026-07-23)
     from types import SimpleNamespace
+
     from reviewer import prompts
 
     assert "## Verdict" in prompts.REVIEW_SYSTEM
@@ -1042,6 +1051,7 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
     # texts over the threshold must route to the main tier
     import asyncio
     from types import SimpleNamespace
+
     from reviewer.config import settings
     from reviewer.pipeline import Pipeline
 
@@ -1064,6 +1074,7 @@ def test_process_skips_already_reviewed_sha(monkeypatch):
     # head sha we already reviewed — must skip before any notify/AI spend
     import asyncio
     from types import SimpleNamespace
+
     from reviewer import pipeline as pipeline_mod
     from reviewer import review_state
 
@@ -1109,6 +1120,7 @@ def test_review_content_handles_collapsed_diffs():
     # regression: GitLab returns empty diffs for collapsed (too large) files —
     # exactly the biggest files silently vanished from the review (MR !18)
     from types import SimpleNamespace
+
     from reviewer import gitlab_io
 
     class _File:
@@ -1425,6 +1437,7 @@ def test_dialogue_answers_in_thread(monkeypatch):
     # "Пусть сам подтверждает" — the bot answers a dev's reply, checking the
     # repo itself; NO_REPLY suppresses the answer; budget caps runaway threads
     from types import SimpleNamespace
+
     from reviewer import pipeline as pipeline_mod
     from reviewer.ai_client import AIResult
     from reviewer.config import settings
@@ -1742,6 +1755,7 @@ def test_prompt_cache_broken_rule():
 
 def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
     from reviewer import usage
     from reviewer.ai_client import ToolDef
 

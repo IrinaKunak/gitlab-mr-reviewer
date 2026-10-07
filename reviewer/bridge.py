@@ -169,7 +169,7 @@ class ReviewBridge:
                     item = await asyncio.wait_for(
                         self._inbox.get(), timeout=min(wait, remaining))
                     chunks.append(item["text"])
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if chunks:
                         break  # grace window passed — answer complete
                     # else keep waiting until the hard deadline

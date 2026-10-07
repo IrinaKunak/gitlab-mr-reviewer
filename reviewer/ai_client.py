@@ -21,16 +21,18 @@ import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import anthropic
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from . import overrides, telegram_io, usage
-from .config import Settings, settings as default_settings
+from .config import Settings
+from .config import settings as default_settings
 
 logger = logging.getLogger(__name__)
 

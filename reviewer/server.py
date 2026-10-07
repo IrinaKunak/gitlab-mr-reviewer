@@ -23,8 +23,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import (__version__, gitlab_io, openrouter_models, overrides, state_layout,
-               telegram_io, usage)
+from . import __version__, gitlab_io, openrouter_models, overrides, state_layout, telegram_io, usage
 from .bridge import bridge
 from .config import settings
 from .pipeline import new_job_id, pipeline

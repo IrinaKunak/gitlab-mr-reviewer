@@ -4,13 +4,14 @@ Script to add webhook integration for merge request events to all projects
 in configured GitLab instances.
 """
 
+import logging
 import os
 import sys
-import logging
 import time
-from typing import Dict, List, Any, Optional
-import requests
+from typing import Any
+
 import gitlab
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -28,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_gitlab_instances() -> Dict[str, Dict[str, str]]:
+def load_gitlab_instances() -> dict[str, dict[str, str]]:
     """Load GitLab instances configuration from environment variables"""
     instances = {}
 
@@ -60,7 +61,7 @@ def load_gitlab_instances() -> Dict[str, Dict[str, str]]:
     return instances
 
 
-def get_gitlab_client(instance_config: Dict[str, str]) -> gitlab.Gitlab:
+def get_gitlab_client(instance_config: dict[str, str]) -> gitlab.Gitlab:
     """Get GitLab client for a specific instance configuration"""
     try:
         # Setup session with proxy if configured
@@ -74,8 +75,9 @@ def get_gitlab_client(instance_config: Dict[str, str]) -> gitlab.Gitlab:
             elif SOCKS_PROXY:
                 logger.debug(f"Using SOCKS proxy: {SOCKS_PROXY}")
                 try:
-                    import socks
                     import socket
+
+                    import socks
 
                     proxy_host, proxy_port = SOCKS_PROXY.split(":")
                     socks.set_default_proxy(socks.SOCKS5, proxy_host, int(proxy_port))
@@ -100,7 +102,7 @@ def get_gitlab_client(instance_config: Dict[str, str]) -> gitlab.Gitlab:
         raise
 
 
-def get_all_projects(gl: gitlab.Gitlab) -> List[Any]:
+def get_all_projects(gl: gitlab.Gitlab) -> list[Any]:
     """Get all projects from GitLab instance"""
     try:
         # Get all projects (including ones user is a member of)
@@ -112,7 +114,7 @@ def get_all_projects(gl: gitlab.Gitlab) -> List[Any]:
         raise
 
 
-def check_existing_webhook(project, webhook_url: str) -> Optional[Any]:
+def check_existing_webhook(project, webhook_url: str) -> Any | None:
     """Check if webhook already exists for the project"""
     try:
         hooks = project.hooks.list()
@@ -233,8 +235,8 @@ def test_webhook_endpoint() -> bool:
 
 
 def process_gitlab_instance(
-    instance_name: str, instance_config: Dict[str, str], dry_run: bool = False
-) -> Dict[str, Any]:
+    instance_name: str, instance_config: dict[str, str], dry_run: bool = False
+) -> dict[str, Any]:
     """Process all projects in a GitLab instance"""
     results = {
         "instance": instance_name,

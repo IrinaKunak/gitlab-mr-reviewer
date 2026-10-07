@@ -25,12 +25,19 @@ from typing import Any
 import gitlab as gitlab_lib
 
 from . import gitlab_io, prompts, review_state, telegram_io, usage
-from .ai_client import (CHARS_PER_TOKEN, AIClient, AIError, AIInputTooLargeError,
-                        AITimeoutError, ToolDef, ai_client, estimate_tokens)
+from .ai_client import (
+    CHARS_PER_TOKEN,
+    AIClient,
+    AIError,
+    AIInputTooLargeError,
+    AITimeoutError,
+    ToolDef,
+    ai_client,
+    estimate_tokens,
+)
 from .bridge import bridge
 from .config import settings
-from .repo_cache import (repo_cache, repo_find_symbol, repo_grep, repo_list_tree,
-                         repo_read_file)
+from .repo_cache import repo_cache, repo_find_symbol, repo_grep, repo_list_tree, repo_read_file
 
 logger = logging.getLogger(__name__)
 
