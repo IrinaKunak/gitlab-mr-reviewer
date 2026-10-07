@@ -145,8 +145,8 @@ class Settings:
     # a diff-only reviewer structurally cannot check anything outside the diff)
     review_repo_tools: bool = field(default_factory=lambda: _bool("REVIEW_REPO_TOOLS", True))
     review_max_tool_calls: int = field(default_factory=lambda: _int("REVIEW_MAX_TOOL_CALLS", 8))
-    # answer developer replies in MR discussion threads (needs note_events on
-    # the project webhooks — re-run add_webhooks_to_all_projects.py once)
+    # answer developer replies in MR discussion threads (needs note_events —
+    # "Comments" — enabled on the project webhooks)
     dialogue_enabled: bool = field(default_factory=lambda: _bool("MR_DIALOGUE", True))
     dialogue_max_replies_per_mr: int = field(
         default_factory=lambda: _int("DIALOGUE_MAX_REPLIES_PER_MR", 20))

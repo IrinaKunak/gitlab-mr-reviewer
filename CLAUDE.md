@@ -148,9 +148,8 @@ Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
   no-verdict output) falls back to the plain single-shot review.
 - **MR dialogue** (`MR_DIALOGUE=on`): replying to a bot comment or @mentioning the bot
   in an MR triggers a Note Hook → the bot answers in the same thread, checking the
-  repo before answering ("Пусть сам подтверждает"). Requires `note_events` on project
-  webhooks — `scripts/add_webhooks_to_all_projects.py` enables it and also UPDATES existing
-  hooks (re-run it once after deploying). Guards: own-note drop (startup-captured
+  repo before answering ("Пусть сам подтверждает"). Requires `note_events` ("Comments")
+  on project webhooks — enabled by hand in each project's webhook settings. Guards: own-note drop (startup-captured
   bot_username + worker re-check), only bot-threads/mentions answered,
   already-answered check, `DIALOGUE_MAX_REPLIES_PER_MR` (20/day), `NO_REPLY` sentinel
   for acks. Replies are never posted on failure paths (a broken reply must not spam
@@ -276,13 +275,11 @@ git pull && docker compose up -d --build
 
 ## Testing utilities
 
-Manual helpers live in `scripts/` (live GitLab, not part of the test suite; not
-linted except the webhook tool):
-
-- `python scripts/create_test_mrs.py` — create test MRs in the configured test repos
-  (`spikerwork/test-repo` on primary, `gitlab-instance-0d55f60d/max-test` on instance_2)
-- `python scripts/add_webhooks_to_all_projects.py [--dry-run|--instance N|--test-endpoint]` —
-  bulk webhook management across all projects/instances
+- `python scripts/check_webhook_routing.py` — POSTs an MR webhook to a running
+  service (`WEBHOOK_ENDPOINT`, default `http://localhost:5000/webhook`) with each
+  configured instance's `XGITLABTOKEN[_N]`: checks token routing locally. The
+  v1-era MR-creating / bulk-webhook scripts were removed (2026-10-07); webhooks
+  (Merge request events + Comments) are configured by hand per project.
 - To exercise the investigator/bridge: MR with multi-file auth/payment-ish logic and a
   Jira key in the branch name; trivial one-file MRs stop at the Haiku tier by design.
 

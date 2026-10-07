@@ -50,11 +50,11 @@ for the public webhook URL.
 
 ### GitLab webhook
 
-Per project (or bulk via `scripts/add_webhooks_to_all_projects.py`):
+Per project (Settings → Webhooks):
 
 - URL: `https://<your-domain>/webhook`
 - Secret Token: the matching `XGITLABTOKEN[_N]` value (this is how instances are routed)
-- Trigger: Merge request events
+- Trigger: Merge request events, Comments (the latter powers the MR dialogue)
 
 ### Feature flags
 
@@ -97,10 +97,9 @@ python -m pytest tests/ -q          # offline unit tests, no API keys needed
 DEBUG=true python -m reviewer      # serves on 0.0.0.0:5000
 ```
 
-Manual helpers live in `scripts/` (run against live GitLab, not part of the test
-suite): `create_test_mrs.py` (create test MRs in the configured test repos),
-`add_webhooks_to_all_projects.py --dry-run` (bulk webhook management),
-`check_gitlab_connection.py`, `check_webhook_routing.py`, `trigger_webhook.py`.
+`scripts/check_webhook_routing.py` sends an MR webhook with each configured
+instance's token to a running service (default `http://localhost:5000/webhook`,
+override with `WEBHOOK_ENDPOINT`) to check token routing locally.
 
 ## 🧯 Troubleshooting
 

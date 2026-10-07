@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""
-Test script for multi-instance GitLab webhook configuration
+"""Check X-Gitlab-Token routing of a running service, one webhook per instance.
+
+The payload names a fake project (id 12345): the service answers "accepted",
+then its worker fails to fetch that project and sends a gitlab_api_error
+alert to Telegram if Telegram is on. Only the HTTP answer is the check.
 """
 
 import os
+
 import requests
 from dotenv import load_dotenv
 
