@@ -220,6 +220,23 @@ def mr_webhook(project: FakeProject, mr: FakeMR, action: str = "open", *,
     }
 
 
+def note_webhook(project: FakeProject, mr: FakeMR, note: FakeNote) -> dict:
+    """GitLab 'Note Hook' payload for a comment already added to the fake MR."""
+    return {
+        "object_kind": "note",
+        "user": {"username": note.author["username"]},
+        "project": {"id": project.id, "path_with_namespace": project.path_with_namespace},
+        "object_attributes": {
+            "id": note.id, "note": note.body, "noteable_type": "MergeRequest",
+            "discussion_id": note.discussion_id, "system": note.system,
+        },
+        "merge_request": {
+            "iid": mr.iid, "last_commit": {"id": mr.sha},
+            "url": f"https://gitlab.test/{project.path_with_namespace}/-/merge_requests/{mr.iid}",
+        },
+    }
+
+
 def file_change(path: str, diff: str, *, new_file: bool = False) -> dict:
     return {"old_path": path, "new_path": path, "diff": diff, "new_file": new_file,
             "deleted_file": False, "renamed_file": False}

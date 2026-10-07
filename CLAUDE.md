@@ -221,11 +221,16 @@ DEBUG=true uvicorn w-server:app --host 0.0.0.0 --port 5000
 
 **Scenario tests** (`tests/test_scenarios.py`) drive the real webhook → queue → pipeline
 on in-memory fakes (`tests/fakes/`: `FakeGitLab` behind the python-gitlab object model,
-`ScriptedLLM` with per-method answer queues, `FakeTelegram`, `FakeRepoCache` = project
-files in a temp dir under the real repo tools). The `world` fixture in `tests/conftest.py`
-is the ONLY place that patches module boundaries and sets prod-shaped flags (v2 on, RU,
-Telegram on) — scenarios assert external effects only (note texts, messages, AI tiers,
-usage) and never call private methods. An unscripted AI call fails the test. Module-level
+`ScriptedLLM` with per-method answer queues, `FakeTelegram`, `FakeBridge` = scripted
+AIManager answers, `FakeRepoCache` = project files in a temp dir under the real repo
+tools). The `world` fixture in `tests/conftest.py` is the ONLY place that patches module
+boundaries and sets prod-shaped flags (all v2 flags on incl. investigator/bridge/tester
+report, RU, Telegram on); `world.configure(...)` overrides settings per scenario and
+`world.clock.advance(s)` drives the queue's dedupe TTL / burst window. Scenarios cover
+trivial/normal/complex (investigator+bridge+tester report) MRs, incremental re-reviews,
+big-MR degradation, dialogue and dedupe; they assert external effects only (note texts,
+messages, AI tiers, usage) and never call private methods. An unscripted AI call or
+bridge question fails the test. Module-level
 state caches (`review_state._cache`, `overrides._cache`) must be reset there, or
 scenarios leak "already reviewed" state into each other.
 

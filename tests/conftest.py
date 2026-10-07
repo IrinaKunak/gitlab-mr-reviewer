@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,14 +26,36 @@ WEBHOOK_TOKEN = "hook-token"
 
 
 @dataclass
+class Clock:
+    """Monotonic time as the webhook queue sees it (dedupe TTL, burst window)."""
+    now: float = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@dataclass
 class World:
     gitlab: Any
     llm: Any
     telegram: Any
+    bridge: Any
     repo: Any
+    clock: Clock
     log_dir: Path
     client: Any
+    monkeypatch: Any
     responses: list[dict] = field(default_factory=list)
+
+    def configure(self, **values: Any) -> None:
+        """Scenario-specific settings on top of the prod-shaped defaults."""
+        from reviewer.config import settings
+        for name, value in values.items():
+            assert hasattr(settings, name), f"unknown setting {name}"
+            self.monkeypatch.setattr(settings, name, value)
 
     def send(self, payload: dict, event: str = "Merge Request Hook") -> dict:
         """POST a webhook, then run whatever it queued the way a worker does."""
@@ -62,21 +85,24 @@ class World:
 @pytest.fixture
 def world(monkeypatch, tmp_path):
     """Production-shaped service (all v2 flags as deployed, RU output, Telegram
-    on) wired to in-memory GitLab / LLM / Telegram / repo checkout."""
+    on) wired to in-memory GitLab / LLM / Telegram / bridge / repo checkout."""
     from fastapi.testclient import TestClient
 
     from reviewer import gitlab_io, overrides, review_state, server, telegram_io
     from reviewer import pipeline as pipeline_mod
     from reviewer.config import settings
-    from tests.fakes import FakeGitLab, FakeRepoCache, FakeTelegram, ScriptedLLM
+    from tests.fakes import FakeBridge, FakeGitLab, FakeRepoCache, FakeTelegram, ScriptedLLM
 
-    gitlab, llm, telegram = FakeGitLab(), ScriptedLLM(), FakeTelegram()
+    gitlab, llm, telegram, bridge = FakeGitLab(), ScriptedLLM(), FakeTelegram(), FakeBridge()
+    clock = Clock()
     repo = FakeRepoCache(gitlab, tmp_path / "repos")
     log_dir = tmp_path / "logs"
 
     for name, value in {
-        "pipeline_v2": True, "investigator": False, "bridge_enabled": False,
-        "tester_report": False, "review_repo_tools": True, "dialogue_enabled": True,
+        "pipeline_v2": True, "investigator": True, "bridge_enabled": True,
+        "tester_report": True, "review_repo_tools": True, "dialogue_enabled": True,
+        "bridge_chat_id": "bridge-chat", "tester_report_chat_ids": [],
+        "dialogue_max_replies_per_mr": 20,
         "ai_provider": "anthropic", "review_language": "ru", "review_for_conflict": False,
         "review_prompt_en": "", "ai_max_input_tokens": 300_000,
         "telegram_enabled": True, "telegram_token": "test-token",
@@ -100,7 +126,10 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline_mod.pipeline, "ai", llm)
     monkeypatch.setattr(pipeline_mod.pipeline, "_dialogue_replies", {})
     monkeypatch.setattr(pipeline_mod, "repo_cache", repo)
+    monkeypatch.setattr(pipeline_mod, "bridge", bridge)
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=clock.monotonic))
     monkeypatch.setattr(server, "review_queue", server.ReviewQueue(
         workers=0, dedupe_ttl=600, burst_window=30))
 
-    return World(gitlab, llm, telegram, repo, log_dir, TestClient(server.app))
+    return World(gitlab, llm, telegram, bridge, repo, clock, log_dir,
+                 TestClient(server.app), monkeypatch)
