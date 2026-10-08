@@ -31,11 +31,15 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
+from .ai_client import ToolDef
 from .config import RepoCacheSection
-from .domain.models import InstanceRef
+from .domain.models import InstanceRef, MergeRequestRef
 
 logger = logging.getLogger(__name__)
 
@@ -466,3 +470,69 @@ def repo_find_symbol(worktree: Path, name: str, max_results: int = 20) -> str:
         lines.append(f"... and {len(matches) - max_results} more")
     return "\n".join(lines)
 
+
+
+# --- the RepoWorkspace port over the cache ---
+
+def repo_tools(worktree: Path) -> list[ToolDef]:
+    """Read-only, sandboxed tools over a checkout at the MR head commit
+    (shared by the tool-assisted review, the investigator and dialogue)."""
+    wt = worktree
+    return [
+        ToolDef("repo_find_symbol",
+                "Find where a class/function/constant is DEFINED, from a "
+                "pre-built symbol index (exact name first, then fuzzy). "
+                "Prefer this over repo_grep for definitions; then open the "
+                "location with repo_read_file.",
+                {"type": "object", "properties": {
+                    "name": {"type": "string",
+                             "description": "symbol name, e.g. LeadSerializer"},
+                    "max_results": {"type": "integer"}},
+                 "required": ["name"]},
+                handler=lambda **kw: asyncio.to_thread(repo_find_symbol, wt, **kw)),
+        ToolDef("repo_grep",
+                "Search the project for a regex pattern. Returns file:line: text matches.",
+                {"type": "object", "properties": {
+                    "pattern": {"type": "string", "description": "Python regex"},
+                    "glob": {"type": "string", "description": "optional path glob, e.g. **/*.py"},
+                    "max_results": {"type": "integer"}},
+                 "required": ["pattern"]},
+                handler=lambda **kw: asyncio.to_thread(repo_grep, wt, **kw)),
+        ToolDef("repo_read_file",
+                "Read a file from the project at the MR head commit (line-numbered).",
+                {"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"}},
+                 "required": ["path"]},
+                handler=lambda **kw: asyncio.to_thread(repo_read_file, wt, **kw)),
+        ToolDef("repo_list_tree",
+                "List files/directories under a path.",
+                {"type": "object", "properties": {
+                    "path": {"type": "string"}, "depth": {"type": "integer"}},
+                 "required": []},
+                handler=lambda **kw: asyncio.to_thread(repo_list_tree, wt, **kw)),
+    ]
+
+
+class CacheWorkspace:
+    """RepoWorkspace over a RepoCache (or anything with its checkout_mr /
+    release pair — the scenario tests' FakeRepoCache)."""
+
+    def __init__(self, cache: Any) -> None:
+        self.cache = cache
+
+    @asynccontextmanager
+    async def session(self, ref: MergeRequestRef,
+                      sha: str | None) -> AsyncIterator[list[ToolDef] | None]:
+        try:
+            worktree = await self.cache.checkout_mr(
+                ref.instance, ref.project_path, ref.mr_iid, sha)
+        except Exception as exc:  # noqa: BLE001 — tools degrade, the caller still runs
+            logger.error("repo checkout failed, continuing without repo tools: %s", exc)
+            yield None
+            return
+        try:
+            yield repo_tools(worktree)
+        finally:
+            await self.cache.release(worktree)

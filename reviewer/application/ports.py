@@ -7,9 +7,13 @@ argument and result is a domain model or a plain value.
 
 from __future__ import annotations
 
-from typing import Protocol
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import ChangeSet, Discussion, MergeRequestInfo, MergeRequestRef, Note
+
+if TYPE_CHECKING:
+    from ..ai_client import ToolDef
 
 
 class VcsError(Exception):
@@ -67,3 +71,15 @@ class VcsPort(Protocol):
     async def upload(self, ref: MergeRequestRef, filename: str, content: bytes) -> str | None:
         """Attach a file to the project; the markdown link, or None on failure."""
         ...
+
+
+class RepoWorkspace(Protocol):
+    """A checkout of the MR head with read-only repo tools over it.
+
+    One session per review (shared by the tool-assisted review and the
+    investigator) or per dialogue reply; the context manager releases the
+    worktree on exit. It yields None when the checkout failed — callers
+    degrade to working without tools, the review still runs."""
+
+    def session(self, ref: MergeRequestRef,
+                sha: str | None) -> AbstractAsyncContextManager[list[ToolDef] | None]: ...

@@ -787,7 +787,7 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
 def test_tester_report_targets(monkeypatch):
     # owner request 2026-07-23: reports go to the team group(s) too, not only
     # the bridge chat where AIManager archives them
-    from reviewer.pipeline import tester_report_targets
+    from reviewer.application.stages import tester_report_targets
 
     cfg = make_settings(bridge__chat_id="-100bridge")
     tg = cfg.notify.telegram
@@ -819,11 +819,13 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
             assert "<document>" in user  # translation input is always wrapped now
             return SimpleNamespace(text=next(answers))
 
-    p = make_pipeline(make_settings(pipeline__language="ru"), ai=StubAI())
+    from reviewer.application.stages import Translator
+
+    t = Translator(StubAI(), "ru")
     # commentary (no Cyrillic) -> deliver the English original instead
-    assert asyncio.run(p._translate_if_needed("review text", "fast")) == "review text"
+    assert asyncio.run(t.translate("review text", "fast")) == "review text"
     # real translation passes through
-    assert asyncio.run(p._translate_if_needed("review text", "fast")) == "Обзор: всё в порядке."
+    assert asyncio.run(t.translate("review text", "fast")) == "Обзор: всё в порядке."
 
 
 def test_process_skips_merged_or_closed_mr():
@@ -836,7 +838,7 @@ def test_process_skips_merged_or_closed_mr():
         gitlab.add_project(1).add_mr(2, changes=[], state=state)
         # the AI is unwired: touching it fails the test
         svc = make_services(vcs_for=lambda instance: gitlab)
-        asyncio.run(svc.pipeline._process_inner(review_job(), {}))
+        asyncio.run(svc.pipeline.review_mr.run(review_job(), {}))
         assert svc.telegram.messages == []
         assert [c[0] for c in gitlab.calls] == ["mr_get"]  # no notes, no diffs
 
@@ -974,17 +976,19 @@ def test_investigator_degrades_before_cloning(monkeypatch):
     # rejected as too large — and the guard only fires inside agent_loop, AFTER
     # the repo clone, so we paid for a clone then silently dropped the analysis
     cfg = make_settings(llm__max_input_tokens=10_000)
-    p = make_pipeline(cfg, ai=AIClient(cfg))
+    from reviewer.application.stages import Investigate
+
+    p = Investigate(cfg, AIClient(cfg), bridge=None)
     triage, mr_data = TriageResult(summary="s"), review_job(mr_iid=779)
 
     huge, small = "x" * 200_000, "y" * 6_000
     # full context too big -> falls back to the diff, no exception, no clone yet
-    assert p._investigator_content(mr_data, huge, triage, "review", small) == small
+    assert p.content_for(mr_data, huge, triage, "review", small) == small
     # both too big -> a truncated subset, still something to investigate
-    picked = p._investigator_content(mr_data, huge, triage, "review", huge)
+    picked = p.content_for(mr_data, huge, triage, "review", huge)
     assert 0 < len(picked) < len(huge)
     # fits -> untouched
-    assert p._investigator_content(mr_data, small, triage, "review", "z") == small
+    assert p.content_for(mr_data, small, triage, "review", "z") == small
 
 
 def test_force_full_re_review_marker():
@@ -1083,9 +1087,11 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
             tiers.append(tier)
             return SimpleNamespace(text="Перевод готов.")
 
-    p = make_pipeline(make_settings(pipeline__language="ru"), ai=StubAI())
-    asyncio.run(p._translate_if_needed("short text", "fast"))
-    asyncio.run(p._translate_if_needed("long text " * 500, "fast"))  # ~5000 chars
+    from reviewer.application.stages import Translator
+
+    t = Translator(StubAI(), "ru")
+    asyncio.run(t.translate("short text", "fast"))
+    asyncio.run(t.translate("long text " * 500, "fast"))  # ~5000 chars
     assert tiers == ["fast", "main"]
 
 
@@ -1099,7 +1105,7 @@ def test_process_skips_already_reviewed_sha(tmp_path):
     svc = make_services(make_settings(tmp_path), vcs_for=lambda instance: gitlab)
     job = review_job(last_commit="abc123")
     svc.review_state.set_last_sha(*job.ref.key, "abc123")
-    asyncio.run(svc.pipeline._process_inner(job, {}))
+    asyncio.run(svc.pipeline.review_mr.run(job, {}))
     assert svc.telegram.messages == []
     assert [c[0] for c in gitlab.calls] == ["mr_get"]
 
@@ -1576,32 +1582,35 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
             calls.append("complete")
             return AIResult(text="## Verdict\n**SHIP** plain path")
 
+    from pathlib import Path
+
+    from reviewer.application.stages import Review
+    from reviewer.repo_cache import repo_tools
+
+    cfg, tools = make_settings(), repo_tools(Path("."))
+
     # tool path succeeds -> plain completion never runs
-    p = make_pipeline(ai=StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
-    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
-                                worktree=object()))
+    p = Review(cfg, StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
+    out = asyncio.run(p.review(mr_data, "content", triage, "diff", "", None, tools=tools))
     assert out.text == "## Verdict\n**SHIP** verified" and calls == ["agent"]
     assert out.tool_assisted
 
     # loop dies (refusal, provider trouble) -> plain review still ships
     calls.clear()
-    p = make_pipeline(ai=StubAI(agent_exc=AIError("boom")))
-    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
-                                worktree=object()))
+    p = Review(cfg, StubAI(agent_exc=AIError("boom")))
+    out = asyncio.run(p.review(mr_data, "content", triage, "diff", "", None, tools=tools))
     assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # loop ran out of turns mid-check (no verdict) -> plain review
     calls.clear()
-    p = make_pipeline(ai=StubAI(agent_result=AIResult(text="hmm, checking")))
-    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
-                                worktree=object()))
+    p = Review(cfg, StubAI(agent_result=AIResult(text="hmm, checking")))
+    out = asyncio.run(p.review(mr_data, "content", triage, "diff", "", None, tools=tools))
     assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # no worktree (checkout failed / flag off) -> straight to the plain path
     calls.clear()
-    p = make_pipeline(ai=StubAI())
-    out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
-                                worktree=None))
+    p = Review(cfg, StubAI())
+    out = asyncio.run(p.review(mr_data, "content", triage, "diff", "", None, tools=None))
     assert calls == ["complete"]
 
 
@@ -1864,7 +1873,7 @@ def test_review_queue_assigns_job_id():
 def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
     from types import SimpleNamespace
 
-    from reviewer import pipeline as pipeline_mod
+    from reviewer.application.review_mr import ReviewMergeRequest
 
     notes, alerts = [], []
 
@@ -1877,8 +1886,8 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
     async def fake_alert(kind, details, ctx=None):
         alerts.append((details, ctx))
 
-    monkeypatch.setattr(pipeline_mod.Pipeline, "_process_inner", fake_inner)
-    monkeypatch.setattr(pipeline_mod.Pipeline, "_safe_note", fake_note)
+    monkeypatch.setattr(ReviewMergeRequest, "run", fake_inner)
+    monkeypatch.setattr(ReviewMergeRequest, "_safe_note", fake_note)
 
     p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert))
     asyncio.run(p.process(review_job(job_id="deadbeef")))
@@ -1904,11 +1913,15 @@ def test_deliver_review_failure_note_hides_exception_text():
     async def fake_alert(*a, **k):
         return True
 
+    from reviewer.application.stages import Deliver, ReviewContext
+    from reviewer.domain.models import ChangeSet, MergeRequestInfo
+
     vcs = SimpleNamespace(post_note=fake_post)
-    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert),
-                      vcs_for=lambda instance: vcs)
-    ok = asyncio.run(p._deliver_review(review_job(job_id="cafe0001"), False, "review"))
-    assert ok is False
+    deliver = Deliver(make_settings(), SimpleNamespace(notify_error=fake_alert))
+    ctx = ReviewContext(job=review_job(job_id="cafe0001"), vcs=vcs, changes=ChangeSet(),
+                        mr=MergeRequestInfo("opened", "t", "dev", "f", "main"),
+                        review_out="review")
+    assert asyncio.run(deliver.run(ctx)).posted is False
     assert "10.0.0.5" not in posted[1] and "cafe0001" in posted[1]
 
 

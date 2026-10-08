@@ -52,15 +52,21 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   also yields the bot username; the pipeline retries it lazily if GitLab was down at
   boot), lazy project/MR handles so notes/uploads need no extra GET, conflicts read
   from the MR itself. `webhooks.py`: `parse_*_webhook(payload, instance)` → jobs.
-- **reviewer/pipeline.py** — stage orchestrator: triage (fast) → review (main,
-  **agentic with repo tools** — see below) → investigator (smart, agentic, complex MRs
-  only) → translate EN→RU → deliver review (+impact analysis) and tester report; one
-  repo checkout is shared by the tool-assisted review and the investigator;
-  `process_note` answers developer replies in MR discussion threads (main tier + repo
-  tools, `NO_REPLY` sentinel, per-MR daily reply budget); per-review usage tracking
-  (`kind: review|dialogue` in usage.jsonl). The v1-parity (`PIPELINE_V2=off`) and
+- **reviewer/application/review_mr.py** — use case `ReviewMergeRequest`: preflight
+  (live MR state, incremental delta, conflicts) → stages from
+  `application/stages/` (each `async run(ctx) -> ctx` over a `ReviewContext`):
+  `Triage` (fast) → content assembly → `Review` (main, **agentic with repo tools** —
+  see below) → `Investigate` (smart, agentic, complex MRs only) → `Translate` EN→RU →
+  `Deliver` (review + impact analysis) → reviewed sha recorded → `DeliverTesterReport`.
+  One repo session (`RepoWorkspace` port, `repo_cache.CacheWorkspace`: async context
+  manager yielding the repo tools, or None when the checkout failed) is shared by the
+  tool-assisted review and the investigator. Per-review usage tracking (`kind:
+  review|dialogue` in usage.jsonl). The v1-parity (`PIPELINE_V2=off`) and
   `AI_PROVIDER=gemini` paths were removed in refactoring stage 6 (tag `v2-pre-cleanup`
   still has them)
+- **reviewer/pipeline.py** — facade over the use cases; `process_note` answers
+  developer replies in MR discussion threads (main tier + repo tools, `NO_REPLY`
+  sentinel, per-MR daily reply budget)
 - **reviewer/ai_client.py** — Anthropic SDK via Cloudflare AI Gateway with OpenRouter
   fallback (Anthropic-compatible `/api/v1/messages`, `models` array failover); response
   cache (key includes `max_tokens` + effort), rate limiting, empty-response retry, agent

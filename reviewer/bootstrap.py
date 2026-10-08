@@ -37,7 +37,7 @@ from .domain.models import InstanceRef
 from .openrouter_models import OpenRouterCatalog
 from .overrides import ModelOverrides
 from .pipeline import Pipeline
-from .repo_cache import RepoCache
+from .repo_cache import CacheWorkspace, RepoCache
 from .review_state import ReviewStateStore
 from .server import ReviewQueue
 from .server import create_app as _create_app
@@ -146,7 +146,8 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
         vcs_for = lambda instance: clients[instance.name]  # noqa: E731
     review_state = ReviewStateStore(state_dir)
     usage_log = UsageLog(cfg.storage.log_dir)
-    pipeline = Pipeline(cfg, ai=ai, telegram=telegram, bridge=bridge, repo_cache=repo_cache,
+    pipeline = Pipeline(cfg, ai=ai, telegram=telegram, bridge=bridge,
+                        workspace=CacheWorkspace(repo_cache),
                         review_state=review_state, usage_log=usage_log, pricing=pricing,
                         vcs=vcs_for)
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
