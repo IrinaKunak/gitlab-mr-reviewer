@@ -131,6 +131,12 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   `config.KNOWN_CHANNELS`), add it to `CHANNELS` in `tests/test_notify.py` — the
   contract tests must pass. `bitrix` is a known name that fails startup until then.
 - **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **reviewer/logging_setup.py** — `configure(settings)` (called by bootstrap: format,
+  level, `JobContextFilter` on the root handlers, the rotating `logs/ai-debug.log`
+  when `AI_DEBUG=on`, fail-open). `job_context(job, usage=tracker)` sets the
+  `JobContext` contextvar for a job — log lines get its label, and
+  `usage.current_tracker()` / `usage.record()` read the job's tracker from it (the
+  separate usage contextvar is gone).
 - **reviewer/i18n/** — message catalog `en.yaml` / `ru.yaml` + `t(key, lang, **kw)`
   (dotted keys, `str.format` fields; a key missing in a language falls back to en
   with a WARNING). Every user-facing text (MR notes, notifications) comes from it —
@@ -274,8 +280,9 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   the hook log to maintainers): error paths post only «Ревью не выполнено, id задачи: …»,
   a webhook 500 returns `{"detail": "internal error", "job_id": …}`. `str(exc)` goes to
   the log and the internal Telegram alert only. Every queued job gets a short `job_id`
-  (`ReviewQueue.submit`) that appears in its log lines (`job <id>: …`), TG alerts and
-  the error note — grep the log for the id from a user's report.
+  (`ReviewQueue.submit`) that appears in every log line of the job (`[<id> <instance>
+  <project>!<iid> <kind>]`, stamped by `logging_setup.JobContextFilter`), TG alerts
+  and the error note — grep the log for the id from a user's report.
 - **Debug/usage logging must never break a review** — logs dir can be unwritable
   (bind-mount ownership); all accounting is fail-open.
 - **Translator input is wrapped in `<document>` tags** and output must contain Cyrillic,
@@ -390,7 +397,7 @@ git pull && docker compose up -d --build
   SQL over the `usage` table of `state/reviewer.db`
 - `logs/usage.jsonl` — one JSON entry per review (tokens, cost, per-model breakdown),
   still appended in parallel; `sqlite3 state/reviewer.db 'select ...'` for ad-hoc queries
-- `logs/ai-debug.log` — request/response dumps when `AI_DEBUG=true` (rotating)
+- `logs/ai-debug.log` — request/response dumps when `AI_DEBUG=true` (rotating, job-labelled)
 - Telegram review notifications end with a usage footer:
   `haiku-4-5: →19448 ←446 | sonnet-5: →104634 ←7457 | 💰$0.63`
 - Costs are list-price ceilings. Prompt-cache tokens ARE counted: wire-format

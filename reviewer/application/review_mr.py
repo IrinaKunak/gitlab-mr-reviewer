@@ -23,6 +23,7 @@ from ..domain import budget
 from ..domain.events import MrSummary, ReviewFailed, ReviewStarted
 from ..domain.models import ChangeSet, Complexity, InstanceRef, MergeRequestRef, ReviewJob
 from ..i18n import t
+from ..logging_setup import job_context
 from ..review_state import ReviewStateStore
 from ..usage import UsageLog
 from . import content
@@ -75,7 +76,16 @@ class ReviewMergeRequest:
         logger.info("job %s: review MR !%s in project %s on %s", job_id,
                     ref.mr_iid, ref.project_id, ref.instance.name)
         tracker = usage.UsageTracker(self.pricing)
-        tracker_token = usage.current_tracker.set(tracker)
+        # every log line and AI call below belongs to this job (logging_setup)
+        with job_context(job, usage=tracker):
+            try:
+                await self._guarded(job)
+            finally:
+                self.usage_log.persist(tracker, job)
+
+    async def _guarded(self, job: ReviewJob) -> None:
+        """Run the review; every failure ends here (neutral MR note + alert)."""
+        ref, job_id = job.ref, job.job_id
 
         async def fail(kind: str, details: str) -> None:
             await self.notifier.notify(ReviewFailed(
@@ -83,7 +93,7 @@ class ReviewMergeRequest:
                 language=self.settings.pipeline.language))
 
         try:
-            await self.run(job, tracker)
+            await self.run(job)
         except VcsError as exc:
             logger.error("job %s: GitLab API error: %s", job_id, exc)
             await fail("gitlab_api_error", str(exc))
@@ -102,9 +112,6 @@ class ReviewMergeRequest:
             logger.exception("job %s: error in quality check", job_id)
             await fail("general", str(exc))
             await self._safe_note(ref, self._msg("mr.review_failed", job_id=job_id))
-        finally:
-            usage.current_tracker.reset(tracker_token)
-            self.usage_log.persist(tracker, job)
 
     async def _safe_note(self, ref: MergeRequestRef, body: str) -> None:
         """Best-effort MR comment on error paths (v1 behavior)."""
@@ -115,11 +122,11 @@ class ReviewMergeRequest:
 
     # --- main flow ---
 
-    async def run(self, job: ReviewJob, tracker: usage.UsageTracker | None = None) -> None:
+    async def run(self, job: ReviewJob) -> None:
         ctx = await self._preflight(job)
         if ctx is None:
             return
-        ctx.usage = tracker
+        ctx.usage = usage.current_tracker()  # the job's, from its JobContext
         ctx = await self.triage.run(ctx)
         await self._assemble_content(ctx)
         if not ctx.review_content:

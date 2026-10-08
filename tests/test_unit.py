@@ -25,6 +25,7 @@ from reviewer.ai_client import AIClient, extract_json
 from reviewer.application import content
 from reviewer.config import Settings
 from reviewer.domain.models import ChangeSet, FileChange, InstanceRef, TriageResult
+from reviewer.logging_setup import job_context
 from reviewer.repo_cache import _safe_path, repo_grep, repo_list_tree, repo_read_file
 from reviewer.server import ReviewQueue
 from tests.factories import (
@@ -133,17 +134,33 @@ def test_cache_roundtrip(tmp_path):
     assert client._cache_get(key) is None
 
 
-def test_debug_log_failure_is_nonfatal(tmp_path):
+def test_debug_log_failure_is_nonfatal(tmp_path, caplog):
     # regression: unwritable logs/ mount raised Errno 13 inside _debug and killed the review
-    cfg = Settings()
-    cfg.llm.debug = True
-    blocker = tmp_path / "blocker"
-    blocker.write_text("")  # file where a directory is needed -> mkdir raises OSError
-    cfg.storage.log_dir = str(blocker / "logs")
-    client = AIClient(cfg)
-    client._debug("request", "payload")  # must not raise
-    assert client._debug_failed
-    client._debug("response", "again")   # stays disabled, still no raise
+    import logging
+
+    from reviewer.logging_setup import AI_DEBUG_LOGGER, configure_ai_debug
+
+    debug = logging.getLogger(AI_DEBUG_LOGGER)
+    saved = list(debug.handlers)
+    debug.handlers.clear()
+    try:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")  # file where a directory is needed -> mkdir raises OSError
+        assert configure_ai_debug(blocker / "logs") is None  # warned, not raised
+        assert "AI debug logging disabled" in caplog.text
+        cfg = Settings()
+        cfg.llm.debug = True
+        AIClient(cfg)._debug("request", "payload")  # no handler: dropped, no raise
+
+        assert configure_ai_debug(tmp_path / "logs") is debug  # writable: dumps land
+        AIClient(cfg)._debug("request", "payload")
+        for handler in debug.handlers:
+            handler.flush()
+        assert "request | payload" in (tmp_path / "logs" / "ai-debug.log").read_text()
+    finally:
+        for handler in debug.handlers:
+            handler.close()
+        debug.handlers[:] = saved
 
 
 def test_truncated_empty_response_retries_with_larger_budget(tmp_path):
@@ -446,11 +463,11 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     # contextvar plumbing: record() is a no-op without an active tracker
     usage.record(tier="fast", model="m", provider="p",
                  input_tokens=1, output_tokens=1)
-    token = usage.current_tracker.set(usage.UsageTracker())
-    usage.record(tier="fast", model="claude-haiku-4-5", provider="gateway",
-                 input_tokens=5, output_tokens=5)
-    assert usage.current_tracker.get().calls[0]["input_tokens"] == 5
-    usage.current_tracker.reset(token)
+    with job_context(usage=usage.UsageTracker()):
+        usage.record(tier="fast", model="claude-haiku-4-5", provider="gateway",
+                     input_tokens=5, output_tokens=5)
+        assert usage.current_tracker().calls[0]["input_tokens"] == 5
+    assert usage.current_tracker() is None
 
 
 def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
@@ -668,17 +685,14 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     stub = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
     stub.with_options = lambda **kw: stub
     client._primary = stub
-    token = usage.current_tracker.set(usage.UsageTracker())
-    try:
+    with job_context(usage=usage.UsageTracker()):
         loop_result = asyncio.run(client.agent_loop(
             "smart", "sys", "user", [ToolDef("t", "d", {}, None)],
             max_iterations=2))
         assert loop_result.cache_read_tokens == 50_000
-        recorded = usage.current_tracker.get().calls[-1]
+        recorded = usage.current_tracker().calls[-1]
         assert recorded["input_tokens"] == 9 + 50_000 + 2_000
         assert recorded["cached_tokens"] == 52_000
-    finally:
-        usage.current_tracker.reset(token)
 
 
 def test_model_overrides_and_routing(tmp_path, monkeypatch):
@@ -776,12 +790,9 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
     stub.with_options = lambda **kw: stub
     client._primary = stub
     tracker = usage.UsageTracker()
-    token = usage.current_tracker.set(tracker)
-    try:
+    with job_context(usage=tracker):
         result = asyncio.run(client.agent_loop(
             "smart", "sys", "go", tools=[], max_iterations=3))
-    finally:
-        usage.current_tracker.reset(token)
 
     assert result.input_tokens == 300 and result.output_tokens == 30
     assert len(tracker.calls) == 1  # a single aggregate record for the loop
@@ -1841,14 +1852,11 @@ def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
         return "out"
 
     async def review():
-        token = usage.current_tracker.set(usage.UsageTracker())
-        try:
+        with job_context(usage=usage.UsageTracker()):
             for _ in range(2):  # tool review + investigator in one review
                 client._primary = make_stub()
                 await client.agent_loop("main", "sys", "diff",
                                         [ToolDef("t", "d", {}, handler)], max_iterations=5)
-        finally:
-            usage.current_tracker.reset(token)
 
     asyncio.run(review())
     assert len(alerts) == 1

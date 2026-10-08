@@ -21,7 +21,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from . import __version__, state_layout
+from . import __version__, logging_setup, state_layout
 from .adapters.gitlab import GitLabVcs
 from .adapters.knowledge import ReviewBridge
 from .adapters.notify import CompositeNotifier
@@ -55,9 +55,6 @@ from .usage import Pricing, UsageLog
 
 logger = logging.getLogger(__name__)
 
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-
 def load_config(dotenv: bool = True) -> Settings:
     """The mounted .env (never overriding real env vars) + config.yaml, validated.
     A bad value raises SystemExit with a message naming the variable."""
@@ -67,8 +64,7 @@ def load_config(dotenv: bool = True) -> Settings:
 
 
 def configure_logging(cfg: Settings) -> None:
-    logging.basicConfig(level=logging.DEBUG if cfg.server.debug else logging.INFO,
-                        format=LOG_FORMAT)
+    logging_setup.configure(cfg)
 
 
 @dataclass

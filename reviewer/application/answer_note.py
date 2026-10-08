@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from .. import prompts, usage
 from ..config import Settings
 from ..domain.models import DialogueJob, InstanceRef, Tier
+from ..logging_setup import job_context
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
@@ -57,15 +58,14 @@ class AnswerNote:
         logger.info("job %s: dialogue for note %s in MR !%s", job.job_id,
                     job.note_id, job.ref.mr_iid)
         tracker = usage.UsageTracker(self.pricing)
-        tracker_token = usage.current_tracker.set(tracker)
-        try:
-            await self.run(job)
-        except Exception:  # noqa: BLE001 — a failed reply must not spam the thread
-            logger.exception("job %s: dialogue failed for note %s in MR !%s", job.job_id,
-                             job.note_id, job.ref.mr_iid)
-        finally:
-            usage.current_tracker.reset(tracker_token)
-            self.usage_log.persist(tracker, job)
+        with job_context(job, usage=tracker):
+            try:
+                await self.run(job)
+            except Exception:  # noqa: BLE001 — a failed reply must not spam the thread
+                logger.exception("job %s: dialogue failed for note %s in MR !%s",
+                                 job.job_id, job.note_id, job.ref.mr_iid)
+            finally:
+                self.usage_log.persist(tracker, job)
 
     async def run(self, job: DialogueJob) -> None:
         ref, note_id = job.ref, job.note_id

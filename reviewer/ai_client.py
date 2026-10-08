@@ -26,7 +26,6 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +37,7 @@ from .config import Settings
 from .domain.models import Tier
 from .json_store import atomic_write_text
 from .llm_requests import CACHE_CONTROL, RequestBuilder, Route
+from .logging_setup import AI_DEBUG_LOGGER
 from .overrides import ModelOverrides
 from .usage import UsageAccumulator
 
@@ -165,8 +165,6 @@ class AIClient:
         self._rate_lock = asyncio.Lock()
         self._last_call = 0.0
         self._cache_dir = Path(self.cfg.storage.ai_cache_dir)
-        self._debug_logger: logging.Logger | None = None
-        self._debug_failed = False
         self._primary: AsyncAnthropic | None = None
         self._fallback: AsyncAnthropic | None = None
         self.requests = RequestBuilder(cfg)
@@ -240,7 +238,7 @@ class AIClient:
                    f"in={total_in + total_cc} cached=0 — every turn re-billed the "
                    f"full prompt. Check the tier's model override / AI_PROVIDER.")
         logger.warning("prompt cache miss: %s", details)
-        tracker = usage.current_tracker.get()
+        tracker = usage.current_tracker()
         if self._alert is None or (tracker is not None and tracker.cache_alerted):
             return
         if tracker is not None:
@@ -304,25 +302,14 @@ class AIClient:
             self._last_call = time.monotonic()
 
     def _debug(self, direction: str, payload: str) -> None:
-        if not self.cfg.llm.debug or self._debug_failed:
+        """Request/response dump into logs/ai-debug.log (AI_DEBUG). The logger
+        is set up by logging_setup.configure; without its handler (setup
+        failed, or a client built outside bootstrap) nothing is written."""
+        if not self.cfg.llm.debug:
             return
-        try:
-            if self._debug_logger is None:
-                log_dir = Path(self.cfg.storage.log_dir)
-                log_dir.mkdir(parents=True, exist_ok=True)
-                handler = RotatingFileHandler(
-                    log_dir / "ai-debug.log", maxBytes=20_000_000, backupCount=3, encoding="utf-8")
-                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-                self._debug_logger = logging.getLogger("reviewer.ai_debug")
-                self._debug_logger.addHandler(handler)
-                self._debug_logger.setLevel(logging.DEBUG)
-                self._debug_logger.propagate = False
-            self._debug_logger.debug("%s | %s", direction, payload[:50_000])
-        except OSError as exc:
-            # debug logging must never take down a review (e.g. unwritable
-            # bind-mounted logs/ dir) — warn once and continue without it
-            self._debug_failed = True
-            logger.warning("AI debug logging disabled (%s) — reviews continue without it", exc)
+        debug = logging.getLogger(AI_DEBUG_LOGGER)
+        if debug.handlers:
+            debug.debug("%s | %s", direction, payload[:50_000])
 
     # --- public API ---
 

@@ -1,7 +1,7 @@
 """Per-review token/cost accounting.
 
 Every AI call records (tier, model, provider, tokens) into a per-review
-tracker held in a contextvar; the use cases persist one entry per review
+tracker carried by the job's logging_setup.JobContext; the use cases persist one entry per review
 through `UsageLog` (the `usage` table in state/reviewer.db + logs/usage.jsonl),
 whose `aggregate()` is the SQL behind the /stats endpoint. `Pricing` turns tokens into
 list-price dollars (curated table + MODEL_PRICES + live OpenRouter catalog).
@@ -9,7 +9,6 @@ list-price dollars (curated table + MODEL_PRICES + live OpenRouter catalog).
 
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 import sqlite3
@@ -22,6 +21,7 @@ from .adapters.storage import Database
 from .config import DEFAULT_MODELS, match_model_key
 from .domain.events import ModelUsage, UsageSummary
 from .domain.models import Job
+from .logging_setup import current_job
 
 logger = logging.getLogger(__name__)
 
@@ -188,13 +188,15 @@ class UsageAccumulator:
                    cache_creation_tokens=self.cache_creation_tokens)
 
 
-current_tracker: contextvars.ContextVar[UsageTracker | None] = contextvars.ContextVar(
-    "usage_tracker", default=None)
+def current_tracker() -> UsageTracker | None:
+    """The running job's tracker (logging_setup.JobContext), None outside a job."""
+    ctx = current_job()
+    return ctx.usage if ctx is not None else None
 
 
 def record(**kwargs) -> None:
     """Record one AI call into the active review's tracker (no-op outside one)."""
-    tracker = current_tracker.get()
+    tracker = current_tracker()
     if tracker is not None:
         tracker.record(**kwargs)
 
