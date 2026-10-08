@@ -13,6 +13,7 @@ from ...config import Settings
 from ...domain import budget
 from ...domain.investigation import investigation_from_text
 from ...domain.models import Investigation, ReviewJob, Tier, TriageResult
+from ...prompts import Prompts, default_prompts
 from ..ports import KnowledgeSource
 from .base import ReviewContext
 
@@ -20,10 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 class Investigate:
-    def __init__(self, settings: Settings, ai: Any, bridge: KnowledgeSource) -> None:
+    def __init__(self, settings: Settings, ai: Any, bridge: KnowledgeSource,
+                 templates: Prompts | None = None) -> None:
         self.settings = settings
         self.ai = ai
         self.bridge = bridge
+        self.templates = templates or default_prompts()
 
     async def run(self, ctx: ReviewContext) -> ReviewContext:
         ctx.investigation = await self.investigate(
@@ -36,7 +39,7 @@ class Investigate:
         return ctx
 
     def _system(self) -> str:
-        return prompts.INVESTIGATOR_SYSTEM.format(
+        return self.templates.INVESTIGATOR_SYSTEM.format(
             max_iterations=self.settings.pipeline.investigator_max_iterations)
 
     def content_for(self, job: ReviewJob, review_content: str,
@@ -80,7 +83,7 @@ class Investigate:
             "ask_aimanager",
             "Ask the company knowledge bot (Jira corpus + project chats) one focused "
             "plain-text question. Include the Jira issue key when known. 15-60s latency. "
-            + prompts.BRIDGE_QUESTION_HINT.format(key="<KEY>"),
+            + self.templates.BRIDGE_QUESTION_HINT.format(key="<KEY>"),
             {"type": "object", "properties": {"question": {"type": "string"}},
              "required": ["question"]},
             handler=ask_aimanager)

@@ -9,6 +9,7 @@ from typing import Any
 from ... import prompts
 from ...ai_client import AIError
 from ...domain.models import Tier
+from ...prompts import Prompts, default_prompts
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,10 @@ FAST_TIER_MAX_CHARS = 3500
 
 
 class Translator:
-    def __init__(self, ai: Any, language: str) -> None:
+    def __init__(self, ai: Any, language: str, templates: Prompts | None = None) -> None:
         self.ai = ai
         self.language = language
+        self.templates = templates or default_prompts()
 
     async def translate(self, text: str, tier: Tier) -> str:
         if self.language != "ru" or not text:
@@ -30,7 +32,7 @@ class Translator:
             tier = Tier.MAIN
         try:
             result = await self.ai.complete(
-                tier, prompts.TRANSLATE_SYSTEM, prompts.translate_user_prompt(text),
+                tier, self.templates.TRANSLATE_SYSTEM, prompts.translate_user_prompt(text),
                 max_tokens=max(2048, min(16000, len(text))), use_cache=True)
         except AIError as exc:
             logger.error("translation failed, delivering English original: %s", exc)

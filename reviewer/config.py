@@ -343,6 +343,9 @@ class PipelineSection(_Section):
     # replaces the main-tier REVIEW_SYSTEM prompt (English; per-team focus
     # belongs in the repo's .ai-review.md instead)
     review_prompt: str = ""
+    # directory of prompt overrides: <name>.md replaces the built-in
+    # reviewer/prompts/templates/<name>.md (e.g. review_system.md); "" = built-ins
+    prompts_dir: str = ""
     stages: StagesSection = StagesSection()
     review_max_tool_calls: int = Field(default=8, ge=0)
     dialogue_max_replies_per_mr: int = Field(default=20, ge=0)
@@ -463,6 +466,7 @@ ENV_FIELDS: dict[str, str] = {
     "REVIEW_LANGUAGE": "pipeline.language",
     "REVIEW_FOR_CONFLICT": "pipeline.review_for_conflict",
     "REVIEW_PROMPT": "pipeline.review_prompt",
+    "PROMPTS_DIR": "pipeline.prompts_dir",
     "INVESTIGATOR": "pipeline.stages.investigator",
     "TESTER_REPORT": "pipeline.stages.tester_report",
     "REVIEW_REPO_TOOLS": "pipeline.stages.review_repo_tools",

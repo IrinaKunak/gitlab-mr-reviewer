@@ -47,6 +47,7 @@ from .domain.events import SystemAlert
 from .domain.models import InstanceRef
 from .openrouter_models import OpenRouterCatalog
 from .overrides import ModelOverrides
+from .prompts import Prompts
 from .repo_cache import CacheWorkspace, RepoCache
 from .review_state import ReviewStateStore
 from .server import ReviewQueue
@@ -191,14 +192,15 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     review_state = ReviewStateStore(db)
     usage_log = UsageLog(cfg.storage.log_dir, db)
     workspace = CacheWorkspace(repo_cache)
-    translator = Translator(ai, cfg.pipeline.language)
+    templates = Prompts(cfg.pipeline.prompts_dir or None)
+    translator = Translator(ai, cfg.pipeline.language, templates)
     review_mr = ReviewMergeRequest(
         cfg, ai=ai, notifier=notifier, knowledge=bridge, workspace=workspace,
         review_state=review_state, usage_log=usage_log, vcs=vcs_for,
-        translator=translator, pricing=pricing)
+        translator=translator, pricing=pricing, templates=templates)
     answer_note = AnswerNote(
         cfg, ai=ai, workspace=workspace, usage_log=usage_log, vcs=vcs_for,
-        translator=translator, pricing=pricing,
+        translator=translator, pricing=pricing, templates=templates,
         budget=DialogueBudget(db, lambda: cfg.pipeline.dialogue_max_replies_per_mr))
     instances = {i.name: i for i in cfg.gitlab.routes.values()}
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,

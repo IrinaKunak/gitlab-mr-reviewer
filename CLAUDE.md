@@ -130,7 +130,13 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   `adapters/notify/<name>/`, register it in `bootstrap.NOTIFIERS` (and
   `config.KNOWN_CHANNELS`), add it to `CHANNELS` in `tests/test_notify.py` — the
   contract tests must pass. `bitrix` is a known name that fails startup until then.
-- **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **reviewer/prompts/** — English-only prompts (translation is a stage): the prose in
+  `templates/<name>.md` (`REVIEW_SYSTEM` → `review_system.md`, `str.format` fields
+  filled at the call site), the user-message builders in `__init__.py`. A `Prompts`
+  object (built-ins + `PROMPTS_DIR` overrides, same file names) is built by bootstrap
+  and passed to the stages; `prompts.X` at module level reads the built-ins. System
+  prompts are the prompt-cache prefix: `tests/test_prompts.py` pins them byte for byte
+  (`tests/snapshots/prompts.json`) — an intended prompt change updates the snapshot.
 - **reviewer/logging_setup.py** — `configure(settings)` (called by bootstrap: format,
   level, `JobContextFilter` on the root handlers, the rotating `logs/ai-debug.log`
   when `AI_DEBUG=on`, fail-open). `job_context(job, usage=tracker)` sets the

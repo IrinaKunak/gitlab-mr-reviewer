@@ -24,6 +24,7 @@ from ..domain.events import MrSummary, ReviewFailed, ReviewStarted
 from ..domain.models import ChangeSet, Complexity, InstanceRef, MergeRequestRef, ReviewJob
 from ..i18n import t
 from ..logging_setup import job_context
+from ..prompts import Prompts, default_prompts
 from ..review_state import ReviewStateStore
 from ..usage import UsageLog
 from . import content
@@ -48,7 +49,8 @@ class ReviewMergeRequest:
                  knowledge: KnowledgeSource, workspace: RepoWorkspace, review_state: ReviewStateStore,
                  usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
                  translator: Translator,
-                 pricing: usage.Pricing = usage.BUILTIN_PRICING) -> None:
+                 pricing: usage.Pricing = usage.BUILTIN_PRICING,
+                 templates: Prompts | None = None) -> None:
         self.settings = settings
         self.notifier = notifier
         self.workspace = workspace
@@ -56,9 +58,10 @@ class ReviewMergeRequest:
         self.usage_log = usage_log
         self.pricing = pricing
         self.vcs = vcs
-        self.triage = Triage(ai)
-        self.review = Review(settings, ai)
-        self.investigate = Investigate(settings, ai, knowledge)
+        self.templates = templates or default_prompts()
+        self.triage = Triage(ai, self.templates)
+        self.review = Review(settings, ai, self.templates)
+        self.investigate = Investigate(settings, ai, knowledge, self.templates)
         self.translate = Translate(translator)
         self.deliver = Deliver(settings, notifier)
         self.deliver_tester_report = DeliverTesterReport(settings, notifier, knowledge,
@@ -284,5 +287,5 @@ class ReviewMergeRequest:
         if guidelines:
             ctx.system_extra += prompts.guidelines_section(guidelines)
         if ctx.incremental:
-            ctx.system_extra += prompts.INCREMENTAL_REVIEW_NOTE.format(
+            ctx.system_extra += self.templates.INCREMENTAL_REVIEW_NOTE.format(
                 prev_sha=(ctx.prev_sha or "")[:8])

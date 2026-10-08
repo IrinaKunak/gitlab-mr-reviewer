@@ -13,6 +13,7 @@ from ...ai_client import CHARS_PER_TOKEN, AIError, AIInputTooLargeError, AIResul
 from ...config import Settings
 from ...domain import budget
 from ...domain.models import ChangeSet, Complexity, ReviewJob, ReviewResult, Tier, TriageResult
+from ...prompts import Prompts, default_prompts
 from .. import content
 from .base import ReviewContext
 
@@ -46,9 +47,10 @@ def review_user_prompts(settings: Settings, job: ReviewJob, review_content: str,
 
 
 class Review:
-    def __init__(self, settings: Settings, ai: Any) -> None:
+    def __init__(self, settings: Settings, ai: Any, templates: Prompts | None = None) -> None:
         self.settings = settings
         self.ai = ai
+        self.templates = templates or default_prompts()
 
     async def run(self, ctx: ReviewContext) -> ReviewContext:
         ctx.review = await self.review(
@@ -64,10 +66,10 @@ class Review:
         if triage.complexity is Complexity.TRIVIAL:
             user = prompts.review_user_prompt(mr_header(job), review_content)
             result = await self.ai.complete(
-                Tier.FAST, prompts.TRIVIAL_REVIEW_SYSTEM + system_extra, user,
+                Tier.FAST, self.templates.TRIVIAL_REVIEW_SYSTEM + system_extra, user,
                 max_tokens=1024)
             return ReviewResult(result.text)
-        system = (self.settings.pipeline.review_prompt or prompts.REVIEW_SYSTEM) + system_extra
+        system = (self.settings.pipeline.review_prompt or self.templates.REVIEW_SYSTEM) + system_extra
         if triage.risk_areas:
             system += "\nTriage flagged risk areas: " + ", ".join(triage.risk_areas)
         if tools is not None:
@@ -108,7 +110,7 @@ class Review:
         to. Returns None when the loop produced no usable review — the caller
         falls back to the plain single-shot path."""
         max_calls = self.settings.pipeline.review_max_tool_calls
-        system = system + prompts.REVIEW_TOOLS_NOTE.format(max_calls=max_calls)
+        system = system + self.templates.REVIEW_TOOLS_NOTE.format(max_calls=max_calls)
         last_exc: AIInputTooLargeError | None = None
         for user in review_user_prompts(self.settings, job, review_content, diff_only,
                                         changes):

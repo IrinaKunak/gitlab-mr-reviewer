@@ -19,6 +19,7 @@ from .. import prompts, usage
 from ..config import Settings
 from ..domain.models import DialogueJob, InstanceRef, Tier
 from ..logging_setup import job_context
+from ..prompts import Prompts, default_prompts
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
@@ -42,7 +43,8 @@ class AnswerNote:
     def __init__(self, settings: Settings, *, ai: Any, workspace: RepoWorkspace,
                  usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
                  translator: Translator, budget: ReplyBudget,
-                 pricing: usage.Pricing = usage.BUILTIN_PRICING) -> None:
+                 pricing: usage.Pricing = usage.BUILTIN_PRICING,
+                 templates: Prompts | None = None) -> None:
         self.settings = settings
         self.ai = ai
         self.workspace = workspace
@@ -51,6 +53,7 @@ class AnswerNote:
         self.translator = translator
         self.budget = budget
         self.pricing = pricing
+        self.templates = templates or default_prompts()
 
     async def execute(self, job: DialogueJob) -> None:
         if not job.job_id:
@@ -105,7 +108,7 @@ class AnswerNote:
             header, thread_text, author, job.note_position, diff)
         async with self.workspace.session(ref, job.last_commit or mr.sha or None) as tools:
             result = await self.ai.agent_loop(
-                Tier.MAIN, prompts.DIALOGUE_SYSTEM, user, tools or [],
+                Tier.MAIN, self.templates.DIALOGUE_SYSTEM, user, tools or [],
                 max_iterations=self.settings.pipeline.review_max_tool_calls + 2,
                 max_tokens=4000)
 
