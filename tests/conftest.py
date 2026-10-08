@@ -120,10 +120,8 @@ def world(monkeypatch, tmp_path):
     clock = Clock()
     repo = FakeRepoCache(gitlab, tmp_path / "repos")
     services = build_services(cfg, telegram=telegram, ai=llm, bridge=bridge,
-                              repo_cache=repo, gitlab_client=gitlab.client,
+                              repo_cache=repo, vcs_for=lambda instance: gitlab,
                               clock=clock.monotonic, workers=0)
-    # what the startup instance check learns from GET /user
-    services.bot_usernames["primary"] = gitlab.bot_username
 
     return World(cfg, services, gitlab, llm, telegram, bridge, repo, clock, log_dir,
                  TestClient(create_app(services)), monkeypatch)

@@ -16,14 +16,15 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from functools import partial
+from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
 
-from . import __version__, gitlab_io, state_layout
+from . import __version__, state_layout
+from .adapters.gitlab import GitLabVcs
 from .ai_client import AIClient
+from .application.ports import VcsPort
 from .bridge import ReviewBridge
 from .config import (
     Settings,
@@ -75,11 +76,9 @@ class Services:
     pricing: Pricing
     usage_log: UsageLog
     review_state: ReviewStateStore
-    gitlab_client: Callable[[InstanceRef], Any]
-    # instance name -> the bot's own GitLab username, learned at startup so note
-    # webhooks from the bot itself are dropped at the door instead of queueing a
-    # job (every review post fires one). Runtime state, kept out of the config.
-    bot_usernames: dict[str, str] = field(default_factory=dict)
+    # instance -> its VCS client; the startup check learns each one's bot username,
+    # so note webhooks from the bot itself are dropped at the door
+    vcs_for: Callable[[InstanceRef], VcsPort]
     _verify_task: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -109,14 +108,13 @@ class Services:
         await self.queue.stop()
 
     async def verify_instances(self) -> None:
-        """Startup connectivity check (non-fatal, v1 behavior)."""
+        """Startup connectivity check (non-fatal, v1 behavior): the one
+        authentication per instance; the pipeline retries it lazily on failure."""
         for instance in self.settings.gitlab.routes.values():
             try:
-                gl = await asyncio.to_thread(self.gitlab_client, instance)
-                self.bot_usernames[instance.name] = getattr(
-                    getattr(gl, "user", None), "username", "") or ""
+                bot = await self.vcs_for(instance).connect()
                 logger.info("GitLab instance OK: %s (%s), bot=%s", instance.name,
-                            instance.url, self.bot_usernames[instance.name] or "?")
+                            instance.url, bot or "?")
             except Exception as exc:  # noqa: BLE001
                 logger.error("GitLab instance %s connection failed: %s", instance.name, exc)
                 await self.telegram.notify_error(
@@ -126,7 +124,7 @@ class Services:
 
 def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
                    ai: Any = None, bridge: Any = None, repo_cache: Any = None,
-                   gitlab_client: Callable[[InstanceRef], Any] | None = None,
+                   vcs_for: Callable[[InstanceRef], VcsPort] | None = None,
                    catalog: OpenRouterCatalog | None = None,
                    clock: Callable[[], float] = time.monotonic,
                    workers: int | None = None) -> Services:
@@ -141,20 +139,22 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     ai = ai or AIClient(cfg, overrides=overrides, alert=telegram.notify_error)
     bridge = bridge or ReviewBridge(cfg.bridge, telegram)
     repo_cache = repo_cache or RepoCache(cfg.repo_cache, git_proxy=cfg.network.git_proxy)
-    gitlab_client = gitlab_client or partial(
-        gitlab_io.get_gitlab_client, proxies=cfg.network.requests_proxies)
+    if vcs_for is None:
+        clients: dict[str, VcsPort] = {
+            i.name: GitLabVcs(i, proxies=cfg.network.requests_proxies)
+            for i in cfg.gitlab.routes.values()}
+        vcs_for = lambda instance: clients[instance.name]  # noqa: E731
     review_state = ReviewStateStore(state_dir)
     usage_log = UsageLog(cfg.storage.log_dir)
     pipeline = Pipeline(cfg, ai=ai, telegram=telegram, bridge=bridge, repo_cache=repo_cache,
                         review_state=review_state, usage_log=usage_log, pricing=pricing,
-                        gitlab_client=gitlab_client)
+                        vcs=vcs_for)
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
                         cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
                         pipeline=pipeline, clock=clock)
     return Services(settings=cfg, telegram=telegram, bridge=bridge, ai=ai, pipeline=pipeline,
                     queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,
-                    usage_log=usage_log, review_state=review_state,
-                    gitlab_client=gitlab_client)
+                    usage_log=usage_log, review_state=review_state, vcs_for=vcs_for)
 
 
 def _services_from_env() -> Services:

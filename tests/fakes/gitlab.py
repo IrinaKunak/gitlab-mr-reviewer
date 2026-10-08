@@ -1,23 +1,28 @@
-"""In-memory GitLab behind the python-gitlab object model.
+"""In-memory GitLab implementing VcsPort (reviewer/application/ports.py).
 
-Replaces only `gitlab_io.get_gitlab_client`: everything above it (content
-assembly, conflict check, note posting, discussion lookup) runs the real
-gitlab_io code against these objects. Every API-shaped call is appended to
-`FakeGitLab.calls` so tests can assert what was (not) touched.
+The pipeline talks to it exactly as it talks to adapters/gitlab.GitLabVcs.
+What the real adapter does with python-gitlab (pagination, collapsed-diff
+refetch, error mapping) is covered by its own tests in test_unit.py. Every
+API-shaped call is appended to `FakeGitLab.calls` so tests can assert what
+was (not) touched.
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Any
 
-from gitlab.exceptions import GitlabGetError
+from reviewer.adapters.gitlab import to_changeset
+from reviewer.application.ports import VcsNotFound
+from reviewer.domain.models import (
+    ChangeSet,
+    Discussion,
+    MergeRequestInfo,
+    MergeRequestRef,
+    Note,
+)
 
-
-def _not_found(what: str) -> GitlabGetError:
-    return GitlabGetError(f"404 {what} Not Found", response_code=404)
+CONFLICT_STATUSES = ("cannot_be_merged", "cannot_be_merged_recheck")
 
 
 @dataclass
@@ -28,26 +33,8 @@ class FakeNote:
     system: bool = False
     discussion_id: str = ""
 
-    def as_dict(self) -> dict:
-        return {"id": self.id, "body": self.body, "author": self.author,
-                "system": self.system}
-
-
-class FakeDiscussion:
-    def __init__(self, mr: FakeMR, disc_id: str):
-        self._mr = mr
-        self.id = disc_id
-        self.notes = SimpleNamespace(create=self._create)
-
-    @property
-    def attributes(self) -> dict:
-        return {"id": self.id,
-                "notes": [n.as_dict() for n in self._mr.all_notes
-                          if n.discussion_id == self.id]}
-
-    def _create(self, data: dict) -> FakeNote:
-        return self._mr.add_note(data["body"], discussion_id=self.id,
-                                 call=("discussion_reply", self.id))
+    def as_note(self) -> Note:
+        return Note(self.id, self.author["username"], self.body, self.system)
 
 
 class FakeMR:
@@ -69,34 +56,6 @@ class FakeMR:
         self.has_conflicts = has_conflicts
         self.change_list = changes
         self.all_notes: list[FakeNote] = []
-        self.manager = SimpleNamespace(gitlab=gl)
-        self.notes = SimpleNamespace(create=self._create_note, list=self._list_notes)
-        self.discussions = SimpleNamespace(get=self._get_discussion,
-                                           list=self._list_discussions)
-
-    # --- python-gitlab surface ---
-
-    def changes(self, **kwargs) -> dict[str, Any]:
-        self._gl.calls.append(("mr_changes", self.iid, kwargs))
-        return {"changes": [dict(c) for c in self.change_list]}
-
-    def _create_note(self, data: dict) -> FakeNote:
-        return self.add_note(data["body"], call=("note_create", self.iid))
-
-    def _list_notes(self, **kwargs) -> list[FakeNote]:
-        self._gl.calls.append(("notes_list", self.iid))
-        return list(self.all_notes)
-
-    def _get_discussion(self, disc_id: str) -> FakeDiscussion:
-        if not any(n.discussion_id == disc_id for n in self.all_notes):
-            raise _not_found(f"Discussion {disc_id}")
-        return FakeDiscussion(self, disc_id)
-
-    def _list_discussions(self, **kwargs) -> list[FakeDiscussion]:
-        ids = dict.fromkeys(n.discussion_id for n in self.all_notes)
-        return [FakeDiscussion(self, d) for d in ids]
-
-    # --- test helpers ---
 
     def add_note(self, body: str, *, author: str | None = None, discussion_id: str = "",
                  system: bool = False, call: tuple | None = None) -> FakeNote:
@@ -108,6 +67,9 @@ class FakeMR:
         if call:
             self._gl.calls.append(call)
         return note
+
+    def thread(self, discussion_id: str) -> tuple[Note, ...]:
+        return tuple(n.as_note() for n in self.all_notes if n.discussion_id == discussion_id)
 
     @property
     def bot_notes(self) -> list[str]:
@@ -127,31 +89,6 @@ class FakeProject:
         self.mrs: dict[int, FakeMR] = {}
         self.uploads: list[tuple[str, bytes]] = []
         self.compare_result: dict | None = None
-        self.mergerequests = SimpleNamespace(get=self._get_mr)
-        self.files = SimpleNamespace(get=self._get_file)
-
-    def _get_mr(self, iid: int) -> FakeMR:
-        self._gl.calls.append(("mr_get", iid))
-        if iid not in self.mrs:
-            raise _not_found(f"Merge Request {iid}")
-        return self.mrs[iid]
-
-    def _get_file(self, path: str, ref: str = "") -> SimpleNamespace:
-        self._gl.calls.append(("file_get", path, ref))
-        if path not in self.repo_files:
-            raise _not_found(f"File {path}")
-        content = self.repo_files[path].encode()
-        return SimpleNamespace(decode=lambda: content)
-
-    def repository_compare(self, from_sha: str, to_sha: str) -> dict:
-        self._gl.calls.append(("compare", from_sha, to_sha))
-        return self.compare_result or {"diffs": []}
-
-    def upload(self, filename: str, content: bytes) -> dict:
-        self._gl.calls.append(("upload", filename))
-        self.uploads.append((filename, content))
-        url = f"/uploads/{len(self.uploads)}/{filename}"
-        return {"url": url, "markdown": f"[{filename}]({url})"}
 
     def add_mr(self, iid: int, *, changes: list[dict], title: str = "Change things",
                author: str = "dev", sha: str = "sha-1", source_branch: str = "feature",
@@ -171,34 +108,88 @@ class FakeGitLab:
     calls: list[tuple] = field(default_factory=list)
     ids: itertools.count = field(default_factory=lambda: itertools.count(100))
 
-    def __post_init__(self):
-        self.projects = SimpleNamespace(get=self._get_project)
-        self.user = SimpleNamespace(username=self.bot_username)
-
-    def client(self, instance) -> FakeGitLab:
-        """Drop-in for gitlab_io.get_gitlab_client."""
-        self.calls.append(("auth", instance.name))
-        return self
-
-    def _get_project(self, project_id: int) -> FakeProject:
-        self.calls.append(("project_get", project_id))
-        if project_id not in self.projects_by_id:
-            raise _not_found(f"Project {project_id}")
-        return self.projects_by_id[project_id]
-
-    def http_get(self, path: str) -> dict:
-        """Raw MR details (used by the conflict check)."""
-        self.calls.append(("http_get", path))
-        _, pid, _, iid = path.strip("/").split("/")
-        mr = self.projects_by_id[int(pid)].mrs[int(iid)]
-        return {"merge_status": mr.merge_status, "has_conflicts": mr.has_conflicts}
-
     def add_project(self, project_id: int = 1, path: str = "group/app", *,
                     files: dict[str, str] | None = None,
                     default_branch: str = "main") -> FakeProject:
         project = FakeProject(self, project_id, path, files or {}, default_branch)
         self.projects_by_id[project_id] = project
         return project
+
+    # --- lookup ---
+
+    def _project(self, ref: MergeRequestRef) -> FakeProject:
+        if ref.project_id not in self.projects_by_id:
+            raise VcsNotFound(f"404 Project {ref.project_id} Not Found")
+        return self.projects_by_id[ref.project_id]
+
+    def _mr(self, ref: MergeRequestRef) -> FakeMR:
+        project = self._project(ref)
+        if ref.mr_iid not in project.mrs:
+            raise VcsNotFound(f"404 Merge Request {ref.mr_iid} Not Found")
+        return project.mrs[ref.mr_iid]
+
+    # --- VcsPort ---
+
+    async def connect(self) -> str:
+        self.calls.append(("auth",))
+        return self.bot_username
+
+    async def get_merge_request(self, ref: MergeRequestRef) -> MergeRequestInfo:
+        self.calls.append(("mr_get", ref.mr_iid))
+        mr = self._mr(ref)
+        return MergeRequestInfo(
+            state=mr.state, title=mr.title, author=mr.author["username"],
+            source_branch=mr.source_branch, target_branch=mr.target_branch, sha=mr.sha,
+            has_conflicts=mr.merge_status in CONFLICT_STATUSES or mr.has_conflicts)
+
+    async def get_changes(self, ref: MergeRequestRef) -> ChangeSet:
+        self.calls.append(("mr_changes", ref.mr_iid))
+        return to_changeset([dict(c) for c in self._mr(ref).change_list])
+
+    async def compare(self, ref: MergeRequestRef, from_sha: str,
+                      to_sha: str) -> ChangeSet | None:
+        self.calls.append(("compare", from_sha, to_sha))
+        diffs = (self._project(ref).compare_result or {}).get("diffs")
+        return to_changeset(diffs) if diffs else None
+
+    async def read_file(self, ref: MergeRequestRef, path: str, git_ref: str) -> str:
+        self.calls.append(("file_get", path, git_ref))
+        files = self._project(ref).repo_files
+        if path not in files:
+            raise VcsNotFound(f"404 File {path} Not Found")
+        return files[path]
+
+    async def list_notes(self, ref: MergeRequestRef) -> list[Note]:
+        self.calls.append(("notes_list", ref.mr_iid))
+        return [n.as_note() for n in self._mr(ref).all_notes]
+
+    async def find_discussion(self, ref: MergeRequestRef, note_id: int | None,
+                              discussion_id: str = "") -> Discussion | None:
+        mr = self._mr(ref)
+        if discussion_id and mr.thread(discussion_id):
+            return Discussion(discussion_id, mr.thread(discussion_id))
+        for note in mr.all_notes:
+            if note.id == note_id:
+                return Discussion(note.discussion_id, mr.thread(note.discussion_id))
+        return None
+
+    async def post_note(self, ref: MergeRequestRef, body: str) -> None:
+        self._mr(ref).add_note(body, call=("note_create", ref.mr_iid))
+
+    async def reply_in_discussion(self, ref: MergeRequestRef, discussion_id: str,
+                                  body: str) -> None:
+        mr = self._mr(ref)
+        if not mr.thread(discussion_id):
+            raise VcsNotFound(f"404 Discussion {discussion_id} Not Found")
+        mr.add_note(body, discussion_id=discussion_id,
+                    call=("discussion_reply", discussion_id))
+
+    async def upload(self, ref: MergeRequestRef, filename: str, content: bytes) -> str | None:
+        self.calls.append(("upload", filename))
+        project = self._project(ref)
+        project.uploads.append((filename, content))
+        url = f"/uploads/{len(project.uploads)}/{filename}"
+        return f"[{filename}]({url})"
 
 
 def mr_webhook(project: FakeProject, mr: FakeMR, action: str = "open", *,

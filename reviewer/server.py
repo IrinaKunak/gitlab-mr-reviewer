@@ -27,7 +27,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import __version__, gitlab_io
+from . import __version__
+from .adapters.gitlab import parse_merge_request_webhook, parse_note_webhook
 from .config import ServerSection
 from .dashboard import DASHBOARD_HTML
 from .domain.dedupe import DedupePolicy
@@ -279,10 +280,10 @@ async def handle_gitlab_webhook(request: Request):
     if event_type == "Note Hook":
         if not svc.settings.pipeline.stages.dialogue:
             return {"status": "ignored", "reason": "dialogue disabled"}
-        note_job = gitlab_io.parse_note_webhook(payload, instance)
+        note_job = parse_note_webhook(payload, instance)
         if not note_job:
             return {"status": "ignored", "reason": "not an MR comment"}
-        bot = svc.bot_usernames.get(instance.name, "")
+        bot = svc.vcs_for(instance).bot_username
         if bot and note_job.note_author == bot:
             return {"status": "ignored", "reason": "own note"}
         queued = svc.queue.submit(note_job)
@@ -300,7 +301,7 @@ async def handle_gitlab_webhook(request: Request):
         return {"status": "ignored", "reason": f"Not a merge request event: {event_type}"}
 
     try:
-        review_job = gitlab_io.parse_merge_request_webhook(payload, instance)
+        review_job = parse_merge_request_webhook(payload, instance)
     except Exception as exc:  # noqa: BLE001
         # the caller is GitLab (its hook log is visible to project maintainers):
         # exception text stays in our log/alert, the response carries only an id

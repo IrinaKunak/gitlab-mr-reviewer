@@ -13,8 +13,14 @@ import pytest
 
 from reviewer import ai_client as ai_mod
 from reviewer import bridge as bridge_mod
-from reviewer import gitlab_io
+from reviewer.adapters.gitlab import (
+    GitLabVcs,
+    parse_merge_request_webhook,
+    parse_note_webhook,
+    to_changeset,
+)
 from reviewer.ai_client import AIClient, extract_json
+from reviewer.application import content
 from reviewer.config import Settings
 from reviewer.domain.models import ChangeSet, FileChange, InstanceRef, TriageResult
 from reviewer.repo_cache import _safe_path, repo_grep, repo_list_tree, repo_read_file
@@ -25,6 +31,7 @@ from tests.factories import (
     make_pipeline,
     make_services,
     make_settings,
+    mr_ref,
     review_job,
 )
 
@@ -319,7 +326,7 @@ def test_repo_tools(tmp_path):
     assert "Error" in repo_read_file(tmp_path, "../secret")
 
 
-# --- gitlab_io ---
+# --- GitLab webhooks & review content ---
 
 WEBHOOK_PAYLOAD = {
     "object_attributes": {
@@ -780,29 +787,19 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     assert asyncio.run(p._translate_if_needed("review text", "fast")) == "Обзор: всё в порядке."
 
 
-def test_process_skips_merged_or_closed_mr(monkeypatch):
+def test_process_skips_merged_or_closed_mr():
     # an update webhook can sit in the queue while the MR gets merged/closed
     # (push fix -> merge on green); the worker must not review it then
-    import asyncio
-    from types import SimpleNamespace
-
-    from reviewer import pipeline as pipeline_mod
+    from tests.fakes import FakeGitLab
 
     for state in ("merged", "closed"):
-        stub_mr = SimpleNamespace(state=state)
-        stub_project = SimpleNamespace(
-            mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
-            path_with_namespace="group/proj")
-        stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
-
-        def _boom(*args, **kwargs):
-            raise AssertionError(f"must not run for a {stub_mr.state} MR")
-
-        monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
+        gitlab = FakeGitLab()
+        gitlab.add_project(1).add_mr(2, changes=[], state=state)
         # the AI is unwired: touching it fails the test
-        svc = make_services(gitlab_client=lambda instance: stub_gl)
+        svc = make_services(vcs_for=lambda instance: gitlab)
         asyncio.run(svc.pipeline._process_inner(review_job(), {}))
         assert svc.telegram.messages == []
+        assert [c[0] for c in gitlab.calls] == ["mr_get"]  # no notes, no diffs
 
 
 def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
@@ -824,6 +821,23 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
         review_state.set_last_sha("primary", 100 + i, 1, f"sha{i}")
     assert review_state.get_last_sha("primary", 100, 1) is None
     assert review_state.get_last_sha("primary", 104, 1) == "sha4"
+
+
+# --- GitLab adapter (python-gitlab stays inside adapters/gitlab) ---
+
+def _gl_stub(*, project=None, mr=None, **gl_attrs):
+    """Just enough python-gitlab surface: gl.projects.get -> project,
+    project.mergerequests.get -> mr (lazy or not)."""
+    from types import SimpleNamespace
+    project = project or SimpleNamespace()
+    mr = mr or SimpleNamespace()
+    project.mergerequests = SimpleNamespace(get=lambda iid, lazy=False: mr)
+    return SimpleNamespace(projects=SimpleNamespace(get=lambda pid, lazy=False: project),
+                           **gl_attrs)
+
+
+def _vcs(gl):
+    return GitLabVcs(INSTANCE, client_factory=lambda: gl)
 
 
 def test_incremental_review_helpers():
@@ -854,24 +868,25 @@ def test_incremental_review_helpers():
     assert ".ai-review.md" in prompts.guidelines_section("Focus on SQL")
 
     # delta fetch turns compare diffs into a ChangeSet; degrades to None
+    ref = mr_ref()
     stub = SimpleNamespace(
         repository_compare=lambda a, b: {"diffs": [{"new_path": "x.py", "diff": "+1"}]})
-    delta = gitlab_io.fetch_delta_changes(stub, "aaa", "bbb")
+    delta = asyncio.run(_vcs(_gl_stub(project=stub)).compare(ref, "aaa", "bbb"))
     assert delta == ChangeSet((FileChange(old_path="", new_path="x.py", diff="+1"),))
     stub_empty = SimpleNamespace(repository_compare=lambda a, b: {"diffs": []})
-    assert gitlab_io.fetch_delta_changes(stub_empty, "aaa", "bbb") is None
+    assert asyncio.run(_vcs(_gl_stub(project=stub_empty)).compare(ref, "aaa", "bbb")) is None
 
     def _raise(a, b):
         raise RuntimeError("404 commit not found")
     stub_err = SimpleNamespace(repository_compare=_raise)
-    assert gitlab_io.fetch_delta_changes(stub_err, "aaa", "bbb") is None
+    assert asyncio.run(_vcs(_gl_stub(project=stub_err)).compare(ref, "aaa", "bbb")) is None
 
     # .ai-review.md is best-effort: absent file -> empty string
     class _Files:
         def get(self, path, ref):
             raise RuntimeError("404")
-    assert gitlab_io.fetch_review_guidelines(
-        SimpleNamespace(files=_Files()), "main") == ""
+    vcs = _vcs(_gl_stub(project=SimpleNamespace(files=_Files())))
+    assert asyncio.run(content.read_guidelines(vcs, ref, "main")) == ""
 
 
 def test_triage_chooses_skipped_files_and_budget_truncation():
@@ -881,7 +896,7 @@ def test_triage_chooses_skipped_files_and_budget_truncation():
     # list cannot know a project's conventions.
     from reviewer import prompts
 
-    changes = gitlab_io.to_changeset({"changes": [
+    changes = to_changeset({"changes": [
         {"new_path": "src/auth.py", "diff": "+def login():\n" * 50},
         {"new_path": "public/logo.svg", "diff": "+<path d='M0 0'/>\n" * 400},
         {"new_path": "yarn.lock", "diff": "+dep\n" * 300, "new_file": True},
@@ -889,7 +904,7 @@ def test_triage_chooses_skipped_files_and_budget_truncation():
     ]})
 
     # the manifest triage judges from: status, size and path for every file
-    manifest = gitlab_io.file_manifest(changes)
+    manifest = content.file_manifest(changes)
     assert "modified\t" in manifest and "public/logo.svg" in manifest
     assert "added\t" in manifest                     # yarn.lock is new_file
     assert manifest in prompts.triage_user_prompt(review_job(), "diff", manifest)
@@ -900,16 +915,16 @@ def test_triage_chooses_skipped_files_and_budget_truncation():
     skip = {"public/logo.svg", "yarn.lock"}
 
     # honouring triage's verdict keeps the code and names (not dumps) the rest
-    out = gitlab_io.extract_diff_only(changes, skip=skip)
+    out = content.extract_diff_only(changes, skip=skip)
     assert "def login" in out and "def charge" in out
     assert "<path d=" not in out
     assert "SKIPPED — 2 changed file(s)" in out
     assert "deleted: " not in out and "modified: public/logo.svg" in out
     # no skip list -> unchanged v1 behaviour, everything included
-    assert "<path d=" in gitlab_io.extract_diff_only(changes)
+    assert "<path d=" in content.extract_diff_only(changes)
 
     # budget cap drops whole files and says so, instead of refusing the MR
-    small = gitlab_io.extract_diff_only(changes, max_chars=800, skip=skip)
+    small = content.extract_diff_only(changes, max_chars=800, skip=skip)
     assert len(small) < 2000
     assert "more changed file(s) omitted" in small
     assert "def login" in small                      # first file still reviewed
@@ -949,12 +964,12 @@ def test_force_full_re_review_marker():
         "user": {"username": "dev"},
         "labels": [{"title": "re-review"}],
     }
-    parsed = gitlab_io.parse_merge_request_webhook(payload, INSTANCE)
+    parsed = parse_merge_request_webhook(payload, INSTANCE)
     assert parsed and parsed.force_full is True
     payload["labels"] = []
-    assert gitlab_io.parse_merge_request_webhook(payload, INSTANCE).force_full is False
+    assert parse_merge_request_webhook(payload, INSTANCE).force_full is False
     payload["object_attributes"]["title"] = "INCR-54 [re-review]"
-    assert gitlab_io.parse_merge_request_webhook(payload, INSTANCE).force_full is True
+    assert parse_merge_request_webhook(payload, INSTANCE).force_full is True
 
     q = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=30)
     job = review_job(project_id=170, mr_iid=5, last_commit="abc")
@@ -965,39 +980,55 @@ def test_force_full_re_review_marker():
 
 def test_real_mr_author_and_comment_fetch():
     # webhook "user" is the EVENT ACTOR (title edit by the owner relabeled other
-    # people's MRs as spikerwork) — the live MR object carries the real author
+    # people's MRs as spikerwork) — the live MR carries the real author
     from types import SimpleNamespace
 
-    assert gitlab_io.real_mr_author(
-        SimpleNamespace(author={"username": "nisvem"})) == "nisvem"
-    assert gitlab_io.real_mr_author(SimpleNamespace(author=None)) == ""
+    from gitlab.exceptions import GitlabListError
+
+    from reviewer.application.ports import VcsError
+    from reviewer.domain.models import Note
+
+    ref = mr_ref()
+    live = SimpleNamespace(attributes={
+        "state": "opened", "title": "t", "author": {"username": "nisvem"},
+        "source_branch": "f", "target_branch": "main", "sha": "abc",
+        "merge_status": "can_be_merged",
+        "diff_refs": {"base_sha": "b", "head_sha": "abc", "start_sha": "s"}})
+    info = asyncio.run(_vcs(_gl_stub(mr=live)).get_merge_request(ref))
+    assert info.author == "nisvem" and info.sha == "abc" and not info.has_conflicts
+    assert info.diff_refs.head_sha == "abc"
+    no_author = SimpleNamespace(attributes={"state": "opened", "author": None})
+    assert asyncio.run(_vcs(_gl_stub(mr=no_author)).get_merge_request(ref)).author == ""
 
     def note(author, body, system=False):
-        return SimpleNamespace(author={"username": author}, body=body, system=system)
+        return SimpleNamespace(attributes={"id": 1, "author": {"username": author},
+                                           "body": body, "system": system})
 
-    notes = [
+    raw = [
         note("gitlab", "added 1 commit", system=True),      # system -> skipped
         note("botuser", "## 🤖 Automated Code Review ..."),  # our own -> skipped
         note("irina", "это осознанное изменение, фабрика исключений"),
         note("artem", "каталог без бэка не бывает"),
     ]
-    stub_mr = SimpleNamespace(notes=SimpleNamespace(list=lambda **kw: notes))
-    text = gitlab_io.fetch_mr_comments(stub_mr, bot_username="botuser")
+    stub_mr = SimpleNamespace(notes=SimpleNamespace(list=lambda **kw: raw))
+    notes = asyncio.run(_vcs(_gl_stub(mr=stub_mr)).list_notes(ref))
+    assert notes[2] == Note(1, "irina", "это осознанное изменение, фабрика исключений")
+    text = content.format_comments(notes, bot_username="botuser")
     assert "[irina]: это осознанное" in text
     assert "[artem]:" in text
     assert "Automated Code Review" not in text and "added 1 commit" not in text
 
-    # oversized discussions keep the tail (latest replies), and API failures
-    # must not break the review
-    long_notes = [note("dev", f"comment {i} " + "x" * 500) for i in range(30)]
-    stub_long = SimpleNamespace(notes=SimpleNamespace(list=lambda **kw: long_notes))
-    capped = gitlab_io.fetch_mr_comments(stub_long, max_chars=2000)
+    # oversized discussions keep the tail (latest replies)
+    long_notes = [Note(i, "dev", f"comment {i} " + "x" * 500) for i in range(30)]
+    capped = content.format_comments(long_notes, max_chars=2000)
     assert len(capped) <= 2001 and "comment 29" in capped
 
+    # API failures surface as VcsError (the pipeline treats comments as optional)
     def _raise(**kw):
-        raise RuntimeError("403")
+        raise GitlabListError("403 Forbidden", response_code=403)
     broken = SimpleNamespace(notes=SimpleNamespace(list=_raise))
-    assert gitlab_io.fetch_mr_comments(broken) == ""
+    with pytest.raises(VcsError):
+        asyncio.run(_vcs(_gl_stub(mr=broken)).list_notes(ref))
 
 
 def test_translate_long_text_upgrades_tier(monkeypatch):
@@ -1019,60 +1050,142 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
     assert tiers == ["fast", "main"]
 
 
-def test_process_skips_already_reviewed_sha(monkeypatch, tmp_path):
+def test_process_skips_already_reviewed_sha(tmp_path):
     # metadata-only update webhooks (title/labels edits) re-arrive with the same
     # head sha we already reviewed — must skip before any notify/AI spend
-    import asyncio
-    from types import SimpleNamespace
+    from tests.fakes import FakeGitLab
 
-    from reviewer import pipeline as pipeline_mod
-
-    stub_mr = SimpleNamespace(state="opened", sha="abc123")
-    stub_project = SimpleNamespace(
-        mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
-        path_with_namespace="group/proj")
-    stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("must not run for an already-reviewed sha")
-
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
-    svc = make_services(make_settings(tmp_path), gitlab_client=lambda instance: stub_gl)
+    gitlab = FakeGitLab()
+    gitlab.add_project(1).add_mr(2, changes=[], sha="abc123")
+    svc = make_services(make_settings(tmp_path), vcs_for=lambda instance: gitlab)
     job = review_job(last_commit="abc123")
     svc.review_state.set_last_sha(*job.ref.key, "abc123")
     asyncio.run(svc.pipeline._process_inner(job, {}))
     assert svc.telegram.messages == []
+    assert [c[0] for c in gitlab.calls] == ["mr_get"]
 
 
 def test_review_content_handles_collapsed_diffs():
     # regression: GitLab returns empty diffs for collapsed (too large) files —
     # exactly the biggest files silently vanished from the review (MR !18)
-    from types import SimpleNamespace
+    from tests.fakes import FakeGitLab
 
-    from reviewer import gitlab_io
-
-    class _File:
-        def decode(self):
-            return b"def core(): ...\n"
-
-    project = SimpleNamespace(files=SimpleNamespace(get=lambda path, ref: _File()))
-    mr = SimpleNamespace(source_branch="v2")
-    changes = gitlab_io.to_changeset({"changes": [
+    gitlab = FakeGitLab()
+    gitlab.add_project(1, files={"reviewer/ai_client.py": "def core(): ...\n"})
+    changes = to_changeset({"changes": [
         {"new_path": "reviewer/ai_client.py", "diff": "", "collapsed": True, "new_file": True},
         {"new_path": "small.py", "diff": "+ok", "new_file": True},
         {"new_path": "unchanged.py", "diff": ""},  # genuinely empty -> still skipped
     ]})
-    out = gitlab_io.extract_review_content(project, mr, changes)
+    out = asyncio.run(content.assemble_review_content(gitlab, mr_ref(), changes, "v2"))
     assert "reviewer/ai_client.py" in out and "def core" in out
     assert "DIFF UNAVAILABLE" in out
     assert "unchanged.py" not in out
+    assert ("file_get", "reviewer/ai_client.py", "v2") in gitlab.calls
 
-    diff_only = gitlab_io.extract_diff_only(changes)
+    diff_only = content.extract_diff_only(changes)
     assert "[diff unavailable: file too large]" in diff_only
 
 
+def test_gitlab_diffs_paginated_and_collapsed_files_refetched_raw():
+    # #17: /changes is deprecated since GitLab 15.7 — read /diffs, all pages.
+    # /diffs has no access_raw_diffs, so ONLY files it returns collapsed are
+    # re-read via /changes?access_raw_diffs=true (Gitaly, past the per-file
+    # collapse limit); still-collapsed ones stay marked (content shows the file)
+    from types import SimpleNamespace
+
+    listed = []
+
+    def http_list(path, query_data=None, get_all=False):
+        listed.append((path, query_data, get_all))
+        return [{"new_path": "a.py", "diff": "+a"},
+                {"new_path": "big.py", "diff": "", "collapsed": True},
+                {"new_path": "huge.bin", "diff": "", "too_large": True}]
+
+    raw_calls = []
+
+    def changes(**kw):
+        raw_calls.append(kw)
+        return {"changes": [{"new_path": "a.py", "diff": "+a"},
+                            {"new_path": "big.py", "diff": "+raw big diff"},
+                            {"new_path": "huge.bin", "diff": ""}]}
+
+    gl = _gl_stub(mr=SimpleNamespace(changes=changes), http_list=http_list)
+    got = asyncio.run(_vcs(gl).get_changes(mr_ref(project_id=7, mr_iid=3)))
+    assert listed == [("/projects/7/merge_requests/3/diffs", {"per_page": 20}, True)]
+    assert raw_calls == [{"access_raw_diffs": "true"}]
+    by_path = {f.path: f for f in got.files}
+    assert by_path["big.py"].diff == "+raw big diff"
+    assert by_path["huge.bin"].collapsed and not by_path["huge.bin"].diff
+    assert [f.path for f in got.files] == ["a.py", "big.py", "huge.bin"]  # order kept
+
+    # nothing collapsed -> /diffs alone, the deprecated endpoint is never called
+    raw_calls.clear()
+    gl2 = _gl_stub(mr=SimpleNamespace(changes=changes),
+                   http_list=lambda *a, **kw: [{"new_path": "a.py", "diff": "+a"}])
+    assert len(asyncio.run(_vcs(gl2).get_changes(mr_ref()))) == 1
+    assert raw_calls == []
+
+    # GitLab 17.5 answers /diffs with a 500 on some page sizes (prod 2026-10-08):
+    # a failing /diffs falls back to the old read instead of failing the review
+    from gitlab.exceptions import GitlabListError
+
+    def broken_list(*a, **kw):
+        raise GitlabListError("500 Internal Server Error", response_code=500)
+    gl3 = _gl_stub(mr=SimpleNamespace(changes=changes), http_list=broken_list)
+    assert len(asyncio.run(_vcs(gl3).get_changes(mr_ref()))) == 3
+    assert raw_calls == [{"access_raw_diffs": "true"}]
+
+
+def test_gitlab_client_authenticates_once_and_maps_errors():
+    # #12: one client per instance, gl.auth() once (startup), not per job
+    from types import SimpleNamespace
+
+    from gitlab.exceptions import GitlabCreateError, GitlabGetError
+
+    from reviewer.application.ports import VcsError, VcsNotFound
+
+    built, auths = [], []
+
+    def factory():
+        gl = _gl_stub(user=None)
+        gl.auth = lambda: (auths.append(1), setattr(gl, "user",
+                                                    SimpleNamespace(username="bot")))
+        built.append(gl)
+        return gl
+
+    vcs = GitLabVcs(INSTANCE, client_factory=factory)
+    assert vcs.bot_username == ""
+    assert asyncio.run(vcs.connect()) == "bot" and vcs.bot_username == "bot"
+    assert vcs.gl is vcs.gl  # reused
+    assert len(built) == 1 and len(auths) == 1
+
+    def missing(iid, lazy=False):
+        raise GitlabGetError("404 Not found", response_code=404)
+    gone = _gl_stub()
+    gone.projects.get(1).mergerequests.get = missing
+    with pytest.raises(VcsNotFound):
+        asyncio.run(_vcs(gone).get_merge_request(mr_ref()))
+
+    def refuse(data):
+        raise GitlabCreateError("500 boom", response_code=500)
+    gl = _gl_stub(mr=SimpleNamespace(notes=SimpleNamespace(create=refuse)))
+    with pytest.raises(VcsError):
+        asyncio.run(_vcs(gl).post_note(mr_ref(), "x"))
+
+    # conflicts come with the MR itself — no second request (v1 called http_get)
+    conflicted = SimpleNamespace(attributes={"state": "opened",
+                                             "merge_status": "cannot_be_merged"})
+    assert asyncio.run(_vcs(_gl_stub(mr=conflicted)).get_merge_request(
+        mr_ref())).has_conflicts
+    unresolved = SimpleNamespace(attributes={"state": "opened",
+                                             "blocking_discussions_resolved": False})
+    assert asyncio.run(_vcs(_gl_stub(mr=unresolved)).get_merge_request(
+        mr_ref())).has_conflicts
+
+
 def test_parse_webhook_url_fix_and_actions():
-    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
+    parsed = parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
     assert parsed is not None
     assert parsed.ref.url == "https://lab/x/-/merge_requests/7"  # contractual URL typo fix
     assert parsed.last_commit == "deadbeef"
@@ -1080,29 +1193,29 @@ def test_parse_webhook_url_fix_and_actions():
 
     closed = {**WEBHOOK_PAYLOAD,
               "object_attributes": {**WEBHOOK_PAYLOAD["object_attributes"], "action": "close"}}
-    assert gitlab_io.parse_merge_request_webhook(closed, INSTANCE) is None
+    assert parse_merge_request_webhook(closed, INSTANCE) is None
 
 
 def test_parse_webhook_no_review_marker():
     tagged = {**WEBHOOK_PAYLOAD,
               "object_attributes": {**WEBHOOK_PAYLOAD["object_attributes"],
                                     "title": "big infra change [no-review]"}}
-    assert gitlab_io.parse_merge_request_webhook(tagged, INSTANCE) is None
+    assert parse_merge_request_webhook(tagged, INSTANCE) is None
 
     labeled = {**WEBHOOK_PAYLOAD, "labels": [{"title": "No-Review"}]}
-    assert gitlab_io.parse_merge_request_webhook(labeled, INSTANCE) is None
+    assert parse_merge_request_webhook(labeled, INSTANCE) is None
 
 
 def test_extract_jira_keys():
-    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
-    keys = gitlab_io.extract_jira_keys(parsed)
+    parsed = parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
+    keys = content.extract_jira_keys(parsed)
     assert keys == ["PBV-123", "ABC-9"]
 
 
 def test_format_review_comment_language():
-    comment = gitlab_io.format_review_comment("текст обзора", "ru")
+    comment = content.format_review_comment("текст обзора", "ru")
     assert "Автоматический обзор кода" in comment
-    assert "Automated Code Review" in gitlab_io.format_review_comment("review", "en")
+    assert "Automated Code Review" in content.format_review_comment("review", "en")
 
 
 # --- review-fix regressions ---
@@ -1260,7 +1373,7 @@ def test_parse_note_webhook_variants():
         "merge_request": {"iid": 10, "url": "https://x/mr/10",
                           "last_commit": {"id": "sha1"}},
     }
-    parsed = gitlab_io.parse_note_webhook(base, INSTANCE)
+    parsed = parse_note_webhook(base, INSTANCE)
     assert parsed and parsed.kind == "dialogue"
     assert parsed.ref.mr_iid == 10 and parsed.note_id == 555
     assert parsed.discussion_id == "abc123"
@@ -1271,100 +1384,86 @@ def test_parse_note_webhook_variants():
     diff_note = {**base, "object_attributes": {
         **base["object_attributes"],
         "position": {"new_path": "app/views.py", "new_line": 88}}}
-    assert gitlab_io.parse_note_webhook(diff_note, INSTANCE).note_position == "app/views.py:88"
+    assert parse_note_webhook(diff_note, INSTANCE).note_position == "app/views.py:88"
 
     # system notes, non-MR comments, empty bodies -> not dialogue material
     system_note = {**base, "object_attributes": {**base["object_attributes"], "system": True}}
-    assert gitlab_io.parse_note_webhook(system_note, INSTANCE) is None
+    assert parse_note_webhook(system_note, INSTANCE) is None
     issue_note = {**base, "object_attributes": {
         **base["object_attributes"], "noteable_type": "Issue"}}
-    assert gitlab_io.parse_note_webhook(issue_note, INSTANCE) is None
+    assert parse_note_webhook(issue_note, INSTANCE) is None
     empty = {**base, "object_attributes": {**base["object_attributes"], "note": "  "}}
-    assert gitlab_io.parse_note_webhook(empty, INSTANCE) is None
-    assert gitlab_io.parse_note_webhook({**base, "merge_request": {}}, INSTANCE) is None
-    assert gitlab_io.parse_note_webhook({"object_kind": "push"}, INSTANCE) is None
+    assert parse_note_webhook(empty, INSTANCE) is None
+    assert parse_note_webhook({**base, "merge_request": {}}, INSTANCE) is None
+    assert parse_note_webhook({"object_kind": "push"}, INSTANCE) is None
 
 
 def test_thread_helpers():
-    notes = [
-        {"id": 1, "author": {"username": "reviewer-bot"}, "body": "## Review\nfinding A"},
-        {"id": 2, "author": {"username": "irina"}, "body": "ну нет изменений же"},
-        {"id": 3, "author": {"username": "gitlab"}, "system": True, "body": "added 1 commit"},
-    ]
-    text = gitlab_io.render_thread(notes, "reviewer-bot")
+    from reviewer.domain.models import Discussion, Note
+
+    notes = [Note(1, "reviewer-bot", "## Review\nfinding A"),
+             Note(2, "irina", "ну нет изменений же"),
+             Note(3, "gitlab", "added 1 commit", system=True)]
+    text = content.render_thread(notes, "reviewer-bot")
     assert "[@reviewer-bot [bot — this is you]]" in text
     assert "[@irina]" in text and "added 1 commit" not in text
 
-    assert gitlab_io.thread_involves_bot(notes, "reviewer-bot") is True
-    assert gitlab_io.thread_involves_bot(notes, "other-bot") is False
-    assert gitlab_io.thread_involves_bot(notes, "") is False
+    assert content.thread_involves_bot(notes, "reviewer-bot") is True
+    assert content.thread_involves_bot(notes, "other-bot") is False
+    assert content.thread_involves_bot(notes, "") is False
     # bot note id 1 < trigger id 2 -> not answered yet; a bot note after -> answered
-    assert gitlab_io.bot_answered_after(notes, 2, "reviewer-bot") is False
-    answered = notes + [{"id": 4, "author": {"username": "reviewer-bot"}, "body": "ok"}]
-    assert gitlab_io.bot_answered_after(answered, 2, "reviewer-bot") is True
+    assert content.bot_answered_after(notes, 2, "reviewer-bot") is False
+    answered = [*notes, Note(4, "reviewer-bot", "ok")]
+    assert content.bot_answered_after(answered, 2, "reviewer-bot") is True
 
-    assert gitlab_io.mentions_user("cc @Reviewer-Bot, взгляни", "reviewer-bot") is True
-    assert gitlab_io.mentions_user("no mention here", "reviewer-bot") is False
-    assert gitlab_io.mentions_user("@reviewer-bot2 hi", "reviewer-bot") is False
-    assert gitlab_io.mentions_user("hi", "") is False
+    assert content.mentions_user("cc @Reviewer-Bot, взгляни", "reviewer-bot") is True
+    assert content.mentions_user("no mention here", "reviewer-bot") is False
+    assert content.mentions_user("@reviewer-bot2 hi", "reviewer-bot") is False
+    assert content.mentions_user("hi", "") is False
 
-    # discussion_context: hint path, scan fallback, API failure -> ("", [])
+    # adapter find_discussion: hint path, scan fallback, API failure -> None
     from types import SimpleNamespace
     hit = SimpleNamespace(id="d9", attributes={"notes": [{"id": 5, "body": "x"}]})
 
     class _Discussions:
-        def get(self, did):
+        def get(self, did, lazy=False):
             assert did == "d9"
             return hit
+
         def list(self, **kw):
             return iter([SimpleNamespace(id="other", attributes={"notes": [{"id": 1}]}),
                          hit])
-    mr = SimpleNamespace(discussions=_Discussions())
-    assert gitlab_io.discussion_context(mr, 5, "d9") == ("d9", [{"id": 5, "body": "x"}])
-    assert gitlab_io.discussion_context(mr, 5, "") == ("d9", [{"id": 5, "body": "x"}])
+    vcs = _vcs(_gl_stub(mr=SimpleNamespace(discussions=_Discussions())))
+    expected = Discussion("d9", (Note(5, "", "x"),))
+    assert asyncio.run(vcs.find_discussion(mr_ref(), 5, "d9")) == expected
+    assert asyncio.run(vcs.find_discussion(mr_ref(), 5, "")) == expected
 
     class _Broken:
-        def get(self, did):
+        def get(self, did, lazy=False):
             raise RuntimeError("403")
+
         def list(self, **kw):
             raise RuntimeError("403")
-    assert gitlab_io.discussion_context(
-        SimpleNamespace(discussions=_Broken()), 5, "d9") == ("", [])
+    broken = _vcs(_gl_stub(mr=SimpleNamespace(discussions=_Broken())))
+    assert asyncio.run(broken.find_discussion(mr_ref(), 5, "d9")) is None
 
 
-def test_dialogue_answers_in_thread(monkeypatch):
+def test_dialogue_answers_in_thread():
     # "Пусть сам подтверждает" — the bot answers a dev's reply, checking the
     # repo itself; NO_REPLY suppresses the answer; budget caps runaway threads
-    from types import SimpleNamespace
-
-    from reviewer import pipeline as pipeline_mod
     from reviewer.ai_client import AIResult
+    from tests.fakes import FakeGitLab, file_change
 
-    posted: list[tuple] = []
-
-    stub_mr = SimpleNamespace(
-        title="MR 10", source_branch="f", target_branch="dev", author={"username": "dev1"},
-        changes=lambda access_raw_diffs=None: {"changes": [
-            {"new_path": "a.py", "diff": "+x = 1"}]})
-    stub_project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda iid: stub_mr))
-    stub_gl = SimpleNamespace(user=SimpleNamespace(username="reviewer-bot"),
-                              projects=SimpleNamespace(get=lambda pid: stub_project))
-    thread = [{"id": 1, "author": {"username": "reviewer-bot"}, "body": "finding"},
-              {"id": 2, "author": {"username": "irina"}, "body": "точно?"}]
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
-                        lambda mr, nid, did="": ("d1", thread))
+    gitlab = FakeGitLab()
+    mr = gitlab.add_project(1, "g/p").add_mr(
+        10, changes=[file_change("a.py", "+x = 1")], title="MR 10", author="dev1",
+        source_branch="f", target_branch="dev")
+    finding = mr.add_note("finding")                                    # the bot
+    question = mr.add_note("точно?", author="irina", discussion_id=finding.discussion_id)
 
     class _NoRepo:
         async def checkout_mr(self, *a, **kw):
             raise RuntimeError("clone disabled in tests")
-
-    async def _record_reply(mr, did, body):
-        posted.append(("thread", did, body))
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_discussion_reply", _record_reply)
-
-    async def _record_note(mr, body):
-        posted.append(("note", body))
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", _record_note)
 
     answers = iter([AIResult(text="Checked views.py:12 — IsAuthenticated is intact."),
                     AIResult(text="NO_REPLY")])
@@ -1378,31 +1477,32 @@ def test_dialogue_answers_in_thread(monkeypatch):
 
     cfg = make_settings(pipeline__language="en")
     p = make_pipeline(cfg, ai=StubAI(), repo_cache=_NoRepo(),
-                      gitlab_client=lambda instance: stub_gl)
-    note = dialogue_job(project_id=1, project_path="g/p", mr_iid=10, note_id=2,
-                        discussion_id="d1", note_body="точно?", note_author="irina",
-                        last_commit="sha1")
+                      vcs_for=lambda instance: gitlab)
+    note = dialogue_job(project_id=1, project_path="g/p", mr_iid=10, note_id=question.id,
+                        discussion_id=finding.discussion_id, note_body="точно?",
+                        note_author="irina", last_commit="sha1")
     asyncio.run(p.process_note(note))
-    assert posted == [("thread", "d1", "Checked views.py:12 — IsAuthenticated is intact.")]
+    assert mr.bot_notes == ["finding", "Checked views.py:12 — IsAuthenticated is intact."]
+    assert ("discussion_reply", finding.discussion_id) in gitlab.calls
     # the model sees the thread, knows which side it is, and the diff
     assert "[bot — this is you]" in seen_prompts[0]
     assert "Answer the last message, from @irina." in seen_prompts[0]
     assert "+x = 1" in seen_prompts[0]
 
-    # NO_REPLY -> nothing posted
-    asyncio.run(p.process_note(replace(note, note_id=3)))
-    assert len(posted) == 1
+    # a newer question in the same thread; NO_REPLY -> nothing posted
+    again = mr.add_note("ещё?", author="irina", discussion_id=finding.discussion_id)
+    asyncio.run(p.process_note(replace(note, note_id=again.id, note_body="ещё?")))
+    assert len(mr.bot_notes) == 2
 
     # the bot's own note must never trigger an answer (loop guard)
     asyncio.run(p.process_note(replace(note, note_id=4, note_author="reviewer-bot")))
-    assert len(posted) == 1
+    assert len(mr.bot_notes) == 2
 
     # a thread without the bot and without a mention is the humans talking
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
-                        lambda mr, nid, did="": ("d2", [
-                            {"id": 9, "author": {"username": "artem"}, "body": "hi"}]))
-    asyncio.run(p.process_note(replace(note, note_id=9, discussion_id="d2")))
-    assert len(posted) == 1
+    chat = mr.add_note("hi", author="artem")
+    asyncio.run(p.process_note(replace(note, note_id=chat.id, note_author="artem",
+                                       discussion_id=chat.discussion_id, note_body="hi")))
+    assert len(mr.bot_notes) == 2
 
     # per-MR budget: once exhausted the bot stays silent
     cfg.pipeline.dialogue_max_replies_per_mr = 1
@@ -1751,14 +1851,12 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
     assert alerts[0][1]["job_id"] == "deadbeef"
 
 
-def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
+def test_deliver_review_failure_note_hides_exception_text():
     from types import SimpleNamespace
-
-    from reviewer import pipeline as pipeline_mod
 
     posted = []
 
-    async def fake_post(mr, body):
+    async def fake_post(ref, body):
         if not posted:
             posted.append(None)
             raise RuntimeError(_LEAKY)
@@ -1767,11 +1865,10 @@ def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
     async def fake_alert(*a, **k):
         return True
 
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", fake_post)
-    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert))
-    ok = asyncio.run(p._deliver_review(
-        SimpleNamespace(), review_job(job_id="cafe0001"), SimpleNamespace(),
-        False, "review"))
+    vcs = SimpleNamespace(post_note=fake_post)
+    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert),
+                      vcs_for=lambda instance: vcs)
+    ok = asyncio.run(p._deliver_review(review_job(job_id="cafe0001"), False, "review"))
     assert ok is False
     assert "10.0.0.5" not in posted[1] and "cafe0001" in posted[1]
 
@@ -1789,7 +1886,7 @@ def test_webhook_500_hides_exception_text(monkeypatch):
     async def fake_alert(*a, **k):
         return True
 
-    monkeypatch.setattr(server.gitlab_io, "parse_merge_request_webhook", boom)
+    monkeypatch.setattr(server, "parse_merge_request_webhook", boom)
     cfg = make_settings(gitlab__routes={"hook": INSTANCE})
     svc = make_services(cfg, telegram=SimpleNamespace(notify_error=fake_alert))
     resp = TestClient(server.create_app(svc)).post(

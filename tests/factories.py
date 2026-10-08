@@ -84,7 +84,7 @@ def make_services(cfg: Any = None, **deps: Any) -> Any:
     deps.setdefault("ai", _Unwired("ai"))
     deps.setdefault("bridge", FakeBridge(enabled=False))
     deps.setdefault("repo_cache", _Unwired("repo_cache"))
-    deps.setdefault("gitlab_client", _Unwired("gitlab_client"))
+    deps.setdefault("vcs_for", _Unwired("vcs_for"))
     deps.setdefault("workers", 0)
     return build_services(cfg, **deps)
 

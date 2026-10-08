@@ -40,9 +40,18 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   `TriageResult`, `ReviewResult`, `Investigation`; StrEnums `Tier`, `Complexity`,
   `JobKind` that compare equal to the plain strings in config/overrides/usage.jsonl),
   `skip.py` (`resolve_skip`), `budget.py` (the big-MR degradation ladder),
-  `dedupe.py`, `investigation.py`. Adapters build models at the edge:
-  `gitlab_io.parse_*_webhook(payload, instance)` → jobs, `gitlab_io.to_changeset`
-  for GitLab `changes`/`compare` payloads
+  `dedupe.py`, `investigation.py`. Adapters build models at the edge.
+- **reviewer/application/** — `ports.py`: `VcsPort` (async: get MR, changes, compare,
+  read file, notes, discussions, post note / thread reply, upload; `VcsError`,
+  `VcsNotFound`) — the pipeline talks to GitLab ONLY through it, no SDK object crosses
+  it. `content.py`: pure review-input assembly from domain models (diff/manifest/
+  file-context text, comments, thread rendering, review comment format, Jira keys);
+  file reads go through the port.
+- **reviewer/adapters/gitlab/** — `GitLabVcs` (VcsPort over python-gitlab): ONE client
+  per instance built by bootstrap, `gl.auth()` once at startup (`connect()`, which
+  also yields the bot username; the pipeline retries it lazily if GitLab was down at
+  boot), lazy project/MR handles so notes/uploads need no extra GET, conflicts read
+  from the MR itself. `webhooks.py`: `parse_*_webhook(payload, instance)` → jobs.
 - **reviewer/pipeline.py** — stage orchestrator: triage (fast) → review (main,
   **agentic with repo tools** — see below) → investigator (smart, agentic, complex MRs
   only) → translate EN→RU → deliver review (+impact analysis) and tester report; one
@@ -77,8 +86,7 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   corrupt file reads as empty, an unwritable one stays in memory), atomic writes via
   temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
   the cache sweep removes orphaned `<sha256>.*.tmp` too)
-- **reviewer/gitlab_io.py / telegram_io.py** — GitLab and Telegram I/O (SOCKS via proxies
-  dict); **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **reviewer/telegram_io.py** — Telegram I/O (`TelegramClient`); **reviewer/prompts.py** — English-only prompts (translation is a stage)
 - **reviewer/config.py** — pydantic-settings, nested sections (`settings.gitlab`,
   `.llm.tiers.{fast,main,smart}`, `.notify.telegram`, `.bridge`, `.pipeline.stages`,
   `.repo_cache`, `.dedupe`, `.storage`, `.server`, `.network`). Sources: flat env
@@ -137,9 +145,13 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 
 ## Operational gotchas (each cost real money/debugging to learn)
 
-- **GitLab collapses large per-file diffs to empty strings** — changes are fetched with
-  `access_raw_diffs=true`; still-collapsed files fall back to current file content with a
-  marker. Never silently skip empty diffs.
+- **GitLab collapses large per-file diffs to empty strings** — changes come from `/diffs`
+  (paginated; `/changes` is deprecated since 15.7), which has NO `access_raw_diffs`: only
+  files it returns collapsed are re-read via `/changes?access_raw_diffs=true` (Gitaly);
+  still-collapsed files fall back to current file content with a marker. Never silently
+  skip empty diffs. `/diffs` page size stays at GitLab's default 20: GitLab 17.5 answers
+  `per_page=50/100` with a 500 (verified 2026-10-08); if `/diffs` fails anyway the
+  adapter reads the whole MR through `/changes` instead.
 - **Big MRs degrade, they are never refused** (prod: !779 = 655 files / 235k tokens got
   "MR too large to analyze"). Three levers, in order: (1) **triage returns `skip_globs`** —
   the model sees a path/status/size manifest and picks patterns for files not worth

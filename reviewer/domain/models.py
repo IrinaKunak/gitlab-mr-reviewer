@@ -3,7 +3,7 @@
 Replaces the untyped `mr_data` / `gitlab_config` / `triage` / `changes` /
 `investigation` dicts (#6): a typo in a field name is now an AttributeError at
 the first test run instead of a silent `.get()` default in production.
-Everything here is frozen and I/O-free; adapters (gitlab_io, server) build
+Everything here is frozen and I/O-free; adapters (adapters/gitlab, server) build
 these from API payloads.
 """
 
@@ -53,6 +53,42 @@ class MergeRequestRef:
     def key(self) -> tuple[str, int, int]:
         """(instance, project, iid) — dedupe, review state and reply budgets."""
         return (self.instance.name, self.project_id, self.mr_iid)
+
+
+@dataclass(frozen=True)
+class DiffRefs:
+    """The MR's diff anchor SHAs (needed for line-anchored discussions)."""
+    base_sha: str
+    head_sha: str
+    start_sha: str
+
+
+@dataclass(frozen=True)
+class MergeRequestInfo:
+    """Live MR state as the VCS reports it when a job runs (the webhook payload
+    can be stale: the MR may have been merged or relabelled since)."""
+    state: str
+    title: str
+    author: str  # the real author — the webhook's "user" is the event actor
+    source_branch: str
+    target_branch: str
+    sha: str = ""
+    has_conflicts: bool = False
+    diff_refs: DiffRefs | None = None
+
+
+@dataclass(frozen=True)
+class Note:
+    id: int
+    author: str
+    body: str
+    system: bool = False
+
+
+@dataclass(frozen=True)
+class Discussion:
+    id: str
+    notes: tuple[Note, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)

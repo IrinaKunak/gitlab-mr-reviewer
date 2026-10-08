@@ -5,7 +5,7 @@ export const meta = {
 }
 
 const ROOT = '/home/spikerwork/develop/lab.smysl.pro/gitlab-mr-reviwer'
-const FILES = 'reviewer/{config,prompts,ai_client,gitlab_io,telegram_io,repo_cache,bridge,pipeline,server}.py, w-server.py, Dockerfile, docker-compose.yml, tests/test_unit.py'
+const FILES = 'reviewer/{config,prompts,ai_client,telegram_io,repo_cache,bridge,pipeline,server}.py, w-server.py, Dockerfile, docker-compose.yml, tests/test_unit.py'
 
 const FINDINGS = {
   type: 'object',
