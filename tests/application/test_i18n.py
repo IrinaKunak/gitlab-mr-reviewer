@@ -19,7 +19,7 @@ from reviewer.i18n import catalog, languages, t
 from tests.factories import review_job
 from tests.fakes import FakeTelegram
 
-SNAPSHOT = json.loads((Path(__file__).parent / "snapshots" / "messages.json")
+SNAPSHOT = json.loads((Path(__file__).parent.parent / "snapshots" / "messages.json")
                       .read_text(encoding="utf-8"))
 ERROR_KINDS = ("ai_failure", "gemini_failure", "gitlab_api_error", "webhook_error",
                "timeout", "general", "prompt_cache", "weird")

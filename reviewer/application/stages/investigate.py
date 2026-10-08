@@ -5,7 +5,6 @@ complex MRs only. Its impact analysis joins the review comment."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ... import prompts
 from ...ai_client import CHARS_PER_TOKEN, AIError, AIInputTooLargeError, ToolDef
@@ -14,14 +13,14 @@ from ...domain import budget
 from ...domain.investigation import investigation_from_text
 from ...domain.models import Investigation, ReviewJob, Tier, TriageResult
 from ...prompts import Prompts, default_prompts
-from ..ports import KnowledgeSource
+from ..ports import KnowledgeSource, LLMPort
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
 
 
 class Investigate:
-    def __init__(self, settings: Settings, ai: Any, bridge: KnowledgeSource,
+    def __init__(self, settings: Settings, ai: LLMPort, bridge: KnowledgeSource,
                  templates: Prompts | None = None) -> None:
         self.settings = settings
         self.ai = ai

@@ -8,7 +8,7 @@ argument and result is a domain model or a plain value.
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ..domain.events import NotificationEvent
 from ..domain.models import (
@@ -18,10 +18,32 @@ from ..domain.models import (
     MergeRequestInfo,
     MergeRequestRef,
     Note,
+    Tier,
 )
 
 if TYPE_CHECKING:
-    from ..ai_client import ToolDef
+    from ..ai_client import AIResult, ToolDef
+
+
+class LLMPort(Protocol):
+    """The tiered model client (ai_client.AIClient; tests: ScriptedLLM)."""
+
+    def guard_input_size(self, *parts: str) -> None:
+        """Raises AIInputTooLargeError when the parts exceed the input budget."""
+        ...
+
+    async def complete(self, tier: Tier, system: str, user_content: str, *,
+                       max_tokens: int = 4096, effort: str | None = None,
+                       json_schema: dict[str, Any] | None = None, use_cache: bool = True,
+                       timeout: float | None = None) -> AIResult: ...
+
+    async def complete_json(self, tier: Tier, system: str, user_content: str,
+                            schema: dict[str, Any], *,
+                            max_tokens: int = 2048) -> dict[str, Any] | None: ...
+
+    async def agent_loop(self, tier: Tier, system: str, user_content: str,
+                         tools: list[ToolDef], *, max_iterations: int = 30,
+                         max_tokens: int = 16000, effort: str = "high") -> AIResult: ...
 
 
 class VcsError(Exception):

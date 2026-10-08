@@ -4,12 +4,12 @@ English-only; translation is a stage, not a prompt instruction)."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ... import prompts
 from ...ai_client import AIError
 from ...domain.models import Tier
 from ...prompts import Prompts, default_prompts
+from ..ports import LLMPort
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ FAST_TIER_MAX_CHARS = 3500
 
 
 class Translator:
-    def __init__(self, ai: Any, language: str, templates: Prompts | None = None) -> None:
+    def __init__(self, ai: LLMPort, language: str, templates: Prompts | None = None) -> None:
         self.ai = ai
         self.language = language
         self.templates = templates or default_prompts()

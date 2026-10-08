@@ -348,7 +348,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
-    { name = "mypy-baseline" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "types-requests" },
@@ -370,7 +369,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=2.4" },
-    { name = "mypy-baseline", specifier = ">=0.7" },
     { name = "pytest", specifier = ">=9.1" },
     { name = "ruff", specifier = ">=0.16" },
     { name = "types-requests" },
@@ -723,15 +721,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/df/c0/1a5dc601c22041a7bbfe1ff71cf097fbbd4fb49930867c6789baf5102106/mypy-2.4.0-cp315-cp315t-win_amd64.whl", hash = "sha256:172e30b8fea631fe310f0c665477f52d9ea40bb4e99e0c81dc30118563b13710", size = 12350955, upload-time = "2026-10-01T20:40:01.52Z" },
     { url = "https://files.pythonhosted.org/packages/1c/bc/697e9e26fc2a86c094ad67ee1e419971b7f01ded66ee66231b09e9f3e12e/mypy-2.4.0-cp315-cp315t-win_arm64.whl", hash = "sha256:5786ef987b3767e51aaa53f20aec104c0252b42ecda7aef8e8b4cbae279b05c5", size = 11842738, upload-time = "2026-10-01T20:40:30.026Z" },
     { url = "https://files.pythonhosted.org/packages/81/12/46ae8670c98a3cd0286ca5645c2f918f8f6be65edfed81b916010619f668/mypy-2.4.0-py3-none-any.whl", hash = "sha256:d01c5d26a352acc6d5cf3128225477e1e8465e8d3029d4c345807fbf7f3cf093", size = 2800734, upload-time = "2026-10-01T20:39:26.837Z" },
-]
-
-[[package]]
-name = "mypy-baseline"
-version = "0.7.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/08/7e/484e07e1b27f9999f5f3f5097f0dfbb1ba756b0a2ed14acca764abad6cc8/mypy_baseline-0.7.4.tar.gz", hash = "sha256:c69d9964ebb2922f53245336bc506d9d277c8a35349a60ce50cff0c48a8702cc", size = 319098, upload-time = "2026-04-13T08:01:54.239Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/77/3dee0c8f219cc5e68e7d84abc1ecc315856104c459658890bd9ecce17815/mypy_baseline-0.7.4-py3-none-any.whl", hash = "sha256:012c5f2f2bf9770b0e846d22580a72b9d43bdfe04148fee10a8af47b5bdd35c7", size = 17853, upload-time = "2026-04-13T08:01:52.444Z" },
 ]
 
 [[package]]

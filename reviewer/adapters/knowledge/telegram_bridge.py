@@ -12,6 +12,15 @@ Protocol (see plans/2026-06-10-review-bridge.md):
 - the trailing usage footer line ("sonnet: ...") is metadata — stripped;
 - expect 15-60s latency and possible "not found" answers.
 
+Concurrency (#16): every question gets its own inbox keyed by its message id;
+an answer is routed by `reply_to_message` (AIManager's overflow chunks are
+plain replies to the question). An answer that is not linked goes to the
+oldest open question — correct while one question is open at a time, a
+guess otherwise. Whether AIManager's first chunk (`answerGuestQuery`) carries
+the link is not verifiable from here, so BRIDGE_MAX_PARALLEL defaults to 1
+(questions wait for each other, as before); the log says per answer whether
+it was linked — raise the limit once it always is.
+
 Operational requirements:
 - this bot's getUpdates must not be consumed by anything else (exclusive polling);
 - the bot must SEE group messages: Bot API group privacy mode disabled via
@@ -25,6 +34,8 @@ import asyncio
 import logging
 import re
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -63,6 +74,12 @@ class _RateWindow:
         return True
 
 
+@dataclass
+class _Question:
+    message_id: int
+    inbox: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
+
+
 class ReviewBridge:
     def __init__(self, cfg: BridgeSection, telegram: TelegramClient) -> None:
         self.cfg = cfg
@@ -72,9 +89,10 @@ class ReviewBridge:
         self._token = token
         self.enabled = bool(cfg.enabled and cfg.chat_id and token)
         self._offset = 0
-        self._inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self._open: dict[int, _Question] = {}  # message id -> question, oldest first
+        self._closed: deque[int] = deque(maxlen=200)  # answered / timed-out question ids
         self._listener_task: asyncio.Task | None = None
-        self._ask_lock = asyncio.Lock()  # one outstanding question at a time
+        self._slots = asyncio.Semaphore(cfg.max_parallel)
         self._rate = _RateWindow(cfg.rate_per_hour)
         self._bot_id = token.split(":", 1)[0] if token else ""
 
@@ -134,9 +152,24 @@ class ReviewBridge:
         elif not sender.get("is_bot"):
             return  # unconfigured: accept bot answers only (humans in the group are observers)
         text = message.get("text") or message.get("caption") or ""
-        if text:
-            self._inbox.put_nowait({"from_id": sender_id, "text": text,
-                                    "date": message.get("date", 0)})
+        if not text:
+            return
+        reply_to = (message.get("reply_to_message") or {}).get("message_id")
+        question = self._open.get(reply_to) if reply_to is not None else None
+        linked = question is not None
+        if question is None and reply_to in self._closed:
+            logger.info("bridge: late answer to closed question %s — dropped", reply_to)
+            return
+        if question is None:
+            if not self._open:
+                logger.info("bridge: answer with no open question (late?) — dropped")
+                return
+            question = next(iter(self._open.values()))  # the oldest open question
+            if len(self._open) > 1:
+                logger.warning("bridge: unlinked answer with %d open questions — "
+                               "routed to the oldest", len(self._open))
+        question.inbox.put_nowait({"from_id": sender_id, "text": text, "linked": linked,
+                                   "date": message.get("date", 0)})
 
     # --- asking ---
 
@@ -156,42 +189,50 @@ class ReviewBridge:
         # (repo/MR content cannot be exfiltrated wholesale through the bridge)
         question = question.strip()[:800]
 
-        async with self._ask_lock:
-            # drain stale inbox entries from previous interactions
-            while not self._inbox.empty():
-                self._inbox.get_nowait()
-
-            sent = await self.telegram.send_message(self.cfg.chat_id, question,
-                                                    parse_mode=None)
-            if not sent:
+        async with self._slots:
+            message_id = await self.telegram.post_message(self.cfg.chat_id, question,
+                                                          parse_mode=None)
+            if message_id is None:
                 return None
-            logger.info("bridge question sent: %s", question[:200])
+            pending = _Question(message_id)
+            self._open[message_id] = pending
+            logger.info("bridge question %s sent: %s", message_id, question[:200])
+            try:
+                chunks, linked = await self._collect(pending)
+            finally:
+                self._open.pop(message_id, None)
+                self._closed.append(message_id)
 
-            chunks: list[str] = []
-            deadline = time.monotonic() + self.cfg.question_timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                # once an answer started, wait only the short grace window for overflow
-                wait = self.cfg.answer_grace if chunks else remaining
-                if remaining <= 0 or wait <= 0:
-                    break
-                try:
-                    item = await asyncio.wait_for(
-                        self._inbox.get(), timeout=min(wait, remaining))
-                    chunks.append(item["text"])
-                except TimeoutError:
-                    if chunks:
-                        break  # grace window passed — answer complete
-                    # else keep waiting until the hard deadline
+        if not chunks:
+            logger.warning("bridge question timed out after %ss", self.cfg.question_timeout)
+            return None
+        answer = strip_usage_footer("\n".join(chunks))
+        logger.info("bridge answer received (%d chars, %d chunks, %d/%d linked by reply)",
+                    len(answer), len(chunks), linked, len(chunks))
+        return answer
 
-            if not chunks:
-                logger.warning("bridge question timed out after %ss",
-                               self.cfg.question_timeout)
-                return None
-            answer = strip_usage_footer("\n".join(chunks))
-            logger.info("bridge answer received (%d chars, %d chunks)",
-                        len(answer), len(chunks))
-            return answer
+    async def _collect(self, pending: _Question) -> tuple[list[str], int]:
+        """Chunks of one answer: wait up to question_timeout for the first, then
+        only the short grace window for overflow."""
+        chunks: list[str] = []
+        linked = 0
+        deadline = time.monotonic() + self.cfg.question_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            # once an answer started, wait only the short grace window for overflow
+            wait = self.cfg.answer_grace if chunks else remaining
+            if remaining <= 0 or wait <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(pending.inbox.get(),
+                                              timeout=min(wait, remaining))
+            except TimeoutError:
+                if chunks:
+                    break  # grace window passed — answer complete
+                continue  # else keep waiting until the hard deadline
+            chunks.append(item["text"])
+            linked += bool(item["linked"])
+        return chunks, linked
 
     # --- archiving ---
 

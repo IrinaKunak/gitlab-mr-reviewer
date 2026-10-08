@@ -4,7 +4,6 @@ and which changed files are not worth reading (skip_globs)."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ... import prompts
 from ...ai_client import AIError
@@ -12,13 +11,14 @@ from ...domain.models import ChangeSet, ReviewJob, Tier, TriageResult
 from ...domain.skip import resolve_skip
 from ...prompts import Prompts, default_prompts
 from .. import content
+from ..ports import LLMPort
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
 
 
 class Triage:
-    def __init__(self, ai: Any, templates: Prompts | None = None) -> None:
+    def __init__(self, ai: LLMPort, templates: Prompts | None = None) -> None:
         self.ai = ai
         self.templates = templates or default_prompts()
 

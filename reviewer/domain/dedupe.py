@@ -16,11 +16,11 @@ class DedupePolicy:
     def __init__(self, ttl: float, burst_window: float = 30) -> None:
         self.ttl = ttl
         self.burst_window = burst_window
-        self._seen: dict[tuple, float] = {}
-        self._mr_seen: dict[tuple, float] = {}
+        self._seen: dict[tuple[object, ...], float] = {}
+        self._mr_seen: dict[tuple[object, ...], float] = {}
 
     @staticmethod
-    def key(job: Job) -> tuple:
+    def key(job: Job) -> tuple[object, ...]:
         return (*job.ref.key, job.last_commit)
 
     def admit(self, job: Job, now: float) -> bool:

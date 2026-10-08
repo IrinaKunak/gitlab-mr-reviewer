@@ -320,6 +320,9 @@ class BridgeSection(_Section):
     max_questions_per_mr: int = Field(default=10, ge=0)
     rate_per_hour: int = Field(default=25, ge=0)
     answer_bot_id: str = ""
+    # questions in flight at once; >1 only once the log shows AIManager's answers
+    # always arrive linked (reply_to) — see adapters/knowledge/telegram_bridge.py
+    max_parallel: int = Field(default=1, ge=1)
 
 
 # --- pipeline -------------------------------------------------------------
@@ -463,6 +466,7 @@ ENV_FIELDS: dict[str, str] = {
     "BRIDGE_MAX_QUESTIONS_PER_MR": "bridge.max_questions_per_mr",
     "BRIDGE_RATE_PER_HOUR": "bridge.rate_per_hour",
     "BRIDGE_ANSWER_BOT_ID": "bridge.answer_bot_id",
+    "BRIDGE_MAX_PARALLEL": "bridge.max_parallel",
     "REVIEW_LANGUAGE": "pipeline.language",
     "REVIEW_FOR_CONFLICT": "pipeline.review_for_conflict",
     "REVIEW_PROMPT": "pipeline.review_prompt",

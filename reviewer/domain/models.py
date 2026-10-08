@@ -183,7 +183,7 @@ class TriageResult:
     skip_globs: tuple[str, ...] = ()
 
     @classmethod
-    def from_model(cls, parsed: dict, extra_jira_keys: tuple[str, ...] = ()) -> TriageResult:
+    def from_model(cls, parsed: dict[str, Any], extra_jira_keys: tuple[str, ...] = ()) -> TriageResult:
         """Normalize the fast tier's JSON. Lenient on purpose: an unknown
         complexity behaves as "normal" (as the string compare did), non-list
         fields read as empty, and regex-found Jira keys are merged in."""

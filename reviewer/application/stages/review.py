@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from typing import Any
 
 from ... import prompts
 from ...ai_client import CHARS_PER_TOKEN, AIError, AIInputTooLargeError, AIResult, ToolDef
@@ -15,6 +14,7 @@ from ...domain import budget
 from ...domain.models import ChangeSet, Complexity, ReviewJob, ReviewResult, Tier, TriageResult
 from ...prompts import Prompts, default_prompts
 from .. import content
+from ..ports import LLMPort
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def review_user_prompts(settings: Settings, job: ReviewJob, review_content: str,
 
 
 class Review:
-    def __init__(self, settings: Settings, ai: Any, templates: Prompts | None = None) -> None:
+    def __init__(self, settings: Settings, ai: LLMPort, templates: Prompts | None = None) -> None:
         self.settings = settings
         self.ai = ai
         self.templates = templates or default_prompts()

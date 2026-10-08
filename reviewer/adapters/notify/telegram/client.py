@@ -41,8 +41,14 @@ class TelegramClient:
 
     async def send_message(self, chat_id: str, text: str, *,
                            parse_mode: str | None = "Markdown") -> bool:
+        return await self.post_message(chat_id, text, parse_mode=parse_mode) is not None
+
+    async def post_message(self, chat_id: str, text: str, *,
+                           parse_mode: str | None = "Markdown") -> int | None:
+        """sendMessage; the new message's id (the bridge links answers to it),
+        None on failure."""
         if not self.token:
-            return False
+            return None
         data: dict[str, Any] = {"chat_id": chat_id, "text": text,
                                 "disable_web_page_preview": True}
         if parse_mode:
@@ -56,11 +62,12 @@ class TelegramClient:
                     response = await client.post(
                         f"{API}/bot{self.token}/sendMessage", json=data)
                 response.raise_for_status()
-            return True
+                result = response.json().get("result") or {}
+            return int(result.get("message_id") or 0)
         except Exception as exc:  # noqa: BLE001 — notifications must never break a review
             logger.error("Telegram sendMessage to %s failed: %s", chat_id,
                          self.redact_token(str(exc)))
-            return False
+            return None
 
     async def send_document(self, chat_id: str, filename: str, content: bytes,
                             caption: str = "") -> bool:

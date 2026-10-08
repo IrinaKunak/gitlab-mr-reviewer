@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import threading
 import time
-from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -87,6 +86,32 @@ def _run_git(*args: str, token: str | None = None, timeout: int = 600,
     return result.stdout
 
 
+class KeyedLocks:
+    """One asyncio.Lock per key, dropped when its last user leaves (#22: the
+    defaultdict kept a lock per repo ever seen, forever)."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+    def __len__(self) -> int:
+        return len(self._locks)
+
+    @asynccontextmanager
+    async def hold(self, key: str) -> AsyncIterator[None]:
+        lock, users = self._locks.get(key, (None, 0))
+        lock = lock or asyncio.Lock()
+        self._locks[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = self._locks[key]
+            if users <= 1:
+                del self._locks[key]
+            else:
+                self._locks[key] = (lock, users - 1)
+
+
 class RepoCache:
     def __init__(self, cfg: RepoCacheSection, git_proxy: str = "") -> None:
         self.root = Path(cfg.dir)
@@ -94,8 +119,9 @@ class RepoCache:
         # clone -> investigate -> remove (small disks) instead of an LRU cache
         self.ephemeral = cfg.ephemeral
         self.git_proxy = git_proxy
-        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._locks = KeyedLocks()
         self._evict_lock = threading.Lock()
+        self._background: set[asyncio.Task] = set()  # eviction passes in flight
 
     def _git(self, *args: str, token: str | None = None, timeout: int = 600) -> str:
         return _run_git(*args, token=token, timeout=timeout, proxy=self.git_proxy)
@@ -113,13 +139,25 @@ class RepoCache:
         """Ensure the repo is cloned/fetched; return a detached worktree at the MR head."""
         repo_dir = self._repo_dir(instance.url, project_path)
         key = str(repo_dir)
-        async with self._locks[key]:
+        async with self._locks.hold(key):
             await asyncio.to_thread(
                 self._sync_repo, repo_dir, instance, project_path, mr_iid)
             worktree = await asyncio.to_thread(
                 self._add_worktree, repo_dir, mr_iid, sha, instance.token)
-        asyncio.get_running_loop().run_in_executor(None, self._evict)
+        self._spawn(asyncio.to_thread(self._evict), "repo-cache-evict")
         return worktree
+
+    def _spawn(self, coro: Any, name: str) -> None:
+        """Background housekeeping that is tracked: a reference is kept until it
+        ends (no GC mid-run) and its exception is logged, not lost (#20)."""
+        task = asyncio.create_task(coro, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._background_done)
+
+    def _background_done(self, task: asyncio.Task) -> None:
+        self._background.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("%s failed", task.get_name(), exc_info=task.exception())
 
     def _sync_repo(self, repo_dir: Path, instance: InstanceRef,
                    project_path: str, mr_iid: int) -> None:
@@ -152,7 +190,7 @@ class RepoCache:
         clear_symbol_index(worktree)
         repo_dir = worktree.parent / f"{worktree.name.rsplit('-mr', 1)[0]}.git"
         # same lock as checkout_mr: never drop a bare repo mid-checkout of another MR
-        async with self._locks[str(repo_dir)]:
+        async with self._locks.hold(str(repo_dir)):
             await asyncio.to_thread(self._remove_worktree_sync, repo_dir, worktree)
             if self.ephemeral:
                 await asyncio.to_thread(self._drop_repo, repo_dir)
@@ -249,6 +287,8 @@ def _grep_ripgrep(worktree: Path, pattern: str, glob: str | None,
     """ripgrep-backed search: linear-time regex (no ReDoS), .gitignore-aware,
     orders of magnitude faster than the Python walk on big repos. Returns None
     when rg cannot run the pattern — the caller falls back to Python re."""
+    if _RG is None:
+        return None
     cmd = [_RG, "--no-config", "--line-number", "--no-heading", "--color=never",
            "--sort", "path", "--max-columns", "300", "--max-columns-preview",
            "--hidden",  # the Python engine searched dotfiles (.gitlab-ci.yml)

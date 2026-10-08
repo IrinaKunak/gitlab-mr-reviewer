@@ -99,6 +99,10 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   in the bridge group, strips usage footers from answers, `archive()` posts tester
   reports to the bridge chat (AIManager's corpus). Own bot (`BRIDGE_BOT_TOKEN`,
   default `TELEGRAM_BOT_TOKEN`) and chat — independent of the notification channels.
+  No global lock: each question has its own inbox, answers are routed by
+  `reply_to_message` (an unlinked one goes to the oldest open question; late answers
+  to closed questions are dropped). `BRIDGE_MAX_PARALLEL` (default 1 = serialized,
+  as before) — whether AIManager's first chunk is linked is unverified (#16).
 - **reviewer/usage.py** — per-review token/cost accounting (contextvar tracker), model
   price table (`MODEL_PRICES` override), `UsageLog` (the `usage` table + `logs/usage.jsonl`
   written in parallel), `/stats` = SQL aggregates over the table;
@@ -128,14 +132,14 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   (default `telegram`), built by the `bootstrap.NOTIFIERS` registry.
   **Adding a channel** (Bitrix24): implement `Notifier` + a formatter in
   `adapters/notify/<name>/`, register it in `bootstrap.NOTIFIERS` (and
-  `config.KNOWN_CHANNELS`), add it to `CHANNELS` in `tests/test_notify.py` — the
+  `config.KNOWN_CHANNELS`), add it to `CHANNELS` in `tests/adapters/test_notify.py` — the
   contract tests must pass. `bitrix` is a known name that fails startup until then.
 - **reviewer/prompts/** — English-only prompts (translation is a stage): the prose in
   `templates/<name>.md` (`REVIEW_SYSTEM` → `review_system.md`, `str.format` fields
   filled at the call site), the user-message builders in `__init__.py`. A `Prompts`
   object (built-ins + `PROMPTS_DIR` overrides, same file names) is built by bootstrap
   and passed to the stages; `prompts.X` at module level reads the built-ins. System
-  prompts are the prompt-cache prefix: `tests/test_prompts.py` pins them byte for byte
+  prompts are the prompt-cache prefix: `tests/application/test_prompts.py` pins them byte for byte
   (`tests/snapshots/prompts.json`) — an intended prompt change updates the snapshot.
 - **reviewer/logging_setup.py** — `configure(settings)` (called by bootstrap: format,
   level, `JobContextFilter` on the root handlers, the rotating `logs/ai-debug.log`
@@ -146,7 +150,7 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 - **reviewer/i18n/** — message catalog `en.yaml` / `ru.yaml` + `t(key, lang, **kw)`
   (dotted keys, `str.format` fields; a key missing in a language falls back to en
   with a WARNING). Every user-facing text (MR notes, notifications) comes from it —
-  no `if lang == …` in code. `tests/test_i18n.py` pins key parity and the exact
+  no `if lang == …` in code. `tests/application/test_i18n.py` pins key parity and the exact
   texts (`tests/snapshots/messages.json`).
 - **reviewer/config.py** — pydantic-settings, nested sections (`settings.gitlab`,
   `.llm.tiers.{fast,main,smart}`, `.notify.telegram`, `.bridge`, `.pipeline.stages`,
@@ -335,30 +339,37 @@ uv sync                                  # runtime + dev deps, exact versions fr
 source .venv/bin/activate
 .venv/bin/python -m pytest tests/ -q     # offline, no API keys needed — keep it green
 .venv/bin/ruff check                     # lint (rules in pyproject.toml)
-(.venv/bin/mypy || true) | .venv/bin/mypy-baseline filter   # fails only on NEW errors
+.venv/bin/mypy                           # strict for domain/ + application/, zero errors
 DEBUG=true python -m reviewer             # 0.0.0.0:5000
 ```
 
 - Dependencies live in `pyproject.toml` (ranges) + `uv.lock` (exact pins); there is no
   `requirements.txt`. Add a dep with `uv add <pkg>` (dev: `uv add --group dev <pkg>`) and
   commit the lock — the image runs `uv sync --frozen`, so a stale lock fails the build.
-- mypy is non-strict; pre-existing errors are in `mypy-baseline.txt`. Fixing one →
-  `mypy | mypy-baseline sync` to shrink the baseline. Never sync to hide a new error.
-- CI: `.github/workflows/ci.yml` (origin is GitHub) runs ruff, mypy-baseline, pytest on
-  Python 3.12 for pushes to `v2`/`master` and PRs. Note the `(mypy || true) |` form:
-  Actions' bash has pipefail and mypy exits 1 while the baseline is non-empty.
+- mypy: `domain/` and `application/` are strict (per-module flags in pyproject —
+  `strict` cannot be set per module), the rest non-strict; no baseline, zero errors.
+  The application layer talks to the LLM through `ports.LLMPort`.
+- CI: `.github/workflows/ci.yml` (origin is GitHub) runs ruff, mypy, pytest on
+  Python 3.12 for pushes to `v2`/`master` and PRs.
 
-**Scenario tests** (`tests/test_scenarios.py`) drive the real webhook → queue → pipeline
+Tests are laid out by layer: `tests/domain/` (pure functions, no fakes),
+`tests/application/` (stages, use cases, prompts, i18n), `tests/adapters/` (GitLab, LLM,
+storage, notify, bridge, repo cache, config, HTTP, logging), `tests/e2e/` (scenarios,
+durable queue restarts, composition root); snapshots in `tests/snapshots/`.
+
+**Scenario tests** (`tests/e2e/test_scenarios.py`) drive the real webhook → queue → use case
 on in-memory fakes (`tests/fakes/`: `FakeGitLab` behind the python-gitlab object model,
 `ScriptedLLM` with per-method answer queues, `FakeTelegram`, `FakeBridge` = scripted
 AIManager answers, `FakeRepoCache` = project files in a temp dir under the real repo
 tools). The `world` fixture in `tests/conftest.py` builds the real graph with
 `bootstrap.build_services(cfg, telegram=…, ai=…, bridge=…, repo_cache=…,
-gitlab_client=…, clock=…)` — no monkeypatching of modules — on prod-shaped settings
+vcs_for=…, clock=…)` (`telegram` = the Telegram channel's transport, `notifier=` replaces
+all channels) — no monkeypatching of modules — on prod-shaped settings
 (all v2 flags on incl. investigator/bridge/tester report, RU, Telegram on);
 `world.configure(llm__max_input_tokens=...)` overrides nested settings per scenario
 (`__` = `.`), `world.settings` is that scenario's config and
-`world.clock.advance(s)` drives the queue's dedupe TTL / burst window. Scenarios cover
+`world.clock.advance(s)` drives the queue's dedupe TTL / burst window;
+`world.send` posts a webhook and drains the durable queue inline. Scenarios cover
 trivial/normal/complex (investigator+bridge+tester report) MRs, incremental re-reviews,
 big-MR degradation, dialogue and dedupe; they assert external effects only (note texts,
 messages, AI tiers, usage) and never call private methods. An unscripted AI call or
@@ -366,12 +377,13 @@ bridge question fails the test. State stores are per-graph objects over the
 scenario's temp `state_dir`; a new `ReviewStateStore(dir)` on the same dir is a cold start.
 Tests never see a developer's `.env` (only `bootstrap.load_config` reads it).
 
-Pure-function tests live in `tests/test_domain.py` (no fakes); `tests/factories.py`
+`tests/factories.py`
 builds jobs/refs with defaults (`review_job(mr_iid=7, last_commit="abc")`) and graphs
 for unit tests: `make_settings(tmp_path, pipeline__language="ru")`,
-`make_services(cfg, ai=StubAI())` / `make_pipeline(...)` — every edge not passed is
+`make_services(cfg, ai=StubAI())` / `make_review_mr(...)` / `make_answer_note(...)` —
+every edge not passed is
 inert and fails the test if touched.
-Every bug fix gets a regression test in `tests/test_unit.py` (or `test_domain.py`). When checking pytest results
+Every bug fix gets a regression test in the layer's test module. When checking pytest results
 in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.
 
 ## Deployment (production: r.smysl.pro)
@@ -423,8 +435,9 @@ git pull && docker compose up -d --build
 
 ## Backlog
 
-- `RepoCache._locks` defaultdict never evicts (unbounded per-repo growth) — flagged by
-  the reviewer itself on MR !20
+- `BRIDGE_MAX_PARALLEL` > 1 once the log shows AIManager answers always arrive linked
+  (`… chunks, N/N linked by reply`)
+- Bitrix24 notification channel (`adapters/notify/bitrix/`, see Notifications)
 - CF Unified Billing credits top-up (only if switching billing off the direct key)
 - AIManager `GUEST_ANSWER_RATE_PER_HOUR` 30→60 once tester reports ramp up
 - Merge MR !20 (v2→master) — keep `[no-review]` in its title

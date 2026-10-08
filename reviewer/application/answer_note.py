@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import Protocol
 
 from .. import prompts, usage
 from ..config import Settings
@@ -23,7 +23,7 @@ from ..prompts import Prompts, default_prompts
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
-from .ports import RepoWorkspace, VcsPort
+from .ports import LLMPort, RepoWorkspace, VcsPort
 from .stages import Translator
 
 logger = logging.getLogger(__name__)
@@ -34,13 +34,13 @@ NO_REPLY = "NO_REPLY"
 
 
 class ReplyBudget(Protocol):
-    def allows(self, mr_key: tuple) -> bool: ...
+    def allows(self, mr_key: tuple[str, int, int]) -> bool: ...
 
-    def record(self, mr_key: tuple) -> None: ...
+    def record(self, mr_key: tuple[str, int, int]) -> None: ...
 
 
 class AnswerNote:
-    def __init__(self, settings: Settings, *, ai: Any, workspace: RepoWorkspace,
+    def __init__(self, settings: Settings, *, ai: LLMPort, workspace: RepoWorkspace,
                  usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
                  translator: Translator, budget: ReplyBudget,
                  pricing: usage.Pricing = usage.BUILTIN_PRICING,

@@ -14,7 +14,6 @@ import logging
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any
 
 from .. import prompts, usage
 from ..ai_client import AIError, AIInputTooLargeError, AITimeoutError, estimate_tokens
@@ -29,7 +28,15 @@ from ..review_state import ReviewStateStore
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
-from .ports import KnowledgeSource, Notifier, RepoWorkspace, VcsError, VcsNotFound, VcsPort
+from .ports import (
+    KnowledgeSource,
+    LLMPort,
+    Notifier,
+    RepoWorkspace,
+    VcsError,
+    VcsNotFound,
+    VcsPort,
+)
 from .stages import (
     Deliver,
     DeliverTesterReport,
@@ -45,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewMergeRequest:
-    def __init__(self, settings: Settings, *, ai: Any, notifier: Notifier,
+    def __init__(self, settings: Settings, *, ai: LLMPort, notifier: Notifier,
                  knowledge: KnowledgeSource, workspace: RepoWorkspace, review_state: ReviewStateStore,
                  usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
                  translator: Translator,

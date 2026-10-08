@@ -15,7 +15,7 @@ from reviewer.domain.models import TriageResult
 from reviewer.prompts import TEMPLATE_NAMES, Prompts
 from tests.factories import make_services, make_settings, review_job
 
-SNAPSHOT = json.loads((Path(__file__).parent / "snapshots" / "prompts.json")
+SNAPSHOT = json.loads((Path(__file__).parent.parent / "snapshots" / "prompts.json")
                       .read_text(encoding="utf-8"))
 
 
