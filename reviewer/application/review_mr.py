@@ -21,20 +21,11 @@ from ..ai_client import AIError, AIInputTooLargeError, AITimeoutError, estimate_
 from ..config import Settings
 from ..domain import budget
 from ..domain.models import ChangeSet, Complexity, InstanceRef, MergeRequestRef, ReviewJob
+from ..i18n import t
 from ..review_state import ReviewStateStore
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
-from .messages import (
-    CONFLICT_SKIP_MSG,
-    GENERAL_ERROR_MSG,
-    INITIAL_MSG,
-    INITIAL_MSG_CONFLICT,
-    NO_CHANGES_MSG,
-    TIMEOUT_MSG,
-    TOO_LARGE_MSG,
-    msg,
-)
 from .ports import RepoWorkspace, VcsError, VcsNotFound, VcsPort
 from .stages import (
     Deliver,
@@ -70,8 +61,8 @@ class ReviewMergeRequest:
         self.deliver = Deliver(settings, telegram)
         self.deliver_tester_report = DeliverTesterReport(settings, telegram, translator)
 
-    def _msg(self, table: dict[str, str], **kwargs: object) -> str:
-        return msg(table, self.settings.pipeline.language, **kwargs)
+    def _msg(self, key: str, **kwargs: object) -> str:
+        return t(key, self.settings.pipeline.language, **kwargs)
 
     # --- entry point ---
 
@@ -92,19 +83,19 @@ class ReviewMergeRequest:
             await self.telegram.notify_error("gitlab_api_error", str(exc), ctx)
         except AIInputTooLargeError:
             await self.telegram.notify_error("ai_failure", "MR too large to analyze", ctx)
-            await self._safe_note(ref, self._msg(TOO_LARGE_MSG))
+            await self._safe_note(ref, self._msg("mr.too_large"))
         except AITimeoutError:
             logger.error("job %s: AI analysis timed out", job_id)
             await self.telegram.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
-            await self._safe_note(ref, self._msg(TIMEOUT_MSG))
+            await self._safe_note(ref, self._msg("mr.timeout"))
         except AIError as exc:
             logger.error("job %s: AI analysis failed: %s", job_id, exc)
             await self.telegram.notify_error("ai_failure", str(exc)[:300], ctx)
-            await self._safe_note(ref, self._msg(GENERAL_ERROR_MSG, job_id=job_id))
+            await self._safe_note(ref, self._msg("mr.review_failed", job_id=job_id))
         except Exception as exc:  # noqa: BLE001 — top-level use-case guard
             logger.exception("job %s: error in quality check", job_id)
             await self.telegram.notify_error("general", str(exc), ctx)
-            await self._safe_note(ref, self._msg(GENERAL_ERROR_MSG, job_id=job_id))
+            await self._safe_note(ref, self._msg("mr.review_failed", job_id=job_id))
         finally:
             usage.current_tracker.reset(tracker_token)
             self.usage_log.persist(tracker, job)
@@ -125,7 +116,7 @@ class ReviewMergeRequest:
         ctx = await self.triage.run(ctx)
         await self._assemble_content(ctx)
         if not ctx.review_content:
-            await ctx.vcs.post_note(job.ref, self._msg(NO_CHANGES_MSG))
+            await ctx.vcs.post_note(job.ref, self._msg("mr.no_changes"))
             return
 
         # one repo checkout serves both the tool-assisted review and the
@@ -200,7 +191,7 @@ class ReviewMergeRequest:
             job, ref.project_path, has_conflicts, gitlab_instance=ref.instance.url))
 
         if has_conflicts and not self.settings.pipeline.review_for_conflict:
-            await vcs.post_note(ref, self._msg(CONFLICT_SKIP_MSG))
+            await vcs.post_note(ref, self._msg("mr.conflict_skip"))
             logger.info("Skipped review for MR !%s due to conflicts", ref.mr_iid)
             return None
 
@@ -209,7 +200,7 @@ class ReviewMergeRequest:
             delta = await vcs.compare(ref, prev_sha, head_sha)
 
         await vcs.post_note(
-            ref, self._msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
+            ref, self._msg("mr.review_starting_conflict" if has_conflicts else "mr.review_starting"))
 
         # the adapter re-fetches files GitLab collapsed (per-file size limit) and
         # marks whatever stays collapsed — those are never silently unreviewed

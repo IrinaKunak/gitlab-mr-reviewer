@@ -11,6 +11,7 @@ import logging
 import re
 
 from ..domain.models import ChangeSet, MergeRequestRef, Note, ReviewJob
+from ..i18n import t
 from .ports import VcsPort
 
 logger = logging.getLogger(__name__)
@@ -246,13 +247,5 @@ def mr_header(title: str, author: str, source_branch: str, target_branch: str) -
 
 
 def format_review_comment(review_text: str, lang: str = "en") -> str:
-    headers = {"en": "## 🤖 Automated Code Review",
-               "ru": "## 🤖 Автоматический обзор кода"}
-    footers = {
-        "en": "*This review was generated automatically by AI. "
-              "Please review the feedback and address any issues before merging.*",
-        "ru": "*Этот обзор был создан автоматически с помощью ИИ. "
-              "Пожалуйста, изучите отзывы и устраните все проблемы перед слиянием.*",
-    }
-    return (f"{headers.get(lang, headers['en'])}\n\n{review_text.strip()}\n\n---\n"
-            f"{footers.get(lang, footers['en'])}\n")
+    return (f"{t('mr.review_header', lang)}\n\n{review_text.strip()}\n\n---\n"
+            f"{t('mr.review_footer', lang)}\n")

@@ -1,0 +1,30 @@
+# User-facing texts, English. Keys must match ru.yaml (tests/test_i18n.py).
+# Placeholders are str.format fields: {job_id}, {link}.
+mr:
+  conflict_skip: "⚠️ Merge request has conflicts. Code review skipped until conflicts are resolved."
+  review_starting: "🤖 Starting automated code review..."
+  review_starting_conflict: "⚠️ 🤖 Starting automated code review (conflicts detected)..."
+  no_changes: "⚠️ No code changes found to review."
+  too_large: "⚠️ The merge request is too large to analyze. Please break it into smaller changes."
+  timeout: "⏱️ Code review timed out. The changes might be too large to analyze."
+  # MR comments are visible to every project member: error paths post only a
+  # neutral line with the job id — exception text stays in the log/alert
+  review_failed: "❌ Code review was not completed, job id: {job_id}"
+  post_failed: "❌ Failed to post the review comment, job id: {job_id}"
+  tester_report: "## 🧪 Tester Report\n\nA verification guide for this MR is attached: {link}"
+  review_header: "## 🤖 Automated Code Review"
+  review_footer: "*This review was generated automatically by AI. Please review the feedback and address any issues before merging.*"
+telegram:
+  error_prefix: "🚨 **ERROR** 🚨\n"
+  error:
+    ai_failure: "AI Error"
+    gitlab_api_error: "GitLab API Error"
+    webhook_error: "Webhook Processing Error"
+    timeout: "Timeout Error"
+    general: "General Error"
+    prompt_cache: "Prompt cache miss"
+  mr_conflicts: "MR with CONFLICTS"
+  mr_new: "New MR"
+  mr_blocked: "🚫 **BLOCKED: Merge conflicts must be resolved before merging!**"
+  review_heading: "\n📝 **Code Review:**"
+  review_too_long: "\n📝 Code review posted to GitLab (too long for Telegram)"

@@ -101,6 +101,11 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
   the cache sweep removes orphaned `<sha256>.*.tmp` too)
 - **reviewer/telegram_io.py** — Telegram I/O (`TelegramClient`); **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **reviewer/i18n/** — message catalog `en.yaml` / `ru.yaml` + `t(key, lang, **kw)`
+  (dotted keys, `str.format` fields; a key missing in a language falls back to en
+  with a WARNING). Every user-facing text (MR notes, notifications) comes from it —
+  no `if lang == …` in code. `tests/test_i18n.py` pins key parity and the exact
+  texts (`tests/snapshots/messages.json`).
 - **reviewer/config.py** — pydantic-settings, nested sections (`settings.gitlab`,
   `.llm.tiers.{fast,main,smart}`, `.notify.telegram`, `.bridge`, `.pipeline.stages`,
   `.repo_cache`, `.dedupe`, `.storage`, `.server`, `.network`). Sources: flat env

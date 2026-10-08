@@ -1,0 +1,64 @@
+{
+ "mr_new_en": "✅ **New MR from `gitlab.test`**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)",
+ "mr_conf_en": "⚠️ **MR with CONFLICTS from `gitlab.test`**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)\n\n🚫 **BLOCKED: Merge conflicts must be resolved before merging!**\n\n📝 **Code Review:**\n```\nshort review\n```",
+ "mr_long_en": "✅ **New MR**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)\n\n📝 Code review posted to GitLab (too long for Telegram)",
+ "comment_en": "## 🤖 Automated Code Review\n\nbody\n\n---\n*This review was generated automatically by AI. Please review the feedback and address any issues before merging.*\n",
+ "err_ai_failure_en": "🚨 **ERROR** 🚨\n**AI Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_gemini_failure_en": "🚨 **ERROR** 🚨\n**AI Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_gitlab_api_error_en": "🚨 **ERROR** 🚨\n**GitLab API Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_webhook_error_en": "🚨 **ERROR** 🚨\n**Webhook Processing Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_timeout_en": "🚨 **ERROR** 🚨\n**Timeout Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_general_en": "🚨 **ERROR** 🚨\n**General Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_prompt_cache_en": "🚨 **ERROR** 🚨\n**Prompt cache miss**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_weird_en": "🚨 **ERROR** 🚨\n**General Error**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "mr_new_ru": "✅ **Новый MR from `gitlab.test`**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)",
+ "mr_conf_ru": "⚠️ **MR С КОНФЛИКТАМИ from `gitlab.test`**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)\n\n🚫 **ЗАБЛОКИРОВАН: Конфликты слияния должны быть разрешены перед слиянием!**\n\n📝 **Обзор кода:**\n```\nshort review\n```",
+ "mr_long_ru": "✅ **Новый MR**\n**Project:** `g/p`\n**Author:** dev\n**Title:** Fix `x`\n**Branch:** `f` → `main`\n**Link:** [!5](https://g/p/-/merge_requests/5)\n\n📝 Обзор кода опубликован в GitLab (слишком длинный для Telegram)",
+ "comment_ru": "## 🤖 Автоматический обзор кода\n\nbody\n\n---\n*Этот обзор был создан автоматически с помощью ИИ. Пожалуйста, изучите отзывы и устраните все проблемы перед слиянием.*\n",
+ "err_ai_failure_ru": "🚨 **ОШИБКА** 🚨\n**Ошибка AI**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_gemini_failure_ru": "🚨 **ОШИБКА** 🚨\n**Ошибка AI**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_gitlab_api_error_ru": "🚨 **ОШИБКА** 🚨\n**Ошибка GitLab API**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_webhook_error_ru": "🚨 **ОШИБКА** 🚨\n**Ошибка обработки webhook**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_timeout_ru": "🚨 **ОШИБКА** 🚨\n**Превышено время ожидания**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_general_ru": "🚨 **ОШИБКА** 🚨\n**Общая ошибка**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_prompt_cache_ru": "🚨 **ОШИБКА** 🚨\n**Промпт-кэш не работает**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "err_weird_ru": "🚨 **ОШИБКА** 🚨\n**Общая ошибка**\n**Details:** details\n**Project ID:** 1\n**MR:** !2\n**Instance:** primary\n**Job:** j1",
+ "mr_notes": {
+  "mr.conflict_skip": {
+   "en": "⚠️ Merge request has conflicts. Code review skipped until conflicts are resolved.",
+   "ru": "⚠️ Запрос на слияние имеет конфликты. Обзор кода пропущен до разрешения конфликтов."
+  },
+  "mr.review_starting": {
+   "en": "🤖 Starting automated code review...",
+   "ru": "🤖 Начинаем автоматический обзор кода..."
+  },
+  "mr.review_starting_conflict": {
+   "en": "⚠️ 🤖 Starting automated code review (conflicts detected)...",
+   "ru": "⚠️ 🤖 Начинаем автоматический обзор кода (обнаружены конфликты)..."
+  },
+  "mr.no_changes": {
+   "en": "⚠️ No code changes found to review.",
+   "ru": "⚠️ Не найдено изменений кода для обзора."
+  },
+  "mr.too_large": {
+   "en": "⚠️ The merge request is too large to analyze. Please break it into smaller changes.",
+   "ru": "⚠️ Запрос на слияние слишком большой для анализа. Пожалуйста, разбейте его на меньшие изменения."
+  },
+  "mr.timeout": {
+   "en": "⏱️ Code review timed out. The changes might be too large to analyze.",
+   "ru": "⏱️ Тайм-аут обзора кода. Возможно, изменения слишком большие для анализа."
+  },
+  "mr.review_failed": {
+   "en": "❌ Code review was not completed, job id: {job_id}",
+   "ru": "❌ Ревью не выполнено, id задачи: {job_id}"
+  },
+  "mr.post_failed": {
+   "en": "❌ Failed to post the review comment, job id: {job_id}",
+   "ru": "❌ Не удалось опубликовать комментарий с обзором, id задачи: {job_id}"
+  },
+  "mr.tester_report": {
+   "en": "## 🧪 Tester Report\n\nA verification guide for this MR is attached: {link}",
+   "ru": "## 🧪 Отчёт для тестировщика\n\nИнструкция по проверке этого MR во вложении: {link}"
+  }
+ }
+}

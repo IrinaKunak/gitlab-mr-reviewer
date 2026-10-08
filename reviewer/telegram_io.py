@@ -15,28 +15,15 @@ import httpx
 from . import usage
 from .config import TelegramSection
 from .domain.models import ReviewJob
+from .i18n import has, t
 
 logger = logging.getLogger(__name__)
 
 _API = "https://api.telegram.org"
 
 
-_ERROR_TITLES = {
-    "ru": {
-        "ai_failure": "Ошибка AI", "gemini_failure": "Ошибка AI",
-        "gitlab_api_error": "Ошибка GitLab API",
-        "webhook_error": "Ошибка обработки webhook",
-        "timeout": "Превышено время ожидания", "general": "Общая ошибка",
-        "prompt_cache": "Промпт-кэш не работает",
-    },
-    "en": {
-        "ai_failure": "AI Error", "gemini_failure": "AI Error",
-        "gitlab_api_error": "GitLab API Error",
-        "webhook_error": "Webhook Processing Error",
-        "timeout": "Timeout Error", "general": "General Error",
-        "prompt_cache": "Prompt cache miss",
-    },
-}
+# v1 called it gemini_failure; same alert, same title
+_ERROR_ALIASES = {"gemini_failure": "ai_failure"}
 
 
 class TelegramClient:
@@ -110,8 +97,7 @@ class TelegramClient:
             logger.debug("Telegram notifications disabled or not configured")
             return False
         if is_error:
-            prefix = "🚨 **ERROR** 🚨\n" if self.language == "en" else "🚨 **ОШИБКА** 🚨\n"
-            message = prefix + message
+            message = t("telegram.error_prefix", self.language) + message
         sent = 0
         for chat_id in self.cfg.chat_ids:
             if await self.send_message(chat_id, message):
@@ -123,8 +109,11 @@ class TelegramClient:
                            context: dict[str, Any] | None = None) -> bool:
         if not self.cfg.enabled:
             return False
-        titles = _ERROR_TITLES.get(self.language, _ERROR_TITLES["en"])
-        parts = [f"**{titles.get(error_type, titles['general'])}**",
+        kind = _ERROR_ALIASES.get(error_type, error_type)
+        title_key = f"telegram.error.{kind}"
+        if not has(title_key):
+            title_key = "telegram.error.general"
+        parts = [f"**{t(title_key, self.language)}**",
                  f"**Details:** {error_details}"]
         context = context or {}
         if "project_id" in context:
@@ -146,10 +135,10 @@ class TelegramClient:
         lang = self.language
         if has_conflicts:
             status_emoji = "⚠️"
-            status_text = "MR with CONFLICTS" if lang == "en" else "MR С КОНФЛИКТАМИ"
+            status_text = t("telegram.mr_conflicts", lang)
         else:
             status_emoji = "✅"
-            status_text = "New MR" if lang == "en" else "Новый MR"
+            status_text = t("telegram.mr_new", lang)
 
         instance_info = ""
         if gitlab_instance:
@@ -167,20 +156,14 @@ class TelegramClient:
 
         if has_conflicts:
             parts.append("")
-            parts.append(
-                "🚫 **BLOCKED: Merge conflicts must be resolved before merging!**"
-                if lang == "en" else
-                "🚫 **ЗАБЛОКИРОВАН: Конфликты слияния должны быть разрешены перед слиянием!**")
+            parts.append(t("telegram.mr_blocked", lang))
 
         if review_content and len(review_content) < 2000:
-            parts.append("\n📝 **Code Review:**" if lang == "en" else "\n📝 **Обзор кода:**")
+            parts.append(t("telegram.review_heading", lang))
             truncated = review_content[:1500] + "..." if len(review_content) > 1500 else review_content
             parts.append(f"```\n{truncated}\n```")
         elif review_content:
-            parts.append(
-                "\n📝 Code review posted to GitLab (too long for Telegram)"
-                if lang == "en" else
-                "\n📝 Обзор кода опубликован в GitLab (слишком длинный для Telegram)")
+            parts.append(t("telegram.review_too_long", lang))
 
         # usage footer (AIManager style) — only on review-completion messages
         if review_content:

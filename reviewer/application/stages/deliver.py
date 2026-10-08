@@ -8,8 +8,8 @@ from typing import Any
 
 from ...config import Settings
 from ...domain.models import Tier
+from ...i18n import t
 from .. import content
-from ..messages import POST_FAILED_MSG, TESTER_REPORT_COMMENT, msg
 from .base import ReviewContext
 from .translate import Translator
 
@@ -55,7 +55,7 @@ class Deliver:
                 {"project_id": ref.project_id, "mr_iid": ref.mr_iid,
                  "gitlab_instance": ref.instance.name, "job_id": job_id})
             try:
-                await ctx.vcs.post_note(ref, msg(POST_FAILED_MSG, lang, job_id=job_id))
+                await ctx.vcs.post_note(ref, t("mr.post_failed", lang, job_id=job_id))
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
             ctx.posted = False
@@ -88,7 +88,7 @@ class DeliverTesterReport:
         link = await ctx.vcs.upload(ref, filename, report.encode("utf-8"))
         if link:
             await ctx.vcs.post_note(
-                ref, msg(TESTER_REPORT_COMMENT, self.settings.pipeline.language, link=link))
+                ref, t("mr.tester_report", self.settings.pipeline.language, link=link))
         else:  # upload failed — inline the report so it isn't lost
             await ctx.vcs.post_note(ref, report[:60_000])
 
