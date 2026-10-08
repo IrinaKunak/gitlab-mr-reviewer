@@ -249,3 +249,22 @@ def mr_header(title: str, author: str, source_branch: str, target_branch: str) -
 def format_review_comment(review_text: str, lang: str = "en") -> str:
     return (f"{t('mr.review_header', lang)}\n\n{review_text.strip()}\n\n---\n"
             f"{t('mr.review_footer', lang)}\n")
+
+
+# Invisible in rendered GitLab markdown; ties a posted review to the head sha it
+# reviewed, so a re-run of the same job (restart, retry) never posts it twice.
+REVIEW_MARKER = "<!-- mr-reviewer:review sha={sha} -->"
+
+
+def review_marker(sha: str) -> str:
+    return REVIEW_MARKER.format(sha=sha)
+
+
+def has_review_for(notes: list[Note], sha: str, bot_username: str = "") -> bool:
+    """A review for exactly this head sha is already in the MR (by the bot when
+    its username is known)."""
+    if not sha:
+        return False
+    marker = review_marker(sha)
+    return any(marker in n.body and (not bot_username or n.author == bot_username)
+               for n in notes)

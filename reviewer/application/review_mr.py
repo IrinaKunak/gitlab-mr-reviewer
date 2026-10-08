@@ -195,6 +195,20 @@ class ReviewMergeRequest:
                         "update)", ref.mr_iid, head_sha[:8])
             return None
 
+        if job.attempt > 1 and not job.force_full and head_sha:
+            # a re-run after a crash/restart: if the first run got the review
+            # out (crashed before recording it), don't pay for a second one
+            try:
+                notes = await vcs.list_notes(ref)
+            except VcsError:
+                notes = []
+            if content.has_review_for(notes, head_sha, await bot_username(vcs)):
+                logger.info("job %s: retry — review for %s already posted", job.job_id,
+                            head_sha[:8])
+                self.review_state.set_last_sha(ref.instance.name, ref.project_id,
+                                               ref.mr_iid, head_sha)
+                return None
+
         has_conflicts = mr.has_conflicts
         await self.notifier.notify(ReviewStarted(
             MrSummary.from_job(job), has_conflicts, job_id=job.job_id,

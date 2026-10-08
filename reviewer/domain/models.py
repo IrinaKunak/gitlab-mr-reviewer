@@ -98,6 +98,7 @@ class Job:
     ref: MergeRequestRef
     last_commit: str | None = None
     job_id: str = ""
+    attempt: int = 1  # >1: re-run after a crash/restart (the job queue counts them)
 
 
 @dataclass(frozen=True, kw_only=True)

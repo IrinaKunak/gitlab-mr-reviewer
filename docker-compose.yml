@@ -15,12 +15,15 @@ services:
       # - ./config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs
       - ./cache:/app/cache
-      # Durable state (model overrides, reviewed SHAs) — NOT swept like cache/
+      # Durable state (reviewer.db: job queue, overrides, reviewed SHAs, usage) — NOT swept like cache/
       - ./state:/app/state
       # Repo clone cache for the investigator (size it via REPO_CACHE_MAX_GB)
       - ./repos:/app/repos
 
     restart: unless-stopped
+    # graceful stop: workers get SHUTDOWN_TIMEOUT (20s) to finish a job before
+    # it is re-queued in state/reviewer.db; docker's default 10s would kill first
+    stop_grace_period: 30s
 
     networks:
       - gitlab-reviewer-network

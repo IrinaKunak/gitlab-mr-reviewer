@@ -1,8 +1,8 @@
 """state/reviewer.db: one SQLite file for the service's durable state.
 
 Review state (last reviewed sha per MR), dashboard model overrides, the
-dialogue reply budget and usage accounting live here (stage 17; the job queue
-joins in stage 18). WAL mode: readers (/stats) never block the workers.
+dialogue reply budget, usage accounting (stage 17) and the job queue
+(stage 18) live here. WAL mode: readers (/stats) never block the workers.
 Schema changes are numbered migrations tracked in `PRAGMA user_version`.
 
 SQL stays within SQLite 3.40 (the image has 3.46; older distro builds should
@@ -64,6 +64,20 @@ MIGRATIONS: list[str] = [
         entry TEXT NOT NULL
     );
     CREATE INDEX usage_ts ON usage (ts);
+    """,
+    # 2 — stage 18: the job queue
+    """
+    CREATE TABLE jobs (
+        job_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE INDEX jobs_status ON jobs (status, created_at);
     """,
 ]
 

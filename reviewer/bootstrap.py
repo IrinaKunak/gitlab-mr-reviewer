@@ -27,6 +27,7 @@ from .adapters.knowledge import ReviewBridge
 from .adapters.notify import CompositeNotifier
 from .adapters.notify.telegram import TelegramClient, TelegramFormatter, TelegramNotifier
 from .adapters.storage import Database
+from .adapters.storage.jobs import JobStore
 from .adapters.storage.legacy_import import import_legacy
 from .ai_client import AIClient
 from .application.answer_note import AnswerNote
@@ -203,9 +204,13 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
         cfg, ai=ai, workspace=workspace, usage_log=usage_log, vcs=vcs_for,
         translator=translator, pricing=pricing,
         budget=DialogueBudget(db, lambda: cfg.pipeline.dialogue_max_replies_per_mr))
+    instances = {i.name: i for i in cfg.gitlab.routes.values()}
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
                         cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
-                        runner=JobRunner(review_mr, answer_note), clock=clock)
+                        runner=JobRunner(review_mr, answer_note), clock=clock,
+                        store=JobStore(db, instances,
+                                       max_attempts=cfg.server.job_max_attempts),
+                        shutdown_timeout=cfg.server.shutdown_timeout)
     return Services(settings=cfg, notifier=notifier, bridge=bridge, ai=ai,
                     review_mr=review_mr, answer_note=answer_note,
                     queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,

@@ -11,7 +11,14 @@ from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.events import NotificationEvent
-from ..domain.models import ChangeSet, Discussion, MergeRequestInfo, MergeRequestRef, Note
+from ..domain.models import (
+    ChangeSet,
+    Discussion,
+    Job,
+    MergeRequestInfo,
+    MergeRequestRef,
+    Note,
+)
 
 if TYPE_CHECKING:
     from ..ai_client import ToolDef
@@ -115,3 +122,27 @@ class KnowledgeSource(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+
+class JobQueue(Protocol):
+    """Durable queue of accepted jobs (survives restarts)."""
+
+    def enqueue(self, job: Job) -> None: ...
+
+    def claim(self) -> Job | None:
+        """The next job (now running), or None when empty."""
+        ...
+
+    def complete(self, job_id: str) -> None: ...
+
+    def fail(self, job_id: str, error: str) -> None:
+        """Retry while attempts are left, else give up."""
+        ...
+
+    def release(self, job_id: str) -> None:
+        """Back to the queue without counting the attempt (graceful shutdown)."""
+        ...
+
+    def recover(self) -> tuple[int, int]:
+        """Startup: re-queue jobs a dead process left running -> (requeued, failed)."""
+        ...

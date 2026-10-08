@@ -10,6 +10,7 @@ from ...domain.events import MrSummary, ReviewFailed, ReviewPosted, TesterReport
 from ...domain.models import Tier
 from ...i18n import t
 from .. import content
+from ..common import bot_username
 from ..ports import KnowledgeSource, Notifier
 from .base import ReviewContext
 from .translate import Translator
@@ -28,7 +29,14 @@ class Deliver:
     async def run(self, ctx: ReviewContext) -> ReviewContext:
         job, ref = ctx.job, ctx.job.ref
         lang = self.settings.pipeline.language
+        if await self._already_posted(ctx):
+            logger.info("job %s: review for %s already in MR !%s — not posting again",
+                        job.job_id, ctx.head_sha[:8], ref.mr_iid)
+            ctx.posted = True
+            return ctx
         comment = content.format_review_comment(ctx.review_out, lang)
+        if ctx.head_sha:
+            comment += content.review_marker(ctx.head_sha) + "\n"
         try:
             await ctx.vcs.post_note(ref, comment)
             logger.info("Posted review for MR !%s", ref.mr_iid)
@@ -50,6 +58,22 @@ class Deliver:
             job_id=job.job_id, language=lang))
         ctx.posted = True
         return ctx
+
+
+    @staticmethod
+    async def _already_posted(ctx: ReviewContext) -> bool:
+        """Idempotent publishing (FT-2 p.4 / stage 18.3): a re-run of the job
+        after a crash between posting and recording must not post twice. An
+        explicit re-review (force_full) always posts."""
+        if ctx.job.force_full or not ctx.head_sha:
+            return False
+        try:
+            notes = await ctx.vcs.list_notes(ctx.job.ref)
+            bot = await bot_username(ctx.vcs)
+        except Exception as exc:  # noqa: BLE001 — cannot check: post (v1 behavior)
+            logger.debug("idempotency check skipped: %s", exc)
+            return False
+        return content.has_review_for(notes, ctx.head_sha, bot)
 
 
 class DeliverTesterReport:

@@ -29,8 +29,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__
 from .adapters.gitlab import parse_merge_request_webhook, parse_note_webhook
+from .adapters.storage import Database
+from .adapters.storage.jobs import JobStore
 from .application.common import new_job_id
 from .application.jobs import JobRunner
+from .application.ports import JobQueue
 from .config import ServerSection
 from .dashboard import DASHBOARD_HTML
 from .domain.dedupe import DedupePolicy
@@ -46,16 +49,24 @@ UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG
 
 
 class ReviewQueue:
-    """Bounded-concurrency MR processing with webhook-retry dedupe."""
+    """Bounded-concurrency job processing with webhook-retry dedupe, over a
+    durable JobQueue: a webhook answered "accepted" is in the database before
+    the response, so a deploy no longer drops it (#10)."""
 
     def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30, *,
-                 runner: JobRunner | None = None,
-                 clock: Callable[[], float] = time.monotonic) -> None:
-        self.queue: asyncio.Queue[Job] = asyncio.Queue()
+                 runner: JobRunner | None = None, store: JobQueue | None = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 shutdown_timeout: float = 20.0, poll_interval: float = 5.0) -> None:
         self.workers = workers
-        self.runner = runner  # None only for a queue that never starts workers
+        self.runner = runner  # None only for a queue that never runs jobs
+        # in-memory store for queues built without one (unit tests)
+        self.store: JobQueue = store or JobStore(Database.memory(), {})
         self.dedupe = DedupePolicy(dedupe_ttl, burst_window)
         self.clock = clock
+        self.shutdown_timeout = shutdown_timeout
+        self.poll_interval = poll_interval
+        self._wakeup = asyncio.Event()
+        self._stopping = False
         self._tasks: list[asyncio.Task] = []
 
     def submit(self, job: Job) -> bool:
@@ -65,7 +76,8 @@ class ReviewQueue:
         # one id per queued job: log lines, TG alerts and the neutral MR
         # error note all carry it, so a user report maps back to the log
         job = replace(job, job_id=new_job_id())
-        self.queue.put_nowait(job)
+        self.store.enqueue(job)
+        self._wakeup.set()
         logger.info("job %s: queued %s for MR !%s", job.job_id, job.kind, job.ref.mr_iid)
         return True
 
@@ -74,25 +86,73 @@ class ReviewQueue:
         assert self.runner is not None, "ReviewQueue without a runner cannot run jobs"
         await self.runner.run(job)
 
+    async def process(self, job: Job) -> None:
+        """Run one claimed job and record the outcome in the store."""
+        try:
+            await self.run(job)
+        except asyncio.CancelledError:
+            # shutdown timed out mid-job: hand it back, the next start resumes it
+            self.store.release(job.job_id)
+            raise
+        except Exception as exc:  # noqa: BLE001 — workers must survive anything
+            logger.exception("job %s: unhandled error", job.job_id)
+            self.store.fail(job.job_id, str(exc))
+        else:
+            self.store.complete(job.job_id)
+
+    async def drain(self) -> int:
+        """Run queued jobs inline until none is left (tests, tools); the count."""
+        done = 0
+        while (job := self.store.claim()) is not None:
+            await self.process(job)
+            done += 1
+        return done
+
     async def start(self) -> None:
+        requeued, failed = self.store.recover()
+        if requeued or failed:
+            logger.warning("job queue: %d interrupted job(s) re-queued, %d given up "
+                           "(out of attempts)", requeued, failed)
+        self._stopping = False
         self._tasks = [asyncio.create_task(self._worker(i), name=f"review-worker-{i}")
                        for i in range(self.workers)]
+        if requeued:
+            self._wakeup.set()
 
     async def stop(self) -> None:
-        for task in self._tasks:
+        """Graceful: no new jobs are taken; running ones get `shutdown_timeout`
+        seconds to finish, then are cancelled and handed back to the queue."""
+        self._stopping = True
+        self._wakeup.set()
+        if not self._tasks:
+            return
+        _done, pending = await asyncio.wait(self._tasks, timeout=self.shutdown_timeout)
+        for task in pending:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        if pending:
+            logger.warning("shutdown: %d job(s) unfinished after %.0fs — re-queued for "
+                           "the next start", len(pending), self.shutdown_timeout)
 
     async def _worker(self, idx: int) -> None:
         logger.info("review worker %d started", idx)
-        while True:
-            job = await self.queue.get()
+        while not self._stopping:
             try:
-                await self.run(job)
-            except Exception:  # noqa: BLE001 — workers must survive anything
-                logger.exception("worker %d: unhandled job error", idx)
-            finally:
-                self.queue.task_done()
+                job = self.store.claim()
+            except Exception:  # noqa: BLE001 — a db hiccup must not kill the worker
+                logger.exception("worker %d: cannot claim a job", idx)
+                job = None
+            if job is None:
+                try:
+                    await asyncio.wait_for(self._wakeup.wait(), self.poll_interval)
+                except TimeoutError:
+                    pass
+                if not self._stopping:
+                    self._wakeup.clear()
+                continue
+            if job.attempt > 1:
+                logger.info("job %s: attempt %d", job.job_id, job.attempt)
+            await self.process(job)
 
 
 def create_app(services: Services | None = None, *,

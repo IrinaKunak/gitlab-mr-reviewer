@@ -30,7 +30,11 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   `request.app.state.services`. `POST /webhook` (MR events, contract unchanged
   from v1, **plus Note Hook** → dialogue jobs on the same queue, deduped by note id and
   exempt from the burst window), `GET /` (health + flags), `GET /stats` (token/cost
-  aggregates); asyncio queue of `Job`s with N workers; webhook dedupe via
+  aggregates); `ReviewQueue`: N workers over the durable `JobQueue` port
+  (`adapters/storage/jobs.JobStore`, table `jobs`: queued → running → done/failed,
+  ≤`JOB_MAX_ATTEMPTS` (2) tries, `recover()` at start re-queues jobs a dead process
+  left running, graceful stop waits `SHUTDOWN_TIMEOUT` then hands jobs back; payloads
+  store the instance by name, never its token); webhook dedupe via
   `domain.dedupe.DedupePolicy` (exact-SHA TTL + per-MR burst window, injected clock);
   lifespan runs `Services.start()` — the GitLab startup check fills
   `services.bot_usernames` (instance name → bot login, so the bot's own notes are
@@ -260,6 +264,12 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 - **Zero prompt-cache reads are alerted**: an agent loop of >1 turn reading
   ≥`AI_CACHE_ALERT_MIN_INPUT` (100k) input with 0 cache reads logs a WARNING and sends
   one Telegram alert per review (prod !493: 677k in, 0 cached on the tool review).
+- **Accepted webhooks survive deploys** (#10: the in-memory queue dropped them):
+  jobs are in `state/reviewer.db` before the webhook answers. A re-run never posts a
+  second review: the review comment ends with a hidden
+  `<!-- mr-reviewer:review sha=… -->` marker — `Deliver` checks it before posting and a
+  retried job (attempt > 1) checks it before spending AI (force_full re-reviews always
+  post). Compose `stop_grace_period: 30s` > `SHUTDOWN_TIMEOUT` 20s.
 - **Exception text never reaches GitLab** (MR notes are visible to every project member,
   the hook log to maintainers): error paths post only «Ревью не выполнено, id задачи: …»,
   a webhook 500 returns `{"detail": "internal error", "job_id": …}`. `str(exc)` goes to

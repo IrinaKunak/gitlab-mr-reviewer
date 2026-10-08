@@ -72,9 +72,7 @@ class World:
             "X-Gitlab-Token": WEBHOOK_TOKEN, "X-Gitlab-Event": event})
         body = {"status_code": resp.status_code, **resp.json()}
         self.responses.append(body)
-        queue = self.services.queue
-        while not queue.queue.empty():
-            asyncio.run(queue.run(queue.queue.get_nowait()))
+        asyncio.run(self.services.queue.drain())
         return body
 
     def usage_entries(self) -> list[dict]:

@@ -379,6 +379,11 @@ class StorageSection(_Section):
 
 class ServerSection(_Section):
     workers: int = Field(default=2, ge=0)
+    # a job is run at most this many times (a crash/kill mid-review re-queues it)
+    job_max_attempts: int = Field(default=2, ge=1)
+    # graceful stop: running jobs get this long, then are re-queued for the next
+    # start (keep it under compose's stop_grace_period)
+    shutdown_timeout: float = Field(default=20.0, ge=0)
     debug: bool = False
     # bearer token for GET /stats; empty = direct local access only
     stats_token: str = ""
@@ -474,6 +479,8 @@ ENV_FIELDS: dict[str, str] = {
     "STATE_DIR": "storage.state_dir",
     "AI_LOG_DIR": "storage.log_dir",
     "AI_WORKERS": "server.workers",
+    "JOB_MAX_ATTEMPTS": "server.job_max_attempts",
+    "SHUTDOWN_TIMEOUT": "server.shutdown_timeout",
     "DEBUG": "server.debug",
     "STATS_TOKEN": "server.stats_token",
     "STATS_USER": "server.stats_user",

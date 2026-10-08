@@ -1863,13 +1863,17 @@ _LEAKY = "connect to http://10.0.0.5:8080/internal failed, see /srv/app/secrets.
 
 def test_review_queue_assigns_job_id():
     async def run():
-        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0)
+        from reviewer.adapters.storage import Database
+        from reviewer.adapters.storage.jobs import JobStore
+
+        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0,
+                            store=JobStore(Database.memory(), {"primary": INSTANCE}))
         job = review_job(mr_iid=7, last_commit="abc")
         assert queue.submit(job) is True
-        queued = queue.queue.get_nowait()
+        queued = queue.store.claim()
         assert len(queued.job_id) == 8
         assert queue.submit(replace(job, last_commit="def")) is True
-        assert queue.queue.get_nowait().job_id != queued.job_id
+        assert queue.store.claim().job_id != queued.job_id
     asyncio.run(run())
 
 
