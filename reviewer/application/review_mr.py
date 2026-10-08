@@ -20,13 +20,14 @@ from .. import prompts, usage
 from ..ai_client import AIError, AIInputTooLargeError, AITimeoutError, estimate_tokens
 from ..config import Settings
 from ..domain import budget
+from ..domain.events import MrSummary, ReviewFailed, ReviewStarted
 from ..domain.models import ChangeSet, Complexity, InstanceRef, MergeRequestRef, ReviewJob
 from ..i18n import t
 from ..review_state import ReviewStateStore
 from ..usage import UsageLog
 from . import content
 from .common import bot_username, new_job_id
-from .ports import RepoWorkspace, VcsError, VcsNotFound, VcsPort
+from .ports import KnowledgeSource, Notifier, RepoWorkspace, VcsError, VcsNotFound, VcsPort
 from .stages import (
     Deliver,
     DeliverTesterReport,
@@ -42,13 +43,13 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewMergeRequest:
-    def __init__(self, settings: Settings, *, ai: Any, telegram: Any, bridge: Any,
-                 workspace: RepoWorkspace, review_state: ReviewStateStore,
+    def __init__(self, settings: Settings, *, ai: Any, notifier: Notifier,
+                 knowledge: KnowledgeSource, workspace: RepoWorkspace, review_state: ReviewStateStore,
                  usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
                  translator: Translator,
                  pricing: usage.Pricing = usage.BUILTIN_PRICING) -> None:
         self.settings = settings
-        self.telegram = telegram
+        self.notifier = notifier
         self.workspace = workspace
         self.review_state = review_state
         self.usage_log = usage_log
@@ -56,10 +57,11 @@ class ReviewMergeRequest:
         self.vcs = vcs
         self.triage = Triage(ai)
         self.review = Review(settings, ai)
-        self.investigate = Investigate(settings, ai, bridge)
+        self.investigate = Investigate(settings, ai, knowledge)
         self.translate = Translate(translator)
-        self.deliver = Deliver(settings, telegram)
-        self.deliver_tester_report = DeliverTesterReport(settings, telegram, translator)
+        self.deliver = Deliver(settings, notifier)
+        self.deliver_tester_report = DeliverTesterReport(settings, notifier, knowledge,
+                                                         translator)
 
     def _msg(self, key: str, **kwargs: object) -> str:
         return t(key, self.settings.pipeline.language, **kwargs)
@@ -70,31 +72,35 @@ class ReviewMergeRequest:
         if not job.job_id:
             job = replace(job, job_id=new_job_id())
         ref, job_id = job.ref, job.job_id
-        ctx = {"project_id": ref.project_id, "mr_iid": ref.mr_iid,
-               "gitlab_instance": ref.instance.name, "job_id": job_id}
         logger.info("job %s: review MR !%s in project %s on %s", job_id,
                     ref.mr_iid, ref.project_id, ref.instance.name)
         tracker = usage.UsageTracker(self.pricing)
         tracker_token = usage.current_tracker.set(tracker)
+
+        async def fail(kind: str, details: str) -> None:
+            await self.notifier.notify(ReviewFailed(
+                kind, details, mr=MrSummary.from_job(job), job_id=job_id,
+                language=self.settings.pipeline.language))
+
         try:
-            await self.run(job, ctx)
+            await self.run(job, tracker)
         except VcsError as exc:
             logger.error("job %s: GitLab API error: %s", job_id, exc)
-            await self.telegram.notify_error("gitlab_api_error", str(exc), ctx)
+            await fail("gitlab_api_error", str(exc))
         except AIInputTooLargeError:
-            await self.telegram.notify_error("ai_failure", "MR too large to analyze", ctx)
+            await fail("ai_failure", "MR too large to analyze")
             await self._safe_note(ref, self._msg("mr.too_large"))
         except AITimeoutError:
             logger.error("job %s: AI analysis timed out", job_id)
-            await self.telegram.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
+            await fail("timeout", "AI analysis exceeded timeout limit")
             await self._safe_note(ref, self._msg("mr.timeout"))
         except AIError as exc:
             logger.error("job %s: AI analysis failed: %s", job_id, exc)
-            await self.telegram.notify_error("ai_failure", str(exc)[:300], ctx)
+            await fail("ai_failure", str(exc)[:300])
             await self._safe_note(ref, self._msg("mr.review_failed", job_id=job_id))
         except Exception as exc:  # noqa: BLE001 — top-level use-case guard
             logger.exception("job %s: error in quality check", job_id)
-            await self.telegram.notify_error("general", str(exc), ctx)
+            await fail("general", str(exc))
             await self._safe_note(ref, self._msg("mr.review_failed", job_id=job_id))
         finally:
             usage.current_tracker.reset(tracker_token)
@@ -109,10 +115,11 @@ class ReviewMergeRequest:
 
     # --- main flow ---
 
-    async def run(self, job: ReviewJob, alert_ctx: dict) -> None:
-        ctx = await self._preflight(job, alert_ctx)
+    async def run(self, job: ReviewJob, tracker: usage.UsageTracker | None = None) -> None:
+        ctx = await self._preflight(job)
         if ctx is None:
             return
+        ctx.usage = tracker
         ctx = await self.triage.run(ctx)
         await self._assemble_content(ctx)
         if not ctx.review_content:
@@ -145,7 +152,7 @@ class ReviewMergeRequest:
                                            job.ref.mr_iid, ctx.head_sha)
         await self.deliver_tester_report.run(ctx)
 
-    async def _preflight(self, job: ReviewJob, alert_ctx: dict) -> ReviewContext | None:
+    async def _preflight(self, job: ReviewJob) -> ReviewContext | None:
         """Live MR state, incremental delta, conflicts, the start notification.
         None = nothing to review (closed, already reviewed, conflicts)."""
         ref = job.ref
@@ -155,8 +162,10 @@ class ReviewMergeRequest:
         try:
             mr = await vcs.get_merge_request(ref)
         except VcsNotFound as exc:
-            await self.telegram.notify_error(
-                "gitlab_api_error", f"Failed to get MR !{ref.mr_iid}: {exc}", alert_ctx)
+            await self.notifier.notify(ReviewFailed(
+                "gitlab_api_error", f"Failed to get MR !{ref.mr_iid}: {exc}",
+                mr=MrSummary.from_job(job), job_id=job.job_id,
+                language=self.settings.pipeline.language))
             return None
 
         # the webhook only queues open/update/reopen, but the MR can get merged
@@ -187,8 +196,9 @@ class ReviewMergeRequest:
             return None
 
         has_conflicts = mr.has_conflicts
-        await self.telegram.notify(self.telegram.format_mr_message(
-            job, ref.project_path, has_conflicts, gitlab_instance=ref.instance.url))
+        await self.notifier.notify(ReviewStarted(
+            MrSummary.from_job(job), has_conflicts, job_id=job.job_id,
+            language=self.settings.pipeline.language))
 
         if has_conflicts and not self.settings.pipeline.review_for_conflict:
             await vcs.post_note(ref, self._msg("mr.conflict_skip"))

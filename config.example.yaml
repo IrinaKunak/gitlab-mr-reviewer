@@ -21,6 +21,7 @@ gitlab:
       webhook_token: ${XGITLABTOKEN_2}
 
 notify:
+  channels: [telegram]   # bitrix: not implemented yet (startup error)
   telegram:
     # replaces TELEGRAM_CHAT_ID / TELEGRAM_CHAT_ID_1..10 (deprecated);
     # env alternative: TELEGRAM_CHAT_IDS=-100123,-100456

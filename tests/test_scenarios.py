@@ -256,9 +256,11 @@ def test_complex_mr_runs_investigator_with_bridge_and_tester_report(world):
                            f"вложении: [{filename}](/uploads/1/{filename})")
     assert project.uploads == [
         (filename, "## ОТЧЁТ ДЛЯ ТЕСТИРОВЩИКА\n\n1. Отмените заказ с комиссией.".encode())]
-    # bridge chat first (AIManager archives reports), then the team channels
+    # AIManager archives reports (KnowledgeSource), the team channels get a copy
+    assert [(name, caption.split("\n")[0]) for name, _, caption in world.bridge.archived] == [
+        (filename, "🧪 Tester report: group/app !7")]
     assert [(d.chat_id, d.filename) for d in world.telegram.documents] == [
-        ("bridge-chat", filename), ("chat-1", filename)]
+        ("chat-1", filename)]
     assert all("group/app !7" in d.caption for d in world.telegram.documents)
 
     (entry,) = world.usage_entries()
@@ -277,7 +279,7 @@ def test_investigator_runs_only_for_complex_mrs_that_need_it(world):
 
     assert "smart" not in world.llm.tiers()
     assert world.bridge.questions == []
-    assert world.telegram.documents == []
+    assert world.telegram.documents == [] and world.bridge.archived == []
     assert len(mr.bot_notes) == 2
 
 

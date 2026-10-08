@@ -23,6 +23,7 @@ from ..ports import VcsPort
 
 if TYPE_CHECKING:
     from ...ai_client import ToolDef
+    from ...usage import UsageTracker
 
 
 @dataclass
@@ -54,6 +55,8 @@ class ReviewContext:
     # Translate / Deliver
     review_out: str = ""
     posted: bool = False
+    # this review's AI spend so far (the notification carries a summary)
+    usage: UsageTracker | None = None
 
 
 class Stage(Protocol):

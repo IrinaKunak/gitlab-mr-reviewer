@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING, Protocol
 
+from ..domain.events import NotificationEvent
 from ..domain.models import ChangeSet, Discussion, MergeRequestInfo, MergeRequestRef, Note
 
 if TYPE_CHECKING:
@@ -83,3 +84,34 @@ class RepoWorkspace(Protocol):
 
     def session(self, ref: MergeRequestRef,
                 sha: str | None) -> AbstractAsyncContextManager[list[ToolDef] | None]: ...
+
+
+class Notifier(Protocol):
+    """A notification channel (Telegram; Bitrix24 later).
+
+    Contract: `notify` never raises (fail-open, like usage accounting); the
+    channel decides which events it reacts to, formats them itself and splits
+    long messages to its own limits."""
+
+    name: str
+
+    async def notify(self, event: NotificationEvent) -> None: ...
+
+
+class KnowledgeSource(Protocol):
+    """Company knowledge the investigator can ask (AIManager over the Review
+    Bridge). Independent of the notification channels."""
+
+    enabled: bool
+
+    async def ask(self, question: str) -> str | None:
+        """The answer, or None (timeout / not found / disabled); never raises."""
+        ...
+
+    async def archive(self, filename: str, content: bytes, caption: str = "") -> None:
+        """Hand a document to the knowledge base (tester reports); never raises."""
+        ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...

@@ -20,7 +20,7 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 
 - **reviewer/bootstrap.py** — composition root, the ONLY place that reads `.env`
   (`load_config`), configures logging and builds objects: `build_services(cfg, **fakes)`
-  → `Services` (settings, TelegramClient, ReviewBridge, AIClient, ReviewMergeRequest, AnswerNote, ReviewQueue,
+  → `Services` (settings, Notifier, ReviewBridge, AIClient, ReviewMergeRequest, AnswerNote, ReviewQueue,
   ModelOverrides, OpenRouterCatalog, Pricing, UsageLog, ReviewStateStore, gitlab client
   factory, `bot_usernames`) with `start()`/`stop()` (startup logs, state migration,
   workers, bridge listener, instance check). No module in `reviewer/` holds a
@@ -90,17 +90,33 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   Deliberately NOT embeddings/RAG: review questions are exact-identifier lookups,
   and an embedding index would go stale per MR head and add an API dependency —
   ripgrep+ctags is what Claude Code and aider themselves use.
-- **reviewer/bridge.py** — Review Bridge: exclusive `getUpdates` long-polling, asks
-  AIManager questions in the bridge group, strips usage footers from answers
+- **reviewer/adapters/knowledge/telegram_bridge.py** — Review Bridge, the
+  `KnowledgeSource` port: exclusive `getUpdates` long-polling, asks AIManager questions
+  in the bridge group, strips usage footers from answers, `archive()` posts tester
+  reports to the bridge chat (AIManager's corpus). Own bot (`BRIDGE_BOT_TOKEN`,
+  default `TELEGRAM_BOT_TOKEN`) and chat — independent of the notification channels.
 - **reviewer/usage.py** — per-review token/cost accounting (contextvar tracker), model
-  price table (`MODEL_PRICES` override), `logs/usage.jsonl`, `/stats` aggregation,
-  Telegram usage footer
+  price table (`MODEL_PRICES` override), `logs/usage.jsonl`, `/stats` aggregation;
+  `UsageTracker.summary()` → the `UsageSummary` a `ReviewPosted` event carries
 - **reviewer/json_store.py** — `JsonStore`: the one implementation behind the state files
   (`review_state`, `overrides`, `openrouter_models`): lazy read, lock, fail-open (a
   corrupt file reads as empty, an unwritable one stays in memory), atomic writes via
   temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
   the cache sweep removes orphaned `<sha256>.*.tmp` too)
-- **reviewer/telegram_io.py** — Telegram I/O (`TelegramClient`); **reviewer/prompts.py** — English-only prompts (translation is a stage)
+- **Notifications** — the use cases emit domain events (`domain/events.py`:
+  `ReviewStarted`, `ReviewPosted`, `ReviewFailed`, `TesterReportReady`, `SystemAlert`;
+  structured fields, no text/markup) to the `Notifier` port (`notify(event)`, never
+  raises). `adapters/notify/`: `CompositeNotifier` (one failing channel never stops
+  the rest), `NullNotifier`; `adapters/notify/telegram/`: `TelegramClient` (wire),
+  `TelegramFormatter` (v1 Markdown verbatim, usage footer), `TelegramNotifier`
+  (routing: all `TELEGRAM_CHAT_IDS`; tester reports to `TESTER_REPORT_CHAT_IDS`;
+  splits >4096-char messages). Channels: `NOTIFY_CHANNELS` / `notify.channels`
+  (default `telegram`), built by the `bootstrap.NOTIFIERS` registry.
+  **Adding a channel** (Bitrix24): implement `Notifier` + a formatter in
+  `adapters/notify/<name>/`, register it in `bootstrap.NOTIFIERS` (and
+  `config.KNOWN_CHANNELS`), add it to `CHANNELS` in `tests/test_notify.py` — the
+  contract tests must pass. `bitrix` is a known name that fails startup until then.
+- **reviewer/prompts.py** — English-only prompts (translation is a stage)
 - **reviewer/i18n/** — message catalog `en.yaml` / `ru.yaml` + `t(key, lang, **kw)`
   (dotted keys, `str.format` fields; a key missing in a language falls back to en
   with a WARNING). Every user-facing text (MR notes, notifications) comes from it —

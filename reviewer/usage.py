@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import DEFAULT_MODELS, match_model_key
+from .domain.events import ModelUsage, UsageSummary
 from .domain.models import Job
 
 logger = logging.getLogger(__name__)
@@ -145,14 +146,13 @@ class UsageTracker:
         return (f"${self.total_cost:.2f} "
                 f"({self.total_input:,}→{self.total_output:,} tok; {per_model})")
 
-    def footer_line(self) -> str:
-        """Compact usage footer for Telegram messages (AIManager style)."""
-        segs = []
-        for model, stats in sorted(self.by_model().items()):
-            name = model.split("/")[-1].replace("claude-", "")
-            segs.append(f"{name}: →{stats['input_tokens']} ←{stats['output_tokens']}")
-        segs.append(f"💰${self.total_cost:.2f}")
-        return " | ".join(segs)
+    def summary(self) -> UsageSummary:
+        """What a notification carries (the channel formats its own footer)."""
+        return UsageSummary(
+            models=tuple(ModelUsage(model, stats["input_tokens"], stats["output_tokens"],
+                                    stats["cost_usd"])
+                         for model, stats in sorted(self.by_model().items())),
+            total_cost_usd=self.total_cost)
 
 
 @dataclass

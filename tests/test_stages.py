@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from reviewer.adapters.gitlab import to_changeset
+from reviewer.adapters.notify import NullNotifier
 from reviewer.ai_client import AIError, AIResult
 from reviewer.application.stages import (
     Deliver,
@@ -18,6 +19,7 @@ from reviewer.application.stages import (
     Translator,
     Triage,
 )
+from reviewer.domain.events import ReviewPosted
 from reviewer.domain.models import (
     ChangeSet,
     Complexity,
@@ -27,7 +29,7 @@ from reviewer.domain.models import (
 )
 from reviewer.repo_cache import CacheWorkspace
 from tests.factories import make_settings, mr_ref, review_job
-from tests.fakes import FakeGitLab, FakeTelegram, file_change
+from tests.fakes import FakeBridge, FakeGitLab, file_change
 
 
 def _ctx(gitlab=None, **kw) -> ReviewContext:
@@ -115,15 +117,23 @@ def test_investigate_stage_appends_impact_and_survives_failure():
 
 
 def test_deliver_stage_posts_and_notifies():
+    from reviewer.usage import UsageTracker
+
     gitlab = FakeGitLab()
     mr = gitlab.add_project(1).add_mr(2, changes=[])
-    telegram = FakeTelegram()
+    notifier = NullNotifier()
+    tracker = UsageTracker()
+    tracker.record(tier="main", model="claude-sonnet-5", provider="gateway",
+                   input_tokens=10, output_tokens=5)
     cfg = make_settings(pipeline__language="en")
-    cfg.notify.telegram.enabled = True
-    ctx = asyncio.run(Deliver(cfg, telegram).run(_ctx(gitlab, review_out="LGTM")))
+    ctx = asyncio.run(Deliver(cfg, notifier).run(
+        _ctx(gitlab, review_out="LGTM", usage=tracker)))
     assert ctx.posted is True
     assert mr.bot_notes[0].startswith("## 🤖") and "LGTM" in mr.bot_notes[0]
-    assert len(telegram.notifications) == 1 and "LGTM" in telegram.notifications[0]
+    (posted,) = notifier.events
+    assert isinstance(posted, ReviewPosted) and posted.review_text == "LGTM"
+    assert posted.mr.mr_iid == 2 and posted.job_id == "job00001"
+    assert posted.usage.models[0].model == "claude-sonnet-5"  # usage rides the event
 
 
 def test_deliver_tester_report_inlines_when_upload_fails():
@@ -134,14 +144,17 @@ def test_deliver_tester_report_inlines_when_upload_fails():
         return None
     gitlab.upload = no_upload  # type: ignore[method-assign]
 
-    telegram = FakeTelegram()
+    notifier, knowledge = NullNotifier(), FakeBridge()
     cfg = make_settings(pipeline__language="en", bridge__chat_id="bridge")
     cfg.pipeline.stages.tester_report = True
-    stage = DeliverTesterReport(cfg, telegram, Translator(_AI(), "en"))
+    stage = DeliverTesterReport(cfg, notifier, knowledge, Translator(_AI(), "en"))
     inv = Investigation(full_text="x", impact="", tester_report="Steps: 1. open")
     asyncio.run(stage.run(_ctx(gitlab, investigation=inv)))
     assert mr.bot_notes == ["Steps: 1. open"]
-    assert [d.chat_id for d in telegram.documents][0] == "bridge"
+    (archived,) = knowledge.archived  # AIManager's corpus gets it ...
+    (ready,) = notifier.events        # ... and so do the channels
+    assert archived[0] == ready.filename == "tester-report-group-proj-MR2.md"
+    assert ready.content == b"Steps: 1. open"
 
     # flag off -> nothing delivered
     cfg.pipeline.stages.tester_report = False

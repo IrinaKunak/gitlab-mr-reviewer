@@ -116,7 +116,7 @@ def world(monkeypatch, tmp_path):
         set_setting(monkeypatch, cfg, path, value)
 
     gitlab, llm, bridge = FakeGitLab(), ScriptedLLM(cfg), FakeBridge()
-    telegram = FakeTelegram(cfg.notify.telegram, language=cfg.pipeline.language)
+    telegram = FakeTelegram()
     clock = Clock()
     repo = FakeRepoCache(gitlab, tmp_path / "repos")
     services = build_services(cfg, telegram=telegram, ai=llm, bridge=bridge,

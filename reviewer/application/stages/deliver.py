@@ -4,41 +4,26 @@ notification; the tester report (attachment + note + documents to chats)."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ...config import Settings
+from ...domain.events import MrSummary, ReviewFailed, ReviewPosted, TesterReportReady
 from ...domain.models import Tier
 from ...i18n import t
 from .. import content
+from ..ports import KnowledgeSource, Notifier
 from .base import ReviewContext
 from .translate import Translator
 
 logger = logging.getLogger(__name__)
 
 
-def tester_report_targets(settings: Settings) -> list[str]:
-    """Chats that receive the tester-report document.
-
-    Bridge chat first (AIManager archives reports into its corpus), then the
-    team channels where the testers actually are (TESTER_REPORT_CHAT_IDS, or
-    all regular notification channels when unset)."""
-    targets: list[str] = []
-    if settings.bridge.chat_id:
-        targets.append(settings.bridge.chat_id)
-    if settings.notify.telegram.enabled:
-        for chat_id in settings.notify.telegram.tester_report_chat_ids or settings.notify.telegram.chat_ids:
-            if chat_id not in targets:
-                targets.append(chat_id)
-    return targets
-
-
 class Deliver:
     """Posts the review; `ctx.posted` drives the last-reviewed-sha state for
     incremental re-reviews."""
 
-    def __init__(self, settings: Settings, telegram: Any) -> None:
+    def __init__(self, settings: Settings, notifier: Notifier) -> None:
         self.settings = settings
-        self.telegram = telegram
+        self.notifier = notifier
 
     async def run(self, ctx: ReviewContext) -> ReviewContext:
         job, ref = ctx.job, ctx.job.ref
@@ -50,19 +35,19 @@ class Deliver:
         except Exception as exc:  # noqa: BLE001
             job_id = job.job_id or "?"
             logger.error("job %s: failed to post review comment: %s", job_id, exc)
-            await self.telegram.notify_error(
+            await self.notifier.notify(ReviewFailed(
                 "gitlab_api_error", f"Failed to post review comment: {exc}",
-                {"project_id": ref.project_id, "mr_iid": ref.mr_iid,
-                 "gitlab_instance": ref.instance.name, "job_id": job_id})
+                mr=MrSummary.from_job(job), job_id=job_id, language=lang))
             try:
                 await ctx.vcs.post_note(ref, t("mr.post_failed", lang, job_id=job_id))
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
             ctx.posted = False
             return ctx
-        if self.settings.notify.telegram.enabled:
-            await self.telegram.notify(self.telegram.format_mr_message(
-                job, ref.project_path, ctx.has_conflicts, ctx.review_out, ref.instance.url))
+        await self.notifier.notify(ReviewPosted(
+            MrSummary.from_job(job), ctx.review_out, ctx.has_conflicts,
+            usage=ctx.usage.summary() if ctx.usage is not None else None,
+            job_id=job.job_id, language=lang))
         ctx.posted = True
         return ctx
 
@@ -71,9 +56,11 @@ class DeliverTesterReport:
     """Runs after the review is out (and its sha recorded): the report is
     translated on the main tier — it is long, Haiku leaves it half-English."""
 
-    def __init__(self, settings: Settings, telegram: Any, translator: Translator) -> None:
+    def __init__(self, settings: Settings, notifier: Notifier, knowledge: KnowledgeSource,
+                 translator: Translator) -> None:
         self.settings = settings
-        self.telegram = telegram
+        self.notifier = notifier
+        self.knowledge = knowledge
         self.translator = translator
 
     async def run(self, ctx: ReviewContext) -> ReviewContext:
@@ -92,9 +79,13 @@ class DeliverTesterReport:
         else:  # upload failed — inline the report so it isn't lost
             await ctx.vcs.post_note(ref, report[:60_000])
 
-        caption = (f"🧪 Tester report: {ref.project_path} "
-                   f"!{ref.mr_iid}\n{ref.url}")
-        for chat_id in tester_report_targets(self.settings):
-            await self.telegram.send_document(
-                chat_id, filename, report.encode("utf-8"), caption)
+        # AIManager archives reports into its corpus (the bridge chat), then
+        # the team channels where the testers actually are
+        content_bytes = report.encode("utf-8")
+        await self.knowledge.archive(
+            filename, content_bytes,
+            f"🧪 Tester report: {ref.project_path} !{ref.mr_iid}\n{ref.url}")
+        await self.notifier.notify(TesterReportReady(
+            MrSummary.from_job(ctx.job), filename, content_bytes, job_id=ctx.job.job_id,
+            language=self.settings.pipeline.language))
         return ctx

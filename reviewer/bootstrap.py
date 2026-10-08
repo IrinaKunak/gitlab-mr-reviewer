@@ -23,13 +23,15 @@ from dotenv import load_dotenv
 
 from . import __version__, state_layout
 from .adapters.gitlab import GitLabVcs
+from .adapters.knowledge import ReviewBridge
+from .adapters.notify import CompositeNotifier
+from .adapters.notify.telegram import TelegramClient, TelegramFormatter, TelegramNotifier
 from .ai_client import AIClient
 from .application.answer_note import AnswerNote
 from .application.jobs import JobRunner
-from .application.ports import VcsPort
+from .application.ports import KnowledgeSource, Notifier, VcsPort
 from .application.review_mr import ReviewMergeRequest
 from .application.stages import Translator
-from .bridge import ReviewBridge
 from .config import (
     Settings,
     deprecated_env_vars_in_use,
@@ -38,6 +40,7 @@ from .config import (
     retired_env_vars_in_use,
 )
 from .dialogue_budget import DialogueBudget
+from .domain.events import SystemAlert
 from .domain.models import InstanceRef
 from .openrouter_models import OpenRouterCatalog
 from .overrides import ModelOverrides
@@ -45,7 +48,6 @@ from .repo_cache import CacheWorkspace, RepoCache
 from .review_state import ReviewStateStore
 from .server import ReviewQueue
 from .server import create_app as _create_app
-from .telegram_io import TelegramClient
 from .usage import Pricing, UsageLog
 
 logger = logging.getLogger(__name__)
@@ -70,8 +72,8 @@ def configure_logging(cfg: Settings) -> None:
 class Services:
     """The running service's object graph plus its lifecycle."""
     settings: Settings
-    telegram: TelegramClient
-    bridge: Any  # ReviewBridge, or a scripted fake with the same enabled/ask/start/stop
+    notifier: Notifier
+    bridge: KnowledgeSource  # ReviewBridge, or a scripted fake
     ai: Any  # AIClient, or a scripted fake
     review_mr: ReviewMergeRequest
     answer_note: AnswerNote
@@ -122,27 +124,61 @@ class Services:
                             instance.url, bot or "?")
             except Exception as exc:  # noqa: BLE001
                 logger.error("GitLab instance %s connection failed: %s", instance.name, exc)
-                await self.telegram.notify_error(
+                await self.notifier.notify(SystemAlert(
                     "gitlab_api_error", f"Startup connection failed: {exc}",
-                    {"gitlab_instance": instance.name})
+                    instance=instance.name))
+
+
+def _telegram_notifier(cfg: Settings, transport: TelegramClient | None) -> Notifier:
+    tg = cfg.notify.telegram
+    return TelegramNotifier(
+        tg, transport or TelegramClient(tg.token, proxy_url=cfg.network.proxy_url),
+        TelegramFormatter(cfg.pipeline.language),
+        # the bridge chat gets the tester report from the KnowledgeSource
+        exclude_document_chats=(cfg.bridge.chat_id,) if cfg.bridge.chat_id else ())
+
+
+# notification channel registry: notify.channels -> constructor(cfg, telegram transport)
+NOTIFIERS: dict[str, Callable[[Settings, TelegramClient | None], Notifier]] = {
+    "telegram": _telegram_notifier,
+}
+
+
+def build_notifier(cfg: Settings, telegram: TelegramClient | None = None) -> Notifier:
+    channels = []
+    for name in cfg.notify.channels:
+        if name not in NOTIFIERS:
+            raise SystemExit(f"notification channel {name!r} is not implemented yet "
+                             f"(NOTIFY_CHANNELS / notify.channels); available: "
+                             f"{sorted(NOTIFIERS)}")
+        channels.append(NOTIFIERS[name](cfg, telegram))
+    return CompositeNotifier(channels)
 
 
 def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
+                   notifier: Notifier | None = None,
                    ai: Any = None, bridge: Any = None, repo_cache: Any = None,
                    vcs_for: Callable[[InstanceRef], VcsPort] | None = None,
                    catalog: OpenRouterCatalog | None = None,
                    clock: Callable[[], float] = time.monotonic,
                    workers: int | None = None) -> Services:
     """Build the object graph from settings, in dependency order. Keyword
-    arguments replace one edge (tests pass fakes); everything else is real."""
+    arguments replace one edge (tests pass fakes; `telegram` is the Telegram
+    channel's transport, `notifier` replaces all channels); everything else is real."""
     state_dir = cfg.storage.state_dir
-    telegram = telegram or TelegramClient(cfg.notify.telegram, proxy_url=cfg.network.proxy_url,
-                                          language=cfg.pipeline.language)
+    notifier = notifier or build_notifier(cfg, telegram)
+    lang = cfg.pipeline.language
+
+    async def alert(kind: str, details: str) -> None:
+        await notifier.notify(SystemAlert(kind, details, language=lang))
+
     catalog = catalog or OpenRouterCatalog(state_dir, proxy_url=cfg.network.proxy_url)
     pricing = Pricing(cfg.llm.price_table(), catalog)
     overrides = ModelOverrides(state_dir, cfg)
-    ai = ai or AIClient(cfg, overrides=overrides, alert=telegram.notify_error)
-    bridge = bridge or ReviewBridge(cfg.bridge, telegram)
+    ai = ai or AIClient(cfg, overrides=overrides, alert=alert)
+    # the bridge's own bot (default: the notification bot) — independent of notify.*
+    bridge = bridge or ReviewBridge(cfg.bridge, TelegramClient(
+        cfg.bridge.bot_token or cfg.notify.telegram.token, proxy_url=cfg.network.proxy_url))
     repo_cache = repo_cache or RepoCache(cfg.repo_cache, git_proxy=cfg.network.git_proxy)
     if vcs_for is None:
         clients: dict[str, VcsPort] = {
@@ -154,7 +190,7 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     workspace = CacheWorkspace(repo_cache)
     translator = Translator(ai, cfg.pipeline.language)
     review_mr = ReviewMergeRequest(
-        cfg, ai=ai, telegram=telegram, bridge=bridge, workspace=workspace,
+        cfg, ai=ai, notifier=notifier, knowledge=bridge, workspace=workspace,
         review_state=review_state, usage_log=usage_log, vcs=vcs_for,
         translator=translator, pricing=pricing)
     answer_note = AnswerNote(
@@ -164,7 +200,7 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
                         cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
                         runner=JobRunner(review_mr, answer_note), clock=clock)
-    return Services(settings=cfg, telegram=telegram, bridge=bridge, ai=ai,
+    return Services(settings=cfg, notifier=notifier, bridge=bridge, ai=ai,
                     review_mr=review_mr, answer_note=answer_note,
                     queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,
                     usage_log=usage_log, review_state=review_state, vcs_for=vcs_for)

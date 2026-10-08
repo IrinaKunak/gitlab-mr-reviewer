@@ -1,4 +1,9 @@
-"""Review Bridge client — asks AIManager questions in the dedicated Telegram group.
+"""Review Bridge — the KnowledgeSource over Telegram: asks AIManager questions in
+the dedicated group and archives tester reports there.
+
+Independent of the notification channels: its own bot token (BRIDGE_BOT_TOKEN,
+default TELEGRAM_BOT_TOKEN) and chat (REVIEW_BRIDGE_CHAT_ID) — turning the
+Telegram notifications off does not touch it.
 
 Protocol (see plans/2026-06-10-review-bridge.md):
 - one focused plain-text question per message, Jira key included when known;
@@ -24,8 +29,8 @@ from typing import Any
 
 import httpx
 
-from .config import BridgeSection
-from .telegram_io import TelegramClient
+from ...config import BridgeSection
+from ..notify.telegram.client import TelegramClient
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +68,7 @@ class ReviewBridge:
         self.cfg = cfg
         # questions go out through the same bot that polls for the answers
         self.telegram = telegram
-        token = telegram.cfg.token
+        token = telegram.token
         self._token = token
         self.enabled = bool(cfg.enabled and cfg.chat_id and token)
         self._offset = 0
@@ -188,3 +193,14 @@ class ReviewBridge:
                         len(answer), len(chunks))
             return answer
 
+    # --- archiving ---
+
+    async def archive(self, filename: str, content: bytes, caption: str = "") -> None:
+        """Post a document to the bridge chat: AIManager archives tester reports
+        into its corpus. Needs only the chat and the token (not BRIDGE=on)."""
+        if not (self.cfg.chat_id and self._token):
+            return
+        try:
+            await self.telegram.send_document(self.cfg.chat_id, filename, content, caption)
+        except Exception as exc:  # noqa: BLE001 — KnowledgeSource contract: never raise
+            logger.warning("bridge archive failed: %s", self.telegram.redact_token(str(exc)))

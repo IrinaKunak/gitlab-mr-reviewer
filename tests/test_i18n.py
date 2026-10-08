@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from reviewer.adapters.notify.telegram import TelegramFormatter, TelegramNotifier
 from reviewer.application import content
+from reviewer.config import TelegramSection
+from reviewer.domain.events import MrSummary, ReviewFailed, SystemAlert
 from reviewer.i18n import catalog, languages, t
 from tests.factories import review_job
 from tests.fakes import FakeTelegram
@@ -47,16 +50,24 @@ def test_mr_notes_match_previous_texts(lang):
 
 @pytest.mark.parametrize("lang", ["en", "ru"])
 def test_telegram_texts_match_previous_texts(lang):
-    tg = FakeTelegram(language=lang)
+    fmt = TelegramFormatter(lang)
     job = review_job(title="Fix `x`", author="dev", source_branch="f", target_branch="main",
-                     mr_iid=5, url="https://g/p/-/merge_requests/5")
-    assert (tg.format_mr_message(job, "g/p", False, gitlab_instance="https://gitlab.test/")
-            == SNAPSHOT[f"mr_new_{lang}"])
-    assert (tg.format_mr_message(job, "g/p", True, "short review",
-                                 gitlab_instance="https://gitlab.test")
-            == SNAPSHOT[f"mr_conf_{lang}"])
-    assert tg.format_mr_message(job, "g/p", False, "x" * 2500) == SNAPSHOT[f"mr_long_{lang}"]
+                     mr_iid=5, project_path="g/p", url="https://g/p/-/merge_requests/5")
+    mr = MrSummary.from_job(job)
+    assert fmt.mr_message(mr) == SNAPSHOT[f"mr_new_{lang}"]  # instance url always shown
+    assert fmt.mr_message(mr, True, "short review") == SNAPSHOT[f"mr_conf_{lang}"]
+    no_instance = MrSummary(**{**mr.__dict__, "instance_url": ""})
+    assert fmt.mr_message(no_instance, False, "x" * 2500) == SNAPSHOT[f"mr_long_{lang}"]
+
+    tg = FakeTelegram()
+    notifier = TelegramNotifier(TelegramSection(enabled=True, chat_ids=["c"]), tg, fmt)
     for kind in ERROR_KINDS:
-        asyncio.run(tg.notify_error(kind, "details", {
-            "project_id": 1, "mr_iid": 2, "gitlab_instance": "primary", "job_id": "j1"}))
-        assert tg.messages[-1].text.rsplit("\n", 1)[0] == SNAPSHOT[f"err_{kind}_{lang}"], kind
+        # job errors carry the MR; system alerts their own fields — same text
+        events = [ReviewFailed(kind, "details", mr=MrSummary(**{**mr.__dict__,
+                               "instance": "primary", "project_id": 1, "mr_iid": 2}),
+                               job_id="j1"),
+                  SystemAlert(kind, "details", instance="primary", project_id=1,
+                              mr_iid=2, job_id="j1")]
+        for event in events:
+            asyncio.run(notifier.notify(event))
+            assert tg.messages[-1].text.rsplit("\n", 1)[0] == SNAPSHOT[f"err_{kind}_{lang}"], kind

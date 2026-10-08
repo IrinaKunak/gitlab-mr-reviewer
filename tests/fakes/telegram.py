@@ -1,13 +1,12 @@
-"""Telegram sink: a TelegramClient whose two wire-level senders record instead
-of sending, so message formatting (notify, notify_error, format_mr_message)
-runs for real."""
+"""Telegram sink: a TelegramClient transport whose two wire-level senders
+record instead of sending, so the real TelegramNotifier (formatting, routing)
+runs on top of it."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from reviewer.config import TelegramSection
-from reviewer.telegram_io import TelegramClient
+from reviewer.adapters.notify.telegram import TelegramClient
 
 
 @dataclass
@@ -25,9 +24,8 @@ class SentDocument:
 
 
 class FakeTelegram(TelegramClient):
-    def __init__(self, cfg: TelegramSection | None = None, *, language: str = "en") -> None:
-        super().__init__(cfg or TelegramSection(enabled=True, token="test-token",
-                                                chat_ids=["chat-1"]), language=language)
+    def __init__(self, token: str = "test-token") -> None:
+        super().__init__(token)
         self.messages: list[SentMessage] = []
         self.documents: list[SentDocument] = []
 

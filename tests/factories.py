@@ -79,8 +79,7 @@ def make_services(cfg: Any = None, **deps: Any) -> Any:
     from reviewer.bootstrap import build_services
     from tests.fakes import FakeBridge, FakeTelegram
     cfg = cfg if cfg is not None else make_settings()
-    deps.setdefault("telegram", FakeTelegram(cfg.notify.telegram,
-                                             language=cfg.pipeline.language))
+    deps.setdefault("telegram", FakeTelegram())
     deps.setdefault("ai", _Unwired("ai"))
     deps.setdefault("bridge", FakeBridge(enabled=False))
     deps.setdefault("repo_cache", _Unwired("repo_cache"))

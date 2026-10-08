@@ -34,6 +34,7 @@ from .application.jobs import JobRunner
 from .config import ServerSection
 from .dashboard import DASHBOARD_HTML
 from .domain.dedupe import DedupePolicy
+from .domain.events import SystemAlert
 from .domain.models import Job, Tier
 
 if TYPE_CHECKING:  # bootstrap imports this module; the type is all we need
@@ -250,9 +251,10 @@ async def _alert_unknown_token(request: Request, event_type: str | None,
     if now - request.app.state.unknown_token_alert_at < UNKNOWN_TOKEN_ALERT_INTERVAL:
         return
     request.app.state.unknown_token_alert_at = now
-    await _svc(request).telegram.notify_error(
+    svc = _svc(request)
+    await svc.notifier.notify(SystemAlert(
         "webhook_error", f"Unknown webhook token received: {(token or '')[:10]}...",
-        {"event_type": event_type})
+        language=svc.settings.pipeline.language))
 
 
 @router.post("/webhook")
@@ -272,7 +274,8 @@ async def handle_gitlab_webhook(request: Request):
         payload = await request.json()
     except json.JSONDecodeError:
         logger.error("Invalid JSON in webhook payload")
-        await svc.telegram.notify_error("webhook_error", "Invalid JSON in webhook payload")
+        await svc.notifier.notify(SystemAlert("webhook_error", "Invalid JSON in webhook payload",
+                                              language=svc.settings.pipeline.language))
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
 
     if event_type == "Note Hook":
@@ -305,9 +308,8 @@ async def handle_gitlab_webhook(request: Request):
         # exception text stays in our log/alert, the response carries only an id
         job_id = new_job_id()
         logger.exception("job %s: error handling webhook", job_id)
-        await svc.telegram.notify_error("webhook_error", str(exc),
-                                        {"event_type": event_type or "unknown",
-                                         "job_id": job_id})
+        await svc.notifier.notify(SystemAlert("webhook_error", str(exc), job_id=job_id,
+                                              language=svc.settings.pipeline.language))
         return JSONResponse(status_code=500,
                             content={"detail": "internal error", "job_id": job_id})
 

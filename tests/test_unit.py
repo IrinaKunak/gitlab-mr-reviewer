@@ -12,7 +12,6 @@ from dataclasses import replace
 import pytest
 
 from reviewer import ai_client as ai_mod
-from reviewer import bridge as bridge_mod
 from reviewer import llm_requests
 from reviewer.adapters.gitlab import (
     GitLabVcs,
@@ -20,6 +19,8 @@ from reviewer.adapters.gitlab import (
     parse_note_webhook,
     to_changeset,
 )
+from reviewer.adapters.knowledge import telegram_bridge as bridge_mod
+from reviewer.adapters.notify import NullNotifier
 from reviewer.ai_client import AIClient, extract_json
 from reviewer.application import content
 from reviewer.config import Settings
@@ -436,7 +437,9 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     assert "https://" not in DASHBOARD_HTML and "http://" not in DASHBOARD_HTML
 
     # telegram footer, AIManager style
-    footer = tracker.footer_line()
+    from reviewer.adapters.notify.telegram import usage_footer
+
+    footer = usage_footer(tracker.summary())
     assert "haiku-4-5: →19000 ←450" in footer
     assert "💰$" in footer
 
@@ -631,7 +634,8 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     expected = (9 * 2.5 + 150_000 * 2.5 * 0.1 + 10_000 * 2.5 * 1.25
                 + 4029 * 15.0) / 1_000_000        # reads 0.1x, writes 1.25x
     assert abs(call["cost_usd"] - expected) < 1e-9
-    assert "→160009" in tracker.footer_line()
+    from reviewer.adapters.notify.telegram import usage_footer
+    assert "→160009" in usage_footer(tracker.summary())
 
     # cache savings are NET: reads save 0.9x of the input rate, cache writes
     # cost a 0.25x premium — a write-only review must not look like a win
@@ -785,23 +789,21 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
     assert tracker.calls[0]["output_tokens"] == 30
 
 
-def test_tester_report_targets(monkeypatch):
+def test_tester_report_targets():
     # owner request 2026-07-23: reports go to the team group(s) too, not only
-    # the bridge chat where AIManager archives them
-    from reviewer.application.stages import tester_report_targets
+    # the bridge chat where AIManager archives them (the bridge chat now gets it
+    # from the KnowledgeSource, so the Telegram channel skips it)
+    from reviewer.bootstrap import build_notifier
 
     cfg = make_settings(bridge__chat_id="-100bridge")
     tg = cfg.notify.telegram
     tg.enabled, tg.chat_ids, tg.tester_report_chat_ids = True, ["-100team", "-100extra"], []
-    assert tester_report_targets(cfg) == ["-100bridge", "-100team", "-100extra"]
+    (channel,) = build_notifier(cfg).channels
+    assert channel.tester_report_chats() == ["-100team", "-100extra"]
 
     # explicit override narrows the team targets; dedupe against bridge
     tg.tester_report_chat_ids = ["-100team", "-100bridge"]
-    assert tester_report_targets(cfg) == ["-100bridge", "-100team"]
-
-    # telegram off -> only the bridge copy
-    tg.enabled = False
-    assert tester_report_targets(cfg) == ["-100bridge"]
+    assert channel.tester_report_chats() == ["-100team"]
 
 
 def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
@@ -838,9 +840,10 @@ def test_process_skips_merged_or_closed_mr():
         gitlab = FakeGitLab()
         gitlab.add_project(1).add_mr(2, changes=[], state=state)
         # the AI is unwired: touching it fails the test
-        svc = make_services(vcs_for=lambda instance: gitlab)
-        asyncio.run(svc.review_mr.run(review_job(), {}))
-        assert svc.telegram.messages == []
+        notifier = NullNotifier()
+        svc = make_services(vcs_for=lambda instance: gitlab, notifier=notifier)
+        asyncio.run(svc.review_mr.run(review_job()))
+        assert notifier.events == []
         assert [c[0] for c in gitlab.calls] == ["mr_get"]  # no notes, no diffs
 
 
@@ -1103,11 +1106,13 @@ def test_process_skips_already_reviewed_sha(tmp_path):
 
     gitlab = FakeGitLab()
     gitlab.add_project(1).add_mr(2, changes=[], sha="abc123")
-    svc = make_services(make_settings(tmp_path), vcs_for=lambda instance: gitlab)
+    notifier = NullNotifier()
+    svc = make_services(make_settings(tmp_path), vcs_for=lambda instance: gitlab,
+                        notifier=notifier)
     job = review_job(last_commit="abc123")
     svc.review_state.set_last_sha(*job.ref.key, "abc123")
-    asyncio.run(svc.review_mr.run(job, {}))
-    assert svc.telegram.messages == []
+    asyncio.run(svc.review_mr.run(job))
+    assert notifier.events == []
     assert [c[0] for c in gitlab.calls] == ["mr_get"]
 
 
@@ -1872,32 +1877,29 @@ def test_review_queue_assigns_job_id():
     lambda: ai_mod.AIError(_LEAKY),
 ])
 def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
-    from types import SimpleNamespace
 
     from reviewer.application.review_mr import ReviewMergeRequest
 
-    notes, alerts = [], []
+    notes = []
 
-    async def fake_inner(self, job, ctx):
+    async def fake_inner(self, job, tracker=None):
         raise exc_factory()
 
     async def fake_note(self, ref, body):
         notes.append(body)
 
-    async def fake_alert(kind, details, ctx=None):
-        alerts.append((details, ctx))
-
     monkeypatch.setattr(ReviewMergeRequest, "run", fake_inner)
     monkeypatch.setattr(ReviewMergeRequest, "_safe_note", fake_note)
 
-    p = make_review_mr(telegram=SimpleNamespace(notify_error=fake_alert))
+    notifier = NullNotifier()
+    p = make_review_mr(notifier=notifier)
     asyncio.run(p.execute(review_job(job_id="deadbeef")))
     assert len(notes) == 1
     assert "10.0.0.5" not in notes[0] and "/srv/app" not in notes[0]
     assert "deadbeef" in notes[0]
     # details stay available internally
-    assert _LEAKY in alerts[0][0]
-    assert alerts[0][1]["job_id"] == "deadbeef"
+    (failed,) = notifier.events
+    assert _LEAKY in failed.details and failed.job_id == "deadbeef"
 
 
 def test_deliver_review_failure_note_hides_exception_text():
@@ -1911,14 +1913,11 @@ def test_deliver_review_failure_note_hides_exception_text():
             raise RuntimeError(_LEAKY)
         posted.append(body)
 
-    async def fake_alert(*a, **k):
-        return True
-
     from reviewer.application.stages import Deliver, ReviewContext
     from reviewer.domain.models import ChangeSet, MergeRequestInfo
 
     vcs = SimpleNamespace(post_note=fake_post)
-    deliver = Deliver(make_settings(), SimpleNamespace(notify_error=fake_alert))
+    deliver = Deliver(make_settings(), NullNotifier())
     ctx = ReviewContext(job=review_job(job_id="cafe0001"), vcs=vcs, changes=ChangeSet(),
                         mr=MergeRequestInfo("opened", "t", "dev", "f", "main"),
                         review_out="review")
@@ -1927,7 +1926,6 @@ def test_deliver_review_failure_note_hides_exception_text():
 
 
 def test_webhook_500_hides_exception_text(monkeypatch):
-    from types import SimpleNamespace
 
     from fastapi.testclient import TestClient
 
@@ -1936,12 +1934,9 @@ def test_webhook_500_hides_exception_text(monkeypatch):
     def boom(payload, instance):
         raise ValueError(_LEAKY)
 
-    async def fake_alert(*a, **k):
-        return True
-
     monkeypatch.setattr(server, "parse_merge_request_webhook", boom)
     cfg = make_settings(gitlab__routes={"hook": INSTANCE})
-    svc = make_services(cfg, telegram=SimpleNamespace(notify_error=fake_alert))
+    svc = make_services(cfg)
     resp = TestClient(server.create_app(svc)).post(
         "/webhook", json={"object_kind": "merge_request"},
         headers={"X-Gitlab-Token": "hook", "X-Gitlab-Event": "Merge Request Hook"})
@@ -2315,7 +2310,8 @@ def test_composition_root_builds_independent_graphs(tmp_path):
     ru = make_services(make_settings(tmp_path / "a", pipeline__language="ru"))
     en = make_services(make_settings(tmp_path / "b", pipeline__language="en"))
     assert ru.review_mr is not en.review_mr and ru.queue is not en.queue
-    assert ru.telegram.language == "ru" and en.telegram.language == "en"
+    ru_tg, en_tg = (svc.notifier.channels[0].formatter for svc in (ru, en))
+    assert ru_tg.language == "ru" and en_tg.language == "en"
     job = review_job(last_commit="abc")
     ru.review_state.set_last_sha(*job.ref.key, "abc")
     assert en.review_state.get_last_sha(*job.ref.key) is None  # separate state dirs

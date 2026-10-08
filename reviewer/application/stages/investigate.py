@@ -13,13 +13,14 @@ from ...config import Settings
 from ...domain import budget
 from ...domain.investigation import investigation_from_text
 from ...domain.models import Investigation, ReviewJob, Tier, TriageResult
+from ..ports import KnowledgeSource
 from .base import ReviewContext
 
 logger = logging.getLogger(__name__)
 
 
 class Investigate:
-    def __init__(self, settings: Settings, ai: Any, bridge: Any) -> None:
+    def __init__(self, settings: Settings, ai: Any, bridge: KnowledgeSource) -> None:
         self.settings = settings
         self.ai = ai
         self.bridge = bridge

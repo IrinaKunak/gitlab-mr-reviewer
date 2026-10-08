@@ -271,7 +271,7 @@ class LLMSection(_Section):
 
 class TelegramSection(_Section):
     enabled: bool = False
-    token: str = ""  # also polled by the Review Bridge — nothing else may getUpdates
+    token: str = ""  # also the Review Bridge's bot unless BRIDGE_BOT_TOKEN is set
     chat_ids: list[str] = []
     # TELEGRAM_CHAT_ID[_N]; used only when chat_ids is empty
     legacy_chat_ids: list[str] = Field(default=[], exclude=True)
@@ -287,13 +287,32 @@ class TelegramSection(_Section):
         return self
 
 
+# notification channels the service knows; bootstrap builds the implemented ones
+KNOWN_CHANNELS = ("telegram", "bitrix")
+
+
 class NotifySection(_Section):
+    # which channels get notifications (bootstrap.NOTIFIERS builds them)
+    channels: list[str] = ["telegram"]
     telegram: TelegramSection = TelegramSection()
+
+    _split = field_validator("channels", mode="before")(_csv)
+
+    @field_validator("channels")
+    @classmethod
+    def _known(cls, value: list[str]) -> list[str]:
+        unknown = [c for c in value if c not in KNOWN_CHANNELS]
+        if unknown:
+            raise ValueError(f"unknown channel(s) {unknown}; known: {list(KNOWN_CHANNELS)}")
+        return value
 
 
 class BridgeSection(_Section):
     enabled: bool = False
     chat_id: str = ""
+    # the bridge's own bot; empty = TELEGRAM_BOT_TOKEN (the prod setup). That bot
+    # is polled exclusively by the bridge — nothing else may call getUpdates on it
+    bot_token: str = ""
     # measured AIManager latency (2026-07-24): 49s, 73s, 81s, ~180s. 90s dropped
     # answers that were still coming — the cost of waiting is latency, not money
     question_timeout: int = Field(default=240, gt=0)
@@ -427,6 +446,8 @@ ENV_FIELDS: dict[str, str] = {
     "TELEGRAM_BOT_TOKEN": "notify.telegram.token",
     "TELEGRAM_CHAT_IDS": "notify.telegram.chat_ids",
     "TESTER_REPORT_CHAT_IDS": "notify.telegram.tester_report_chat_ids",
+    "NOTIFY_CHANNELS": "notify.channels",
+    "BRIDGE_BOT_TOKEN": "bridge.bot_token",
     "BRIDGE": "bridge.enabled",
     "REVIEW_BRIDGE_CHAT_ID": "bridge.chat_id",
     "BRIDGE_QUESTION_TIMEOUT": "bridge.question_timeout",
