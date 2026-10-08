@@ -1,7 +1,7 @@
 """Scripted Review Bridge: AIManager's answers come from a queue, in order.
 
-Replaces the `bridge` singleton the pipeline imports (same `enabled` / `ask`
-surface), so the investigator's `ask_aimanager` tool runs for real against
+Stands in for ReviewBridge in build_services (same `enabled` / `ask` /
+`start` / `stop` surface), so the investigator's `ask_aimanager` tool runs for real against
 it. `None` in the script is a timeout / "not found" answer. An exhausted
 script raises AssertionError, like ScriptedLLM: an unexpected question is a
 test failure.
@@ -21,6 +21,12 @@ class FakeBridge:
     def on_ask(self, *answers: str | None) -> FakeBridge:
         self.script.extend(answers)
         return self
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
 
     async def ask(self, question: str) -> str | None:
         self.questions.append(question)

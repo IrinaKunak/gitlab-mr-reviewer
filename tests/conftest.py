@@ -1,13 +1,12 @@
-"""Keep the suite hermetic: reviewer.config runs load_dotenv() on import, so a
-developer's .env (e.g. AI_PROVIDER=openrouter) would leak into every Settings().
-load_dotenv never overrides variables already set, so pinning them here wins."""
+"""Keep the suite hermetic: nothing in `reviewer` reads .env on import any more
+(bootstrap.load_config does, and tests never call it with dotenv), but a
+developer's shell may export these — pin them so every Settings() is the same."""
 
 import asyncio
 import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,11 +17,9 @@ os.environ["CONFIG_FILE"] = "/nonexistent/config.yaml"
 
 
 # --- characterization harness ------------------------------------------------
-# The ONLY place that monkeypatches module boundaries for scenario tests. Once
-# a composition root exists (refactoring stage 10) this fixture will hand the
-# same fakes to the bootstrap instead, and the scenario tests stay unchanged.
-# `reviewer` is imported inside the fixture only: the env pin above must run
-# before reviewer.config's load_dotenv().
+# Builds the real object graph through bootstrap.build_services, with fakes on
+# the outer edges (GitLab, LLM, Telegram transport, bridge, repo checkout,
+# clock). Scenario tests only see the `world` surface below.
 
 WEBHOOK_TOKEN = "hook-token"
 
@@ -51,6 +48,8 @@ class Clock:
 
 @dataclass
 class World:
+    settings: Any
+    services: Any
     gitlab: Any
     llm: Any
     telegram: Any
@@ -64,26 +63,18 @@ class World:
 
     def configure(self, **values: Any) -> None:
         """Scenario-specific settings on top of the prod-shaped defaults."""
-        from reviewer.config import settings
         for name, value in values.items():  # llm__max_input_tokens=... -> llm.max_input_tokens
-            set_setting(self.monkeypatch, settings, name.replace("__", "."), value)
+            set_setting(self.monkeypatch, self.settings, name.replace("__", "."), value)
 
     def send(self, payload: dict, event: str = "Merge Request Hook") -> dict:
         """POST a webhook, then run whatever it queued the way a worker does."""
-        from reviewer import pipeline as pipeline_mod
-        from reviewer import server
-
         resp = self.client.post("/webhook", json=payload, headers={
             "X-Gitlab-Token": WEBHOOK_TOKEN, "X-Gitlab-Event": event})
         body = {"status_code": resp.status_code, **resp.json()}
         self.responses.append(body)
-        queue = server.review_queue.queue
-        while not queue.empty():
-            job = queue.get_nowait()
-            if job.kind == "dialogue":
-                asyncio.run(pipeline_mod.pipeline.process_note(job))
-            else:
-                asyncio.run(pipeline_mod.pipeline.process(job))
+        queue = self.services.queue
+        while not queue.queue.empty():
+            asyncio.run(queue.run(queue.queue.get_nowait()))
         return body
 
     def usage_entries(self) -> list[dict]:
@@ -99,17 +90,14 @@ def world(monkeypatch, tmp_path):
     on) wired to in-memory GitLab / LLM / Telegram / bridge / repo checkout."""
     from fastapi.testclient import TestClient
 
-    from reviewer import gitlab_io, server, telegram_io
-    from reviewer import pipeline as pipeline_mod
-    from reviewer.config import settings
+    from reviewer.bootstrap import build_services
+    from reviewer.config import Settings
     from reviewer.domain.models import InstanceRef
+    from reviewer.server import create_app
     from tests.fakes import FakeBridge, FakeGitLab, FakeRepoCache, FakeTelegram, ScriptedLLM
 
-    gitlab, llm, telegram, bridge = FakeGitLab(), ScriptedLLM(), FakeTelegram(), FakeBridge()
-    clock = Clock()
-    repo = FakeRepoCache(gitlab, tmp_path / "repos")
     log_dir = tmp_path / "logs"
-
+    cfg = Settings()
     for path, value in {
         "pipeline.stages.investigator": True, "bridge.enabled": True,
         "pipeline.stages.tester_report": True, "pipeline.stages.review_repo_tools": True,
@@ -125,20 +113,17 @@ def world(monkeypatch, tmp_path):
         "storage.ai_cache_dir": str(tmp_path / "cache"),
         "gitlab.routes": {WEBHOOK_TOKEN: InstanceRef("primary", "https://gitlab.test", "t")},
     }.items():
-        set_setting(monkeypatch, settings, path, value)
+        set_setting(monkeypatch, cfg, path, value)
+
+    gitlab, llm, bridge = FakeGitLab(), ScriptedLLM(cfg), FakeBridge()
+    telegram = FakeTelegram(cfg.notify.telegram, language=cfg.pipeline.language)
+    clock = Clock()
+    repo = FakeRepoCache(gitlab, tmp_path / "repos")
+    services = build_services(cfg, telegram=telegram, ai=llm, bridge=bridge,
+                              repo_cache=repo, gitlab_client=gitlab.client,
+                              clock=clock.monotonic, workers=0)
     # what the startup instance check learns from GET /user
-    monkeypatch.setattr(server, "bot_usernames", {"primary": gitlab.bot_username})
+    services.bot_usernames["primary"] = gitlab.bot_username
 
-    monkeypatch.setattr(gitlab_io, "get_gitlab_client", gitlab.client)
-    monkeypatch.setattr(telegram_io, "send_message", telegram.send_message)
-    monkeypatch.setattr(telegram_io, "send_document", telegram.send_document)
-    monkeypatch.setattr(pipeline_mod.pipeline, "ai", llm)
-    monkeypatch.setattr(pipeline_mod.pipeline, "_dialogue_replies", {})
-    monkeypatch.setattr(pipeline_mod, "repo_cache", repo)
-    monkeypatch.setattr(pipeline_mod, "bridge", bridge)
-    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=clock.monotonic))
-    monkeypatch.setattr(server, "review_queue", server.ReviewQueue(
-        workers=0, dedupe_ttl=600, burst_window=30))
-
-    return World(gitlab, llm, telegram, bridge, repo, clock, log_dir,
-                 TestClient(server.app), monkeypatch)
+    return World(cfg, services, gitlab, llm, telegram, bridge, repo, clock, log_dir,
+                 TestClient(create_app(services)), monkeypatch)

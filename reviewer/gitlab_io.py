@@ -14,7 +14,6 @@ from typing import Any
 import gitlab
 import requests
 
-from .config import settings
 from .domain.models import (
     ChangeSet,
     DialogueJob,
@@ -77,9 +76,8 @@ def summarize_skipped(entries: list[str]) -> str:
             f"no review value; contents not shown\n{'=' * 80}\n{body}\n")
 
 
-def get_gitlab_client(instance: InstanceRef) -> gitlab.Gitlab:
+def get_gitlab_client(instance: InstanceRef, proxies: dict | None = None) -> gitlab.Gitlab:
     session = requests.Session()
-    proxies = settings.network.requests_proxies
     if proxies:
         session.proxies = proxies
     gl = gitlab.Gitlab(instance.url, private_token=instance.token, session=session)
@@ -470,7 +468,7 @@ def mr_header(title: str, author: str, source_branch: str, target_branch: str) -
     )
 
 
-def format_review_comment(review_text: str) -> str:
+def format_review_comment(review_text: str, lang: str = "en") -> str:
     headers = {"en": "## 🤖 Automated Code Review",
                "ru": "## 🤖 Автоматический обзор кода"}
     footers = {
@@ -479,7 +477,6 @@ def format_review_comment(review_text: str) -> str:
         "ru": "*Этот обзор был создан автоматически с помощью ИИ. "
               "Пожалуйста, изучите отзывы и устраните все проблемы перед слиянием.*",
     }
-    lang = settings.pipeline.language
     return (f"{headers.get(lang, headers['en'])}\n\n{review_text.strip()}\n\n---\n"
             f"{footers.get(lang, footers['en'])}\n")
 

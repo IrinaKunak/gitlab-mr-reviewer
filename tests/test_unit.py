@@ -19,7 +19,14 @@ from reviewer.config import Settings
 from reviewer.domain.models import ChangeSet, FileChange, InstanceRef, TriageResult
 from reviewer.repo_cache import _safe_path, repo_grep, repo_list_tree, repo_read_file
 from reviewer.server import ReviewQueue
-from tests.factories import INSTANCE, dialogue_job, review_job
+from tests.factories import (
+    INSTANCE,
+    dialogue_job,
+    make_pipeline,
+    make_services,
+    make_settings,
+    review_job,
+)
 
 # --- config ---
 
@@ -331,10 +338,11 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     from reviewer import usage
 
     # dated model ids normalize to the priced alias
-    assert usage.model_key("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
-    assert usage.cost_usd("claude-sonnet-5", 100_000, 10_000) == (
+    pricing = usage.Pricing()
+    assert pricing.model_key("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+    assert pricing.cost_usd("claude-sonnet-5", 100_000, 10_000) == (
         100_000 * 2.0 + 10_000 * 10.0) / 1_000_000  # $0.30
-    assert usage.cost_usd("unknown/model", 1_000_000, 0) == 0.0  # unknown -> $0
+    assert pricing.cost_usd("unknown/model", 1_000_000, 0) == 0.0  # unknown -> $0
 
     tracker = usage.UsageTracker()
     tracker.record(tier="fast", model="claude-haiku-4-5-20251001",
@@ -350,11 +358,11 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
     assert "$" in tracker.summary_line()
 
     # persist + aggregate roundtrip
-    monkeypatch.setattr(usage.settings.storage, "log_dir", str(tmp_path))
+    log = usage.UsageLog(tmp_path)
     job = review_job(project_path="g/p", mr_iid=7)
-    usage.persist(tracker, job)
-    usage.persist(tracker, job)
-    agg = usage.aggregate()
+    log.persist(tracker, job)
+    log.persist(tracker, job)
+    agg = log.aggregate()
     assert agg["totals"]["reviews"] == 2
     assert agg["totals"]["input_tokens"] == 2 * 419_000
     assert agg["by_model"]["claude-opus-4-8"]["calls"] == 2
@@ -399,9 +407,6 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     # any OpenRouter model can be a tier override -> its cost must be priced
     # from the live catalog, not silently $0
     from reviewer import openrouter_models, usage
-    from reviewer.config import settings
-
-    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
 
     raw = {"data": [
         {"id": "z-ai/glm-5", "pricing": {"prompt": "0.0000006", "completion": "0.0000022"}},
@@ -415,26 +420,27 @@ def test_openrouter_catalog_prices_unknown_models(tmp_path, monkeypatch):
     assert "openrouter/auto" not in parsed             # negative sentinel filtered
 
     # feed the catalog in and confirm cost_usd uses it for an unknown model
-    openrouter_models._store.write((parsed, 1e18))  # never stale
-    assert usage.price_of("z-ai/glm-5") == (0.6, 2.2)
-    cost = usage.cost_usd("z-ai/glm-5", 1_000_000, 1_000_000)
+    def _boom(proxy_url):
+        raise RuntimeError("no network")
+    catalog = openrouter_models.OpenRouterCatalog(tmp_path, fetch=_boom)
+    catalog.store(parsed, 1e18)  # never stale
+    pricing = usage.Pricing(catalog=catalog)
+    assert pricing.price_of("z-ai/glm-5") == (0.6, 2.2)
+    cost = pricing.cost_usd("z-ai/glm-5", 1_000_000, 1_000_000)
     assert abs(cost - (0.6 + 2.2)) < 1e-9
     # curated prices still win over the catalog
-    assert usage.price_of("claude-opus-4-8") == (5.0, 25.0)
+    assert pricing.price_of("claude-opus-4-8") == (5.0, 25.0)
     # opus-5 (released 2026-07-24) is priced like 4.8 on both routes — an
     # unpriced tier model would silently cost $0 in the stats
-    assert usage.price_of("claude-opus-5") == (5.0, 25.0)
-    assert usage.price_of("anthropic/claude-opus-5") == (5.0, 25.0)
-    assert usage.price_of(Settings().llm.tiers.smart.model) != (0.0, 0.0)
+    assert pricing.price_of("claude-opus-5") == (5.0, 25.0)
+    assert pricing.price_of("anthropic/claude-opus-5") == (5.0, 25.0)
+    assert pricing.price_of(Settings().llm.tiers.smart.model) != (0.0, 0.0)
     # a genuinely unknown model is $0 (fail-open), not a crash
-    assert usage.price_of("totally/unknown") == (0.0, 0.0)
+    assert pricing.price_of("totally/unknown") == (0.0, 0.0)
 
     # refresh() is fail-open: a network error keeps the cached copy
-    def _boom():
-        raise RuntimeError("no network")
-    monkeypatch.setattr(openrouter_models, "_fetch_now", _boom)
-    openrouter_models._store.write((parsed, 0.0))  # stale -> forces a refresh attempt
-    assert openrouter_models.refresh() == parsed  # falls back to cache, no raise
+    catalog.store(parsed, 0.0)  # stale -> forces a refresh attempt
+    assert catalog.refresh() == parsed  # falls back to cache, no raise
 
 
 def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
@@ -449,8 +455,6 @@ def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
     cfg = Settings()
     cfg.storage.ai_cache_dir = str(tmp_path)
     cfg.llm.rate_limit = 0
-    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
-                        lambda tier, c: c.model_for_tier(tier))
     client = AIClient(cfg)
     sent: list[list[dict]] = []
     turns = iter(["tool_use", "tool_use", "end_turn"])
@@ -512,12 +516,11 @@ def test_openrouter_agent_loop_keeps_cache_control_for_claude(tmp_path, monkeypa
     def run(head_model):
         cfg = Settings()
         cfg.llm.provider = "openrouter"
+        cfg.llm.openrouter.token = "sk-or-test"  # tests no longer see a developer's .env
         cfg.storage.ai_cache_dir = str(tmp_path)
         cfg.llm.rate_limit = 0
         cfg.llm.tiers.smart.model = "claude-opus-5"
         cfg.llm.tiers.smart.fallback = [head_model, "moonshotai/kimi-k3"]
-        monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
-                            lambda tier, c: c.model_for_tier(tier))
         client = AIClient(cfg)
         sent: list[dict] = []
         turns = iter(["tool_use", "end_turn"])
@@ -597,9 +600,6 @@ def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
     cfg = Settings()
     cfg.storage.ai_cache_dir = str(tmp_path)
     cfg.llm.rate_limit = 0
-    # a dev-machine cache/model_overrides.json must not reroute this test
-    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
-                        lambda tier, c: c.model_for_tier(tier))
     client = AIClient(cfg)
     resp = SimpleNamespace(
         stop_reason="end_turn", model="openai/gpt-5.6-terra",
@@ -636,17 +636,17 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
-    from reviewer import overrides
-    from reviewer.config import settings as live_settings
-
-    monkeypatch.setattr(live_settings.storage, "state_dir", str(tmp_path))
+    from reviewer.overrides import ModelOverrides
 
     cfg = Settings()
     cfg.storage.ai_cache_dir = str(tmp_path)
-    assert overrides.model_for_tier("smart", cfg) == cfg.llm.tiers.smart.model  # env default
+    cfg.llm.openrouter.token = "sk-or-test"  # tests no longer see a developer's .env
+    overrides = ModelOverrides(tmp_path, cfg)
+    assert overrides.model_for_tier("smart") == cfg.llm.tiers.smart.model  # env default
     overrides.save({"smart": "openai/gpt-5.6-terra", "junk": "ignored"})
-    assert overrides.model_for_tier("smart", cfg) == "openai/gpt-5.6-terra"
+    assert overrides.model_for_tier("smart") == "openai/gpt-5.6-terra"
     assert overrides.load()["fast"] == ""  # untouched tiers stay on defaults
+    assert ModelOverrides(tmp_path, cfg).load()["smart"] == "openai/gpt-5.6-terra"  # persisted
 
     # complete() with the override must call the OpenRouter client, not primary
     captured = {}
@@ -658,7 +658,7 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
             stop_reason="end_turn", model="openai/gpt-5.6-terra",
             usage=SimpleNamespace(input_tokens=5, output_tokens=5))
 
-    client = AIClient(cfg)
+    client = AIClient(cfg, overrides=overrides)
     client._fallback = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
     client._primary = None  # would explode if touched — proves routing
     result = asyncio.run(client.complete("smart", "sys", "user", use_cache=False))
@@ -670,37 +670,35 @@ def test_model_overrides_and_routing(tmp_path, monkeypatch):
 def test_basic_auth(monkeypatch):
     import base64
 
-    from reviewer.config import settings
+    from reviewer.config import ServerSection
     from reviewer.server import basic_auth_ok, stats_access_allowed
 
-    monkeypatch.setattr(settings.server, "stats_user", "max")
-    monkeypatch.setattr(settings.server, "stats_password", "pw123")
+    cfg = ServerSection(stats_user="max", stats_password="pw123")
     good = "Basic " + base64.b64encode(b"max:pw123").decode()
     bad = "Basic " + base64.b64encode(b"max:nope").decode()
-    assert basic_auth_ok(good) is True
-    assert basic_auth_ok(bad) is False
-    assert basic_auth_ok("Bearer xyz") is False
+    assert basic_auth_ok(cfg, good) is True
+    assert basic_auth_ok(cfg, bad) is False
+    assert basic_auth_ok(cfg, "Bearer xyz") is False
     # with basic configured, unauthenticated local access is no longer allowed
-    monkeypatch.setattr(settings.server, "stats_token", "")
-    assert stats_access_allowed(good, "", "203.0.113.7") is True
-    assert stats_access_allowed("", "", None) is False
+    assert stats_access_allowed(cfg, good, "", "203.0.113.7") is True
+    assert stats_access_allowed(cfg, "", "", None) is False
 
 
 def test_stats_access_control(monkeypatch):
-    from reviewer.config import settings
+    from reviewer.config import ServerSection
     from reviewer.server import stats_access_allowed
 
     # no token configured: only direct (non-proxied) requests pass
-    monkeypatch.setattr(settings.server, "stats_token", "")
-    assert stats_access_allowed("", "", None) is True
-    assert stats_access_allowed("", "", "203.0.113.7") is False
+    cfg = ServerSection()
+    assert stats_access_allowed(cfg, "", "", None) is True
+    assert stats_access_allowed(cfg, "", "", "203.0.113.7") is False
 
     # token configured: Bearer header or ?token= must match exactly
-    monkeypatch.setattr(settings.server, "stats_token", "s3cret")
-    assert stats_access_allowed("Bearer s3cret", "", "203.0.113.7") is True
-    assert stats_access_allowed("", "s3cret", "203.0.113.7") is True
-    assert stats_access_allowed("Bearer wrong", "", None) is False
-    assert stats_access_allowed("", "", None) is False  # token set: local needs it too
+    cfg = ServerSection(stats_token="s3cret")
+    assert stats_access_allowed(cfg, "Bearer s3cret", "", "203.0.113.7") is True
+    assert stats_access_allowed(cfg, "", "s3cret", "203.0.113.7") is True
+    assert stats_access_allowed(cfg, "Bearer wrong", "", None) is False
+    assert stats_access_allowed(cfg, "", "", None) is False  # token set: local needs it too
 
 
 def test_agent_loop_records_usage_on_max_iterations(tmp_path):
@@ -743,22 +741,20 @@ def test_agent_loop_records_usage_on_max_iterations(tmp_path):
 def test_tester_report_targets(monkeypatch):
     # owner request 2026-07-23: reports go to the team group(s) too, not only
     # the bridge chat where AIManager archives them
-    from reviewer.config import settings
     from reviewer.pipeline import tester_report_targets
 
-    monkeypatch.setattr(settings.bridge, "chat_id", "-100bridge")
-    monkeypatch.setattr(settings.notify.telegram, "enabled", True)
-    monkeypatch.setattr(settings.notify.telegram, "chat_ids", ["-100team", "-100extra"])
-    monkeypatch.setattr(settings.notify.telegram, "tester_report_chat_ids", [])
-    assert tester_report_targets() == ["-100bridge", "-100team", "-100extra"]
+    cfg = make_settings(bridge__chat_id="-100bridge")
+    tg = cfg.notify.telegram
+    tg.enabled, tg.chat_ids, tg.tester_report_chat_ids = True, ["-100team", "-100extra"], []
+    assert tester_report_targets(cfg) == ["-100bridge", "-100team", "-100extra"]
 
     # explicit override narrows the team targets; dedupe against bridge
-    monkeypatch.setattr(settings.notify.telegram, "tester_report_chat_ids", ["-100team", "-100bridge"])
-    assert tester_report_targets() == ["-100bridge", "-100team"]
+    tg.tester_report_chat_ids = ["-100team", "-100bridge"]
+    assert tester_report_targets(cfg) == ["-100bridge", "-100team"]
 
     # telegram off -> only the bridge copy
-    monkeypatch.setattr(settings.notify.telegram, "enabled", False)
-    assert tester_report_targets() == ["-100bridge"]
+    tg.enabled = False
+    assert tester_report_targets(cfg) == ["-100bridge"]
 
 
 def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
@@ -767,10 +763,6 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
-    from reviewer.config import settings
-    from reviewer.pipeline import Pipeline
-
-    monkeypatch.setattr(settings.pipeline, "language", "ru")
     answers = iter([
         "I appreciate your message, but you haven't provided a document.",
         "Обзор: всё в порядке.",
@@ -781,7 +773,7 @@ def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
             assert "<document>" in user  # translation input is always wrapped now
             return SimpleNamespace(text=next(answers))
 
-    p = Pipeline(client=StubAI())
+    p = make_pipeline(make_settings(pipeline__language="ru"), ai=StubAI())
     # commentary (no Cyrillic) -> deliver the English original instead
     assert asyncio.run(p._translate_if_needed("review text", "fast")) == "review text"
     # real translation passes through
@@ -802,25 +794,21 @@ def test_process_skips_merged_or_closed_mr(monkeypatch):
             mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
             path_with_namespace="group/proj")
         stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
-        monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client",
-                            lambda cfg: stub_gl)
 
         def _boom(*args, **kwargs):
             raise AssertionError(f"must not run for a {stub_mr.state} MR")
 
         monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
-        monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
-
-        p = pipeline_mod.Pipeline(client=object())  # AI must never be touched
-        asyncio.run(p._process_inner(review_job(), {}))
+        # the AI is unwired: touching it fails the test
+        svc = make_services(gitlab_client=lambda instance: stub_gl)
+        asyncio.run(svc.pipeline._process_inner(review_job(), {}))
+        assert svc.telegram.messages == []
 
 
 def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
-    from reviewer import review_state
-    from reviewer.config import settings
+    from reviewer.review_state import ReviewStateStore
 
-    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
-
+    review_state = ReviewStateStore(tmp_path)
     assert review_state.get_last_sha("primary", 1, 2) is None
     review_state.set_last_sha("primary", 1, 2, "abc123")
     assert review_state.get_last_sha("primary", 1, 2) == "abc123"
@@ -828,11 +816,10 @@ def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
     assert review_state.get_last_sha("primary", 1, 2) == "def456"
 
     # survives a cold start (persisted to the cache volume)
-    review_state._store.invalidate()
-    assert review_state.get_last_sha("primary", 1, 2) == "def456"
+    assert ReviewStateStore(tmp_path).get_last_sha("primary", 1, 2) == "def456"
 
     # bounded: oldest entries evicted beyond MAX_ENTRIES
-    monkeypatch.setattr(review_state, "MAX_ENTRIES", 3)
+    review_state = ReviewStateStore(tmp_path, max_entries=3)
     for i in range(5):
         review_state.set_last_sha("primary", 100 + i, 1, f"sha{i}")
     assert review_state.get_last_sha("primary", 100, 1) is None
@@ -932,12 +919,8 @@ def test_investigator_degrades_before_cloning(monkeypatch):
     # prod !779: the investigator got the same full context the review had just
     # rejected as too large — and the guard only fires inside agent_loop, AFTER
     # the repo clone, so we paid for a clone then silently dropped the analysis
-    from reviewer.config import settings
-    from reviewer.pipeline import Pipeline
-
-    monkeypatch.setattr(settings.llm, "max_input_tokens", 10_000)
-    p = Pipeline(client=AIClient(Settings()))
-    monkeypatch.setattr(p.ai.cfg.llm, "max_input_tokens", 10_000)
+    cfg = make_settings(llm__max_input_tokens=10_000)
+    p = make_pipeline(cfg, ai=AIClient(cfg))
     triage, mr_data = TriageResult(summary="s"), review_job(mr_iid=779)
 
     huge, small = "x" * 200_000, "y" * 6_000
@@ -1023,10 +1006,6 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
-    from reviewer.config import settings
-    from reviewer.pipeline import Pipeline
-
-    monkeypatch.setattr(settings.pipeline, "language", "ru")
     tiers = []
 
     class StubAI:
@@ -1034,37 +1013,35 @@ def test_translate_long_text_upgrades_tier(monkeypatch):
             tiers.append(tier)
             return SimpleNamespace(text="Перевод готов.")
 
-    p = Pipeline(client=StubAI())
+    p = make_pipeline(make_settings(pipeline__language="ru"), ai=StubAI())
     asyncio.run(p._translate_if_needed("short text", "fast"))
     asyncio.run(p._translate_if_needed("long text " * 500, "fast"))  # ~5000 chars
     assert tiers == ["fast", "main"]
 
 
-def test_process_skips_already_reviewed_sha(monkeypatch):
+def test_process_skips_already_reviewed_sha(monkeypatch, tmp_path):
     # metadata-only update webhooks (title/labels edits) re-arrive with the same
     # head sha we already reviewed — must skip before any notify/AI spend
     import asyncio
     from types import SimpleNamespace
 
     from reviewer import pipeline as pipeline_mod
-    from reviewer import review_state
 
     stub_mr = SimpleNamespace(state="opened", sha="abc123")
     stub_project = SimpleNamespace(
         mergerequests=SimpleNamespace(get=lambda iid: stub_mr),
         path_with_namespace="group/proj")
     stub_gl = SimpleNamespace(projects=SimpleNamespace(get=lambda pid: stub_project))
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client", lambda cfg: stub_gl)
-    monkeypatch.setattr(review_state, "get_last_sha", lambda *a: "abc123")
 
     def _boom(*args, **kwargs):
         raise AssertionError("must not run for an already-reviewed sha")
 
     monkeypatch.setattr(pipeline_mod.gitlab_io, "check_merge_conflicts", _boom)
-    monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
-
-    p = pipeline_mod.Pipeline(client=object())
-    asyncio.run(p._process_inner(review_job(last_commit="abc123"), {}))
+    svc = make_services(make_settings(tmp_path), gitlab_client=lambda instance: stub_gl)
+    job = review_job(last_commit="abc123")
+    svc.review_state.set_last_sha(*job.ref.key, "abc123")
+    asyncio.run(svc.pipeline._process_inner(job, {}))
+    assert svc.telegram.messages == []
 
 
 def test_review_content_handles_collapsed_diffs():
@@ -1122,13 +1099,10 @@ def test_extract_jira_keys():
     assert keys == ["PBV-123", "ABC-9"]
 
 
-def test_format_review_comment_language(monkeypatch):
-    from reviewer.config import settings
-    monkeypatch.setattr(settings.pipeline, "language", "ru")
-    comment = gitlab_io.format_review_comment("текст обзора")
+def test_format_review_comment_language():
+    comment = gitlab_io.format_review_comment("текст обзора", "ru")
     assert "Автоматический обзор кода" in comment
-    monkeypatch.setattr(settings.pipeline, "language", "en")
-    assert "Automated Code Review" in gitlab_io.format_review_comment("review")
+    assert "Automated Code Review" in gitlab_io.format_review_comment("review", "en")
 
 
 # --- review-fix regressions ---
@@ -1252,16 +1226,16 @@ def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):
         git("-C", str(repo_dir), "worktree", "add", "--detach", str(wt))
         return wt
 
-    cache = rc.RepoCache(cache_dir=str(tmp_path / "cache"))
+    from reviewer.config import RepoCacheSection
+    cache = rc.RepoCache(RepoCacheSection(dir=str(tmp_path / "cache")))
 
     # default mode: worktree removed, bare repo kept for the next MR
-    monkeypatch.setattr(rc.settings.repo_cache, "ephemeral", False)
     wt1 = add_worktree("app-mr1-aaa-wt")
     asyncio.run(cache.release(wt1))
     assert not wt1.exists() and repo_dir.exists()
 
     # ephemeral mode: bare repo dropped too
-    monkeypatch.setattr(rc.settings.repo_cache, "ephemeral", True)
+    cache = rc.RepoCache(RepoCacheSection(dir=str(tmp_path / "cache"), ephemeral=True))
     wt2 = add_worktree("app-mr2-bbb-wt")
     asyncio.run(cache.release(wt2))
     assert not wt2.exists() and not repo_dir.exists()
@@ -1365,9 +1339,7 @@ def test_dialogue_answers_in_thread(monkeypatch):
 
     from reviewer import pipeline as pipeline_mod
     from reviewer.ai_client import AIResult
-    from reviewer.config import settings
 
-    monkeypatch.setattr(settings.pipeline, "language", "en")
     posted: list[tuple] = []
 
     stub_mr = SimpleNamespace(
@@ -1377,15 +1349,14 @@ def test_dialogue_answers_in_thread(monkeypatch):
     stub_project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda iid: stub_mr))
     stub_gl = SimpleNamespace(user=SimpleNamespace(username="reviewer-bot"),
                               projects=SimpleNamespace(get=lambda pid: stub_project))
-    monkeypatch.setattr(pipeline_mod.gitlab_io, "get_gitlab_client", lambda cfg: stub_gl)
     thread = [{"id": 1, "author": {"username": "reviewer-bot"}, "body": "finding"},
               {"id": 2, "author": {"username": "irina"}, "body": "точно?"}]
     monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
                         lambda mr, nid, did="": ("d1", thread))
 
-    async def _no_repo(*a, **kw):
-        raise RuntimeError("clone disabled in tests")
-    monkeypatch.setattr(pipeline_mod.repo_cache, "checkout_mr", _no_repo)
+    class _NoRepo:
+        async def checkout_mr(self, *a, **kw):
+            raise RuntimeError("clone disabled in tests")
 
     async def _record_reply(mr, did, body):
         posted.append(("thread", did, body))
@@ -1405,7 +1376,9 @@ def test_dialogue_answers_in_thread(monkeypatch):
             seen_prompts.append(user)
             return next(answers)
 
-    p = pipeline_mod.Pipeline(client=StubAI())
+    cfg = make_settings(pipeline__language="en")
+    p = make_pipeline(cfg, ai=StubAI(), repo_cache=_NoRepo(),
+                      gitlab_client=lambda instance: stub_gl)
     note = dialogue_job(project_id=1, project_path="g/p", mr_iid=10, note_id=2,
                         discussion_id="d1", note_body="точно?", note_author="irina",
                         last_commit="sha1")
@@ -1432,7 +1405,7 @@ def test_dialogue_answers_in_thread(monkeypatch):
     assert len(posted) == 1
 
     # per-MR budget: once exhausted the bot stays silent
-    monkeypatch.setattr(settings.pipeline, "dialogue_max_replies_per_mr", 1)
+    cfg.pipeline.dialogue_max_replies_per_mr = 1
     assert p._dialogue_budget_ok(("primary", 1, 10)) is False
     assert p._dialogue_budget_ok(("primary", 1, 11)) is True
 
@@ -1440,7 +1413,6 @@ def test_dialogue_answers_in_thread(monkeypatch):
 def test_review_with_tools_verifies_and_falls_back(monkeypatch):
     # the review stage checks its own cross-file concerns with repo tools;
     # any tool-path failure degrades to the plain single-shot review
-    from reviewer import pipeline as pipeline_mod
     from reviewer.ai_client import AIError, AIResult
 
     mr_data = review_job(mr_iid=1, author="dev1", source_branch="f", target_branch="dev")
@@ -1466,8 +1438,7 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
             return AIResult(text="## Verdict\n**SHIP** plain path")
 
     # tool path succeeds -> plain completion never runs
-    p = pipeline_mod.Pipeline(
-        client=StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
+    p = make_pipeline(ai=StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
     assert out.text == "## Verdict\n**SHIP** verified" and calls == ["agent"]
@@ -1475,21 +1446,21 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
 
     # loop dies (refusal, provider trouble) -> plain review still ships
     calls.clear()
-    p = pipeline_mod.Pipeline(client=StubAI(agent_exc=AIError("boom")))
+    p = make_pipeline(ai=StubAI(agent_exc=AIError("boom")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
     assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # loop ran out of turns mid-check (no verdict) -> plain review
     calls.clear()
-    p = pipeline_mod.Pipeline(client=StubAI(agent_result=AIResult(text="hmm, checking")))
+    p = make_pipeline(ai=StubAI(agent_result=AIResult(text="hmm, checking")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
     assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # no worktree (checkout failed / flag off) -> straight to the plain path
     calls.clear()
-    p = pipeline_mod.Pipeline(client=StubAI())
+    p = make_pipeline(ai=StubAI())
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=None))
     assert calls == ["complete"]
@@ -1630,13 +1601,12 @@ def test_cache_sweep_spares_state_files(tmp_path):
     assert state_file.exists()  # non-cache files are never touched
 
 
-def test_state_files_live_outside_ai_cache_dir(tmp_path, monkeypatch):
-    from reviewer import openrouter_models, overrides, review_state
-    from reviewer.config import settings
-    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings.storage, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
-    for mod in (overrides, review_state, openrouter_models):
-        assert mod._store.path.parent == tmp_path / "state"
+def test_state_files_live_outside_ai_cache_dir(tmp_path):
+    cfg = make_settings(storage__state_dir=str(tmp_path / "state"),
+                        storage__ai_cache_dir=str(tmp_path / "cache" / "ai"))
+    svc = make_services(cfg)
+    for store in (svc.overrides, svc.review_state, svc.catalog):
+        assert store._store.path.parent == tmp_path / "state"
     assert Settings().storage.ai_cache_dir != Settings().storage.state_dir
 
 
@@ -1687,8 +1657,6 @@ def test_agent_loop_alerts_once_per_review_on_zero_cache(tmp_path, monkeypatch):
     cfg.storage.ai_cache_dir = str(tmp_path)
     cfg.llm.rate_limit = 0
     cfg.llm.cache_alert_min_input = 1000
-    monkeypatch.setattr(ai_mod.overrides, "model_for_tier",
-                        lambda tier, c: c.model_for_tier(tier))
     alerts: list[tuple[str, str]] = []
 
     async def alert(kind, details):
@@ -1755,6 +1723,8 @@ def test_review_queue_assigns_job_id():
     lambda: ai_mod.AIError(_LEAKY),
 ])
 def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
+    from types import SimpleNamespace
+
     from reviewer import pipeline as pipeline_mod
 
     notes, alerts = [], []
@@ -1770,10 +1740,9 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
 
     monkeypatch.setattr(pipeline_mod.Pipeline, "_process_inner", fake_inner)
     monkeypatch.setattr(pipeline_mod.Pipeline, "_safe_note", fake_note)
-    monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
 
-    asyncio.run(pipeline_mod.Pipeline(client=object()).process(
-        review_job(job_id="deadbeef")))
+    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert))
+    asyncio.run(p.process(review_job(job_id="deadbeef")))
     assert len(notes) == 1
     assert "10.0.0.5" not in notes[0] and "/srv/app" not in notes[0]
     assert "deadbeef" in notes[0]
@@ -1799,8 +1768,8 @@ def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
         return True
 
     monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", fake_post)
-    monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
-    ok = asyncio.run(pipeline_mod.Pipeline(client=object())._deliver_review(
+    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert))
+    ok = asyncio.run(p._deliver_review(
         SimpleNamespace(), review_job(job_id="cafe0001"), SimpleNamespace(),
         False, "review"))
     assert ok is False
@@ -1808,6 +1777,8 @@ def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
 
 
 def test_webhook_500_hides_exception_text(monkeypatch):
+    from types import SimpleNamespace
+
     from fastapi.testclient import TestClient
 
     from reviewer import server
@@ -1818,10 +1789,10 @@ def test_webhook_500_hides_exception_text(monkeypatch):
     async def fake_alert(*a, **k):
         return True
 
-    monkeypatch.setattr(server.settings.gitlab, "routes", {"hook": INSTANCE})
     monkeypatch.setattr(server.gitlab_io, "parse_merge_request_webhook", boom)
-    monkeypatch.setattr(server.telegram_io, "notify_error", fake_alert)
-    resp = TestClient(server.app).post(
+    cfg = make_settings(gitlab__routes={"hook": INSTANCE})
+    svc = make_services(cfg, telegram=SimpleNamespace(notify_error=fake_alert))
+    resp = TestClient(server.create_app(svc)).post(
         "/webhook", json={"object_kind": "merge_request"},
         headers={"X-Gitlab-Token": "hook", "X-Gitlab-Event": "Merge Request Hook"})
     assert resp.status_code == 500
@@ -1869,17 +1840,12 @@ def test_startup_warns_about_retired_and_deprecated_vars(monkeypatch, caplog, tm
     from fastapi.testclient import TestClient
 
     from reviewer import server
-    from reviewer.config import settings
     # lifespan runs state_layout.migrate: keep it off the developer's cache/
-    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings.storage, "ai_cache_dir", str(tmp_path / "cache" / "ai"))
-    monkeypatch.setattr(settings.gitlab, "routes", {})
-    monkeypatch.setattr(settings.bridge, "enabled", False)
+    cfg = make_settings(tmp_path, gitlab__routes={}, bridge__enabled=False)
     monkeypatch.setenv("PIPELINE_V2", "off")
     monkeypatch.setenv("TELEGRAM_CHAT_ID_3", "-100x")
-    monkeypatch.setattr(server, "review_queue", server.ReviewQueue(
-        workers=0, dedupe_ttl=600))
-    with caplog.at_level("WARNING", logger="reviewer.server"), TestClient(server.app) as client:
+    app = server.create_app(make_services(cfg))
+    with caplog.at_level("WARNING", logger="reviewer.bootstrap"), TestClient(app) as client:
         flags = client.get("/").json()["flags"]
     assert "pipeline_v2" not in flags
     assert "PIPELINE_V2 is no longer read" in caplog.text
@@ -1888,13 +1854,17 @@ def test_startup_warns_about_retired_and_deprecated_vars(monkeypatch, caplog, tm
 
 def test_single_entry_point_runs_uvicorn_on_port_5000(monkeypatch):
     import uvicorn
+    from fastapi import FastAPI
 
     from reviewer import __main__ as entry
-    from reviewer.server import app
     calls = []
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: calls.append((a, kw)))
+    # config is loaded (and validated) before uvicorn starts; no .env in tests
+    monkeypatch.setattr(entry, "load_config", lambda: make_settings())
     entry.main()
-    assert calls == [((app,), {"host": "0.0.0.0", "port": 5000})]
+    [(args, kwargs)] = calls
+    assert isinstance(args[0], FastAPI) and args[0].state.services is not None
+    assert kwargs == {"host": "0.0.0.0", "port": 5000}
 
 
 def test_json_store_corrupt_file_reads_as_empty(tmp_path, caplog):
@@ -1949,15 +1919,13 @@ def test_json_store_follows_path_change(tmp_path):
     assert store.read() == {"x": "1"}
 
 
-def test_review_state_survives_corrupt_file(tmp_path, monkeypatch):
-    from reviewer import review_state
-    from reviewer.config import settings
-    monkeypatch.setattr(settings.storage, "state_dir", str(tmp_path))
+def test_review_state_survives_corrupt_file(tmp_path):
+    from reviewer.review_state import ReviewStateStore
     (tmp_path / "reviewed_shas.json").write_text("{not json", encoding="utf-8")
+    review_state = ReviewStateStore(tmp_path)
     assert review_state.get_last_sha("primary", 1, 2) is None  # -> full review
     review_state.set_last_sha("primary", 1, 2, "abc")
-    review_state._store.invalidate()
-    assert review_state.get_last_sha("primary", 1, 2) == "abc"
+    assert ReviewStateStore(tmp_path).get_last_sha("primary", 1, 2) == "abc"
 
 
 def test_ai_cache_write_is_atomic_and_sweeps_orphan_temps(tmp_path):
@@ -2078,8 +2046,7 @@ def test_config_yaml_instances_tiers_prices(clean_env, monkeypatch):
     assert cfg.model_for_tier("main") == "claude-sonnet-5-5"
     assert cfg.llm.prices == {"z-ai/glm-5": (0.6, 2.2)}
     assert cfg.notify.telegram.chat_ids == ["-100a"]
-    monkeypatch.setattr(usage.settings.llm, "prices", cfg.llm.prices)
-    assert usage._load_prices()["z-ai/glm-5"] == (0.6, 2.2)
+    assert usage.Pricing(cfg.llm.prices).price_of("z-ai/glm-5") == (0.6, 2.2)
 
 
 def test_config_yaml_unknown_tier_or_key_is_an_error(clean_env):
@@ -2186,3 +2153,20 @@ def test_config_yaml_referencing_gitlab_token_env_is_not_deprecated(clean_env, m
     cfg = Settings()
     assert cfg.gitlab.routes["hook-1"].token == "glpat-1"
     assert deprecated_env_vars_in_use(cfg) == []
+
+
+def test_composition_root_builds_independent_graphs(tmp_path):
+    # #3: config and singletons were created at import, so a second instance
+    # with another configuration was impossible and tests patched globals.
+    # Now importing builds nothing, and two graphs coexist without sharing state.
+    from reviewer import bootstrap
+    assert bootstrap.app.state.services is None  # config loads at startup, not import
+
+    ru = make_services(make_settings(tmp_path / "a", pipeline__language="ru"))
+    en = make_services(make_settings(tmp_path / "b", pipeline__language="en"))
+    assert ru.pipeline is not en.pipeline and ru.queue is not en.queue
+    assert ru.telegram.language == "ru" and en.telegram.language == "en"
+    job = review_job(last_commit="abc")
+    ru.review_state.set_last_sha(*job.ref.key, "abc")
+    assert en.review_state.get_last_sha(*job.ref.key) is None  # separate state dirs
+    assert ru.queue.submit(job) and en.queue.submit(job)       # separate dedupe

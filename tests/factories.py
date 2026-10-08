@@ -37,3 +37,57 @@ def dialogue_job(**kw: Any) -> DialogueJob:
     values: dict[str, Any] = {"note_id": 1, "note_body": "why?", "note_author": "dev"}
     values.update(rest)
     return DialogueJob(ref=ref, **values)
+
+
+# --- object graph -------------------------------------------------------------
+
+class _Unwired:
+    """A dependency the test did not expect to be used: any access fails loudly."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        raise AssertionError(f"test touched unwired {self._name}.{attr}")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"test called unwired {self._name}")
+
+
+def make_settings(tmp_path: Any = None, **values: Any) -> Any:
+    """Settings() from the pinned test env; dotted overrides via `__`
+    (pipeline__language="ru"); state/log/cache dirs under tmp_path when given."""
+    from reviewer.config import Settings
+    cfg = Settings()
+    if tmp_path is not None:
+        cfg.storage.state_dir = str(tmp_path / "state")
+        cfg.storage.log_dir = str(tmp_path / "logs")
+        cfg.storage.ai_cache_dir = str(tmp_path / "cache")
+    for name, value in values.items():
+        *parents, leaf = name.split("__")
+        target = cfg
+        for part in parents:
+            target = getattr(target, part)
+        assert leaf in type(target).model_fields, f"unknown setting {name}"
+        setattr(target, leaf, value)
+    return cfg
+
+
+def make_services(cfg: Any = None, **deps: Any) -> Any:
+    """bootstrap.build_services with inert fakes on every outer edge the test
+    does not pass explicitly (a touched unwired edge fails the test)."""
+    from reviewer.bootstrap import build_services
+    from tests.fakes import FakeBridge, FakeTelegram
+    cfg = cfg if cfg is not None else make_settings()
+    deps.setdefault("telegram", FakeTelegram(cfg.notify.telegram,
+                                             language=cfg.pipeline.language))
+    deps.setdefault("ai", _Unwired("ai"))
+    deps.setdefault("bridge", FakeBridge(enabled=False))
+    deps.setdefault("repo_cache", _Unwired("repo_cache"))
+    deps.setdefault("gitlab_client", _Unwired("gitlab_client"))
+    deps.setdefault("workers", 0)
+    return build_services(cfg, **deps)
+
+
+def make_pipeline(cfg: Any = None, **deps: Any) -> Any:
+    return make_services(cfg, **deps).pipeline

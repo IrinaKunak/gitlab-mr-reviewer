@@ -24,7 +24,8 @@ from typing import Any
 
 import httpx
 
-from .config import settings
+from .config import BridgeSection
+from .telegram_io import TelegramClient
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +59,19 @@ class _RateWindow:
 
 
 class ReviewBridge:
-    def __init__(self):
-        self.enabled = bool(
-            settings.bridge.enabled and settings.bridge.chat_id and settings.notify.telegram.token)
+    def __init__(self, cfg: BridgeSection, telegram: TelegramClient) -> None:
+        self.cfg = cfg
+        # questions go out through the same bot that polls for the answers
+        self.telegram = telegram
+        token = telegram.cfg.token
+        self._token = token
+        self.enabled = bool(cfg.enabled and cfg.chat_id and token)
         self._offset = 0
         self._inbox: asyncio.Queue[dict] = asyncio.Queue()
         self._listener_task: asyncio.Task | None = None
         self._ask_lock = asyncio.Lock()  # one outstanding question at a time
-        self._rate = _RateWindow(settings.bridge.rate_per_hour)
-        self._bot_id = settings.notify.telegram.token.split(":", 1)[0] if settings.notify.telegram.token else ""
+        self._rate = _RateWindow(cfg.rate_per_hour)
+        self._bot_id = token.split(":", 1)[0] if token else ""
 
     # --- lifecycle ---
 
@@ -75,7 +80,7 @@ class ReviewBridge:
             logger.info("Review Bridge disabled (flag/chat_id/token missing)")
             return
         self._listener_task = asyncio.create_task(self._listen(), name="bridge-listener")
-        logger.info("Review Bridge listener started (chat %s)", settings.bridge.chat_id)
+        logger.info("Review Bridge listener started (chat %s)", self.cfg.chat_id)
 
     async def stop(self) -> None:
         if self._listener_task:
@@ -87,10 +92,10 @@ class ReviewBridge:
 
     async def _listen(self) -> None:
         """Exclusive getUpdates long-poll; bridge-chat messages go to the inbox."""
-        url = f"https://api.telegram.org/bot{settings.notify.telegram.token}/getUpdates"
+        url = f"https://api.telegram.org/bot{self._token}/getUpdates"
         kwargs: dict[str, Any] = {"timeout": 70.0}
-        if settings.network.proxy_url:
-            kwargs["proxy"] = settings.network.proxy_url
+        if self.telegram.proxy_url:
+            kwargs["proxy"] = self.telegram.proxy_url
         async with httpx.AsyncClient(**kwargs) as client:
             while True:
                 try:
@@ -103,8 +108,8 @@ class ReviewBridge:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 — keep polling through blips
-                    from .telegram_io import redact_token
-                    logger.warning("bridge getUpdates error: %s", redact_token(str(exc)))
+                    logger.warning("bridge getUpdates error: %s",
+                                   self.telegram.redact_token(str(exc)))
                     await asyncio.sleep(5)
 
     def _dispatch(self, update: dict) -> None:
@@ -112,14 +117,14 @@ class ReviewBridge:
         # accept both plain messages and any update carrying a message-shaped payload.
         message = update.get("message") or update.get("guest_message") or {}
         chat_id = str(message.get("chat", {}).get("id", ""))
-        if chat_id != str(settings.bridge.chat_id):
+        if chat_id != str(self.cfg.chat_id):
             return
         sender = message.get("from", {})
         sender_id = str(sender.get("id", ""))
         if sender_id == self._bot_id:
             return  # our own question echoed back
-        if settings.bridge.answer_bot_id:
-            if sender_id != settings.bridge.answer_bot_id:
+        if self.cfg.answer_bot_id:
+            if sender_id != self.cfg.answer_bot_id:
                 return  # restricted to AIManager when configured
         elif not sender.get("is_bot"):
             return  # unconfigured: accept bot answers only (humans in the group are observers)
@@ -151,18 +156,18 @@ class ReviewBridge:
             while not self._inbox.empty():
                 self._inbox.get_nowait()
 
-            from .telegram_io import send_message
-            sent = await send_message(settings.bridge.chat_id, question, parse_mode=None)
+            sent = await self.telegram.send_message(self.cfg.chat_id, question,
+                                                    parse_mode=None)
             if not sent:
                 return None
             logger.info("bridge question sent: %s", question[:200])
 
             chunks: list[str] = []
-            deadline = time.monotonic() + settings.bridge.question_timeout
+            deadline = time.monotonic() + self.cfg.question_timeout
             while True:
                 remaining = deadline - time.monotonic()
                 # once an answer started, wait only the short grace window for overflow
-                wait = settings.bridge.answer_grace if chunks else remaining
+                wait = self.cfg.answer_grace if chunks else remaining
                 if remaining <= 0 or wait <= 0:
                     break
                 try:
@@ -176,12 +181,10 @@ class ReviewBridge:
 
             if not chunks:
                 logger.warning("bridge question timed out after %ss",
-                               settings.bridge.question_timeout)
+                               self.cfg.question_timeout)
                 return None
             answer = strip_usage_footer("\n".join(chunks))
             logger.info("bridge answer received (%d chars, %d chunks)",
                         len(answer), len(chunks))
             return answer
 
-
-bridge = ReviewBridge()

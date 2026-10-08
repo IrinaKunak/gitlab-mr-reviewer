@@ -12,7 +12,6 @@ from __future__ import annotations
 import re
 
 from reviewer.ai_client import AIError
-from reviewer.config import settings
 from tests.fakes import AgentScript, ToolCall, file_change, mr_webhook, note_webhook
 
 RU_START = "🤖 Начинаем автоматический обзор кода..."
@@ -53,7 +52,7 @@ def test_trivial_mr_reviewed_by_fast_tier(world):
     # triage -> trivial review -> translation, all on the fast tier
     assert [(c.method, c.tier) for c in world.llm.calls] == [
         ("complete_json", "fast"), ("complete", "fast"), ("complete", "fast")]
-    assert {c.model for c in world.llm.calls} == {settings.llm.tiers.fast.model}
+    assert {c.model for c in world.llm.calls} == {world.settings.llm.tiers.fast.model}
     assert world.repo.checkouts == []  # trivial MRs never clone
 
     start, review = mr.bot_notes
@@ -70,7 +69,7 @@ def test_trivial_mr_reviewed_by_fast_tier(world):
     (entry,) = world.usage_entries()
     assert entry["kind"] == "review" and entry["mr_iid"] == 7
     assert entry["instance"] == "primary" and entry["project"] == "group/app"
-    assert set(entry["models"]) == {settings.llm.tiers.fast.model}
+    assert set(entry["models"]) == {world.settings.llm.tiers.fast.model}
 
 
 # --- 4.4 normal MR: main tier verifies with repo tools ---
@@ -96,7 +95,7 @@ def test_normal_mr_reviewed_with_repo_tools(world):
     assert [(c.method, c.tier) for c in world.llm.calls] == [
         ("complete_json", "fast"), ("agent_loop", "main"), ("complete", "fast")]
     review_call = world.llm.calls[1]
-    assert review_call.model == settings.llm.tiers.main.model
+    assert review_call.model == world.settings.llm.tiers.main.model
     assert "payments" in review_call.system  # triage risk areas reach the reviewer
     # the tool ran against the checkout at the MR head and found the call site
     (tool, output), = review_call.tool_results
@@ -110,7 +109,8 @@ def test_normal_mr_reviewed_with_repo_tools(world):
     assert "Вердикт: одна проблема" in world.telegram.notifications[-1]
 
     (entry,) = world.usage_entries()
-    assert set(entry["models"]) == {settings.llm.tiers.fast.model, settings.llm.tiers.main.model}
+    tiers = world.settings.llm.tiers
+    assert set(entry["models"]) == {tiers.fast.model, tiers.main.model}
 
 
 # --- 4.5 AI failure: neutral MR note (stage 2), details only in the alert ---
@@ -231,7 +231,7 @@ def test_complex_mr_runs_investigator_with_bridge_and_tester_report(world):
         ("complete_json", "fast"), ("agent_loop", "main"), ("agent_loop", "smart"),
         ("complete", "fast"), ("complete", "main")]
     investigation = world.llm.calls[2]
-    assert investigation.model == settings.llm.tiers.smart.model
+    assert investigation.model == world.settings.llm.tiers.smart.model
     assert "Verdict: no issues." in investigation.user  # it builds on the review
     assert world.bridge.questions == ["PAY-123: should refunds keep the fee?"]
     (_, grep_out), (_, bridge_out) = investigation.tool_results
@@ -262,8 +262,8 @@ def test_complex_mr_runs_investigator_with_bridge_and_tester_report(world):
     assert all("group/app !7" in d.caption for d in world.telegram.documents)
 
     (entry,) = world.usage_entries()
-    assert set(entry["models"]) == {
-        settings.llm.tiers.fast.model, settings.llm.tiers.main.model, settings.llm.tiers.smart.model}
+    tiers = world.settings.llm.tiers
+    assert set(entry["models"]) == {tiers.fast.model, tiers.main.model, tiers.smart.model}
 
 
 def test_investigator_runs_only_for_complex_mrs_that_need_it(world):

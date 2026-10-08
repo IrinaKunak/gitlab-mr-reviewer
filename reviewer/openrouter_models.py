@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
-from .config import settings
 from .json_store import JsonStore
 
 logger = logging.getLogger(__name__)
@@ -57,43 +57,50 @@ def _to_disk(value: tuple[Prices, float]) -> dict:
     return {"fetched_at": fetched_at, "prices": {k: [v[0], v[1]] for k, v in prices.items()}}
 
 
-# (prices, fetched_at) — memory copy of the disk cache
-_store: JsonStore[tuple[Prices, float]] = JsonStore(
-    lambda: Path(settings.storage.state_dir) / "openrouter_models.json",
-    parse=_from_disk, dump=_to_disk, empty=lambda: ({}, 0.0),
-    label="OpenRouter catalog")
+FILENAME = "openrouter_models.json"
 
 
-def catalog() -> Prices:
-    """Cached catalog (memory → disk). Read-only; never hits the network."""
-    return dict(_store.read()[0])
-
-
-def price_for(model: str) -> tuple[float, float] | None:
-    """(input, output) $/MTok for an OpenRouter model id, or None if unknown."""
-    return _store.read()[0].get(model)
-
-
-def _fetch_now() -> Prices:
-    proxy = settings.network.proxy_url
-    with httpx.Client(timeout=15, proxy=proxy) as client:
+def _fetch(proxy_url: str | None) -> Prices:
+    with httpx.Client(timeout=15, proxy=proxy_url) as client:
         resp = client.get(CATALOG_URL)
         resp.raise_for_status()
         return _parse(resp.json())
 
 
-def refresh(force: bool = False) -> Prices:
-    """Fetch the catalog if stale (or forced). Fail-open to the cached copy.
-    Call from request handlers (async → to_thread), NOT the pricing hot path."""
-    now = time.time()
-    current, fetched_at = _store.read()
-    if not force and current and (now - fetched_at) < TTL_SECONDS:
-        return dict(current)
-    try:
-        prices = _fetch_now()
-    except Exception as exc:  # noqa: BLE001 — availability only; never fatal
-        logger.warning("OpenRouter model catalog refresh failed (%s) — using cache", exc)
-        return dict(current)
-    _store.write((prices, now))
-    logger.info("OpenRouter model catalog refreshed: %d models", len(prices))
-    return dict(prices)
+class OpenRouterCatalog:
+    """state_dir/openrouter_models.json: (prices, fetched_at), refreshed on demand."""
+
+    def __init__(self, state_dir: str | Path, proxy_url: str | None = None,
+                 fetch: Callable[[str | None], Prices] = _fetch) -> None:
+        self.proxy_url = proxy_url
+        self._fetch = fetch
+        self._store: JsonStore[tuple[Prices, float]] = JsonStore(
+            Path(state_dir) / FILENAME, parse=_from_disk, dump=_to_disk,
+            empty=lambda: ({}, 0.0), label="OpenRouter catalog")
+
+    def catalog(self) -> Prices:
+        """Cached catalog (memory → disk). Read-only; never hits the network."""
+        return dict(self._store.read()[0])
+
+    def price_for(self, model: str) -> tuple[float, float] | None:
+        """(input, output) $/MTok for an OpenRouter model id, or None if unknown."""
+        return self._store.read()[0].get(model)
+
+    def store(self, prices: Prices, fetched_at: float) -> None:
+        self._store.write((prices, fetched_at))
+
+    def refresh(self, force: bool = False) -> Prices:
+        """Fetch the catalog if stale (or forced). Fail-open to the cached copy.
+        Call from request handlers (async → to_thread), NOT the pricing hot path."""
+        now = time.time()
+        current, fetched_at = self._store.read()
+        if not force and current and (now - fetched_at) < TTL_SECONDS:
+            return dict(current)
+        try:
+            prices = self._fetch(self.proxy_url)
+        except Exception as exc:  # noqa: BLE001 — availability only; never fatal
+            logger.warning("OpenRouter model catalog refresh failed (%s) — using cache", exc)
+            return dict(current)
+        self.store(prices, now)
+        logger.info("OpenRouter model catalog refreshed: %d models", len(prices))
+        return dict(prices)

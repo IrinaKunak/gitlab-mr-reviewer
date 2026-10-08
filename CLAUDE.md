@@ -14,17 +14,27 @@ Design docs: `plans/2026-06-11-v2-architecture.md`, `plans/2026-06-10-review-bri
 
 ## Architecture (`reviewer/` package)
 
-Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
-`w-server.py` is only an import shim so `uvicorn w-server:app` keeps working.
+Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD): loads
+and validates the config BEFORE uvicorn starts. `w-server.py` is only an import shim
+(`bootstrap.app`, config loaded in the lifespan) so `uvicorn w-server:app` keeps working.
 
-- **reviewer/server.py** — FastAPI app: `POST /webhook` (MR events, contract unchanged
+- **reviewer/bootstrap.py** — composition root, the ONLY place that reads `.env`
+  (`load_config`), configures logging and builds objects: `build_services(cfg, **fakes)`
+  → `Services` (settings, TelegramClient, ReviewBridge, AIClient, Pipeline, ReviewQueue,
+  ModelOverrides, OpenRouterCatalog, Pricing, UsageLog, ReviewStateStore, gitlab client
+  factory, `bot_usernames`) with `start()`/`stop()` (startup logs, state migration,
+  workers, bridge listener, instance check). No module in `reviewer/` holds a
+  config or service singleton; importing anything has no side effects.
+
+- **reviewer/server.py** — `create_app(services)`; handlers read
+  `request.app.state.services`. `POST /webhook` (MR events, contract unchanged
   from v1, **plus Note Hook** → dialogue jobs on the same queue, deduped by note id and
   exempt from the burst window), `GET /` (health + flags), `GET /stats` (token/cost
   aggregates); asyncio queue of `Job`s with N workers; webhook dedupe via
-  `domain.dedupe.DedupePolicy` (exact-SHA TTL + per-MR burst window); lifespan starts
-  the bridge listener and GitLab startup checks (which fill `server.bot_usernames`,
-  instance name → bot login, so the bot's own notes are dropped at the door — the
-  instance config itself is immutable)
+  `domain.dedupe.DedupePolicy` (exact-SHA TTL + per-MR burst window, injected clock);
+  lifespan runs `Services.start()` — the GitLab startup check fills
+  `services.bot_usernames` (instance name → bot login, so the bot's own notes are
+  dropped at the door; the instance config itself is immutable)
 - **reviewer/domain/** — pure layer, no I/O/settings: `models.py` (frozen
   `InstanceRef`, `MergeRequestRef`, `ReviewJob`/`DialogueJob`, `ChangeSet`/`FileChange`,
   `TriageResult`, `ReviewResult`, `Investigation`; StrEnums `Tier`, `Complexity`,
@@ -255,21 +265,25 @@ DEBUG=true python -m reviewer             # 0.0.0.0:5000
 on in-memory fakes (`tests/fakes/`: `FakeGitLab` behind the python-gitlab object model,
 `ScriptedLLM` with per-method answer queues, `FakeTelegram`, `FakeBridge` = scripted
 AIManager answers, `FakeRepoCache` = project files in a temp dir under the real repo
-tools). The `world` fixture in `tests/conftest.py` is the ONLY place that patches module
-boundaries and sets prod-shaped flags (all v2 flags on incl. investigator/bridge/tester
-report, RU, Telegram on); `world.configure(llm__max_input_tokens=...)` overrides nested settings per scenario
-(`__` = `.`) and
+tools). The `world` fixture in `tests/conftest.py` builds the real graph with
+`bootstrap.build_services(cfg, telegram=…, ai=…, bridge=…, repo_cache=…,
+gitlab_client=…, clock=…)` — no monkeypatching of modules — on prod-shaped settings
+(all v2 flags on incl. investigator/bridge/tester report, RU, Telegram on);
+`world.configure(llm__max_input_tokens=...)` overrides nested settings per scenario
+(`__` = `.`), `world.settings` is that scenario's config and
 `world.clock.advance(s)` drives the queue's dedupe TTL / burst window. Scenarios cover
 trivial/normal/complex (investigator+bridge+tester report) MRs, incremental re-reviews,
 big-MR degradation, dialogue and dedupe; they assert external effects only (note texts,
 messages, AI tiers, usage) and never call private methods. An unscripted AI call or
-bridge question fails the test. State stores
-(`JsonStore`) resolve their path from `settings.state_dir` on every access, so pointing
-it at the scenario's temp dir is enough — no module caches to reset; use
-`<module>._store.invalidate()` to simulate a cold start.
+bridge question fails the test. State stores are per-graph objects over the
+scenario's temp `state_dir`; a new `ReviewStateStore(dir)` on the same dir is a cold start.
+Tests never see a developer's `.env` (only `bootstrap.load_config` reads it).
 
 Pure-function tests live in `tests/test_domain.py` (no fakes); `tests/factories.py`
-builds jobs/refs with defaults (`review_job(mr_iid=7, last_commit="abc")`).
+builds jobs/refs with defaults (`review_job(mr_iid=7, last_commit="abc")`) and graphs
+for unit tests: `make_settings(tmp_path, pipeline__language="ru")`,
+`make_services(cfg, ai=StubAI())` / `make_pipeline(...)` — every edge not passed is
+inert and fails the test if touched.
 Every bug fix gets a regression test in `tests/test_unit.py` (or `test_domain.py`). When checking pytest results
 in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.
 

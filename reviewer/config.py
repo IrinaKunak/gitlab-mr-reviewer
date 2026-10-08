@@ -1,7 +1,7 @@
 """Configuration: typed sections, validated at startup (pydantic-settings).
 
 Sources, highest priority first:
-  1. env vars (the .env file is loaded into the environment by load_dotenv) —
+  1. env vars (bootstrap.load_config loads the .env file into the environment) —
      the flat names from v1 (ANTHROPIC_MAIN_MODEL, INVESTIGATOR, …) stay the
      canonical way to set scalars and secrets, see ENV_FIELDS;
   2. optional `config.yaml` (CONFIG_FILE) for structured data — GitLab
@@ -27,13 +27,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from .domain.models import InstanceRef, Tier
-
-load_dotenv()
 
 TIERS = tuple(Tier)
 LEGACY_INSTANCE_SLOTS = ("", *(f"_{i}" for i in range(2, 11)))  # "" = primary
@@ -293,6 +290,13 @@ class NetworkSection(_Section):
         if self.socks_proxy:
             return f"socks5://{self.socks_proxy}"
         return None
+
+    @property
+    def git_proxy(self) -> str:
+        """git's http.proxy value (socks5h: resolve hostnames through the proxy)."""
+        if self.http_proxy:
+            return self.http_proxy
+        return f"socks5h://{self.socks_proxy}" if self.socks_proxy else ""
 
     @property
     def requests_proxies(self) -> dict | None:
@@ -555,12 +559,7 @@ def masked_dump(cfg: Settings) -> dict:
     return mask(cfg.model_dump())
 
 
-settings = load_settings()
-
-
 if __name__ == "__main__":  # pre-deploy check: prints the effective config or the errors
-    import json
+    from reviewer.bootstrap import main_print_config
 
-    print(json.dumps(masked_dump(settings), indent=2, ensure_ascii=False))
-    for message in retired_env_vars_in_use() + deprecated_env_vars_in_use(settings):
-        print("WARNING:", message)
+    main_print_config()

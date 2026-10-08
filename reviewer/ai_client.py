@@ -30,11 +30,11 @@ from typing import Any
 import anthropic
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
-from . import overrides, telegram_io, usage
+from . import usage
 from .config import Settings
-from .config import settings as default_settings
 from .domain.models import Tier
 from .json_store import atomic_write_text
+from .overrides import ModelOverrides
 
 logger = logging.getLogger(__name__)
 
@@ -236,8 +236,11 @@ AlertFn = Callable[[str, str], Awaitable[Any]]
 
 
 class AIClient:
-    def __init__(self, cfg: Settings | None = None, alert: AlertFn | None = None):
-        self.cfg = cfg or default_settings
+    def __init__(self, cfg: Settings, overrides: ModelOverrides | None = None,
+                 alert: AlertFn | None = None):
+        self.cfg = cfg
+        # dashboard per-tier model overrides; None = the configured models only
+        self.overrides = overrides
         self._alert = alert  # (error_type, details) -> ops notification; None = log only
         self._rate_lock = asyncio.Lock()
         self._last_call = 0.0
@@ -246,6 +249,11 @@ class AIClient:
         self._debug_failed = False
         self._primary: AsyncAnthropic | None = None
         self._fallback: AsyncAnthropic | None = None
+
+    def _model_for(self, tier: Tier) -> str:
+        if self.overrides is not None:
+            return self.overrides.model_for_tier(tier)
+        return self.cfg.model_for_tier(tier)
 
     # --- client construction (lazy: keys may be absent in tests) ---
 
@@ -458,7 +466,7 @@ class AIClient:
     ) -> AIResult:
         """Single-shot completion with primary -> fallback failover."""
         self.guard_input_size(system, user_content)
-        model = overrides.model_for_tier(tier, self.cfg)
+        model = self._model_for(tier)
         via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
         if via_openrouter:
             model = openrouter_model(model, self.cfg.fallback_chain(tier))
@@ -618,7 +626,7 @@ class AIClient:
         self.guard_input_size(system, user_content)
         handlers = {tool.name: tool.handler for tool in tools}
         api_tools = [tool.to_api() for tool in tools]
-        model = overrides.model_for_tier(tier, self.cfg)
+        model = self._model_for(tier)
         via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
         if via_openrouter:
             model = openrouter_model(model, self.cfg.fallback_chain(tier))
@@ -739,5 +747,3 @@ class AIClient:
                         input_tokens=total_in, output_tokens=total_out,
                         cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
-
-ai_client = AIClient(alert=telegram_io.notify_error)

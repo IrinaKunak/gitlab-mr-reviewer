@@ -16,9 +16,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from reviewer import overrides, usage
+from reviewer import usage
 from reviewer.ai_client import AIInputTooLargeError, AIResult, ToolDef, estimate_tokens
-from reviewer.config import settings
+from reviewer.config import Settings
 
 
 @dataclass
@@ -44,7 +44,9 @@ class LLMCall:
 
 
 class ScriptedLLM:
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
+        # read live: a scenario may change the budget after the graph is built
+        self.settings = settings
         self.complete_script: list[Any] = []
         self.agent_script: list[Any] = []
         self.calls: list[LLMCall] = []
@@ -66,9 +68,9 @@ class ScriptedLLM:
 
     def guard_input_size(self, *parts: str) -> None:
         total = sum(estimate_tokens(p) for p in parts)
-        if total > settings.llm.max_input_tokens:
-            raise AIInputTooLargeError(
-                f"input ~{total} tokens exceeds limit {settings.llm.max_input_tokens}")
+        limit = self.settings.llm.max_input_tokens
+        if total > limit:
+            raise AIInputTooLargeError(f"input ~{total} tokens exceeds limit {limit}")
 
     async def complete(self, tier: str, system: str, user_content: str, *,
                        max_tokens: int = 4096, effort: str | None = None,
@@ -103,7 +105,7 @@ class ScriptedLLM:
         return self._result(call, text)
 
     def _record(self, method: str, tier: str, system: str, user: str) -> LLMCall:
-        call = LLMCall(method, tier, overrides.model_for_tier(tier, settings), system, user)
+        call = LLMCall(method, tier, self.settings.model_for_tier(tier), system, user)
         self.calls.append(call)
         return call
 

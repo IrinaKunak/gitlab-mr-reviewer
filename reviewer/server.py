@@ -6,6 +6,9 @@
 
 v2 changes: fire-and-forget BackgroundTasks replaced by an asyncio queue with
 N workers and webhook-retry dedupe; the bridge listener runs as a lifespan task.
+
+No module-level state: `create_app` gets the object graph (`bootstrap.Services`)
+and the handlers read it from `request.app.state.services`.
 """
 
 from __future__ import annotations
@@ -16,38 +19,45 @@ import hmac
 import json
 import logging
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import __version__, gitlab_io, openrouter_models, overrides, state_layout, telegram_io, usage
-from .bridge import bridge
-from .config import deprecated_env_vars_in_use, retired_env_vars_in_use, settings
+from . import __version__, gitlab_io
+from .config import ServerSection
+from .dashboard import DASHBOARD_HTML
 from .domain.dedupe import DedupePolicy
 from .domain.models import DialogueJob, Job, ReviewJob, Tier
-from .pipeline import new_job_id, pipeline
+from .pipeline import Pipeline, new_job_id
 
-logging.basicConfig(
-    level=logging.DEBUG if settings.server.debug else logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+if TYPE_CHECKING:  # bootstrap imports this module; the type is all we need
+    from .bootstrap import Services
+
 logger = logging.getLogger(__name__)
+
+UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
 
 
 class ReviewQueue:
     """Bounded-concurrency MR processing with webhook-retry dedupe."""
 
-    def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30):
+    def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30, *,
+                 pipeline: Pipeline | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.workers = workers
+        self.pipeline = pipeline  # None only for a queue that never starts workers
         self.dedupe = DedupePolicy(dedupe_ttl, burst_window)
+        self.clock = clock
         self._tasks: list[asyncio.Task] = []
 
     def submit(self, job: Job) -> bool:
         """False if this exact MR state was queued recently (webhook retry / burst)."""
-        if not self.dedupe.admit(job, time.monotonic()):
+        if not self.dedupe.admit(job, self.clock()):
             return False
         # one id per queued job: log lines, TG alerts and the neutral MR
         # error note all carry it, so a user report maps back to the log
@@ -55,6 +65,14 @@ class ReviewQueue:
         self.queue.put_nowait(job)
         logger.info("job %s: queued %s for MR !%s", job.job_id, job.kind, job.ref.mr_iid)
         return True
+
+    async def run(self, job: Job) -> None:
+        """Process one job (what a worker does with it)."""
+        assert self.pipeline is not None, "ReviewQueue without a pipeline cannot run jobs"
+        if isinstance(job, DialogueJob):
+            await self.pipeline.process_note(job)
+        elif isinstance(job, ReviewJob):
+            await self.pipeline.process(job)
 
     async def start(self) -> None:
         self._tasks = [asyncio.create_task(self._worker(i), name=f"review-worker-{i}")
@@ -70,102 +88,68 @@ class ReviewQueue:
         while True:
             job = await self.queue.get()
             try:
-                if isinstance(job, DialogueJob):
-                    await pipeline.process_note(job)
-                elif isinstance(job, ReviewJob):
-                    await pipeline.process(job)
+                await self.run(job)
             except Exception:  # noqa: BLE001 — workers must survive anything
                 logger.exception("worker %d: unhandled pipeline error", idx)
             finally:
                 self.queue.task_done()
 
 
-review_queue = ReviewQueue(settings.server.workers, settings.dedupe.ttl,
-                           settings.dedupe.burst_seconds)
+def create_app(services: Services | None = None, *,
+               factory: Callable[[], Services] | None = None) -> FastAPI:
+    """The FastAPI app over a built object graph.
 
-# instance name -> the bot's own GitLab username, learned at startup so note
-# webhooks from the bot itself are dropped at the door instead of queueing a
-# job (every review post fires one). Runtime state, kept out of the config.
-bot_usernames: dict[str, str] = {}
+    `services` is attached right away (tests drive the app without running the
+    lifespan); otherwise the lifespan calls `factory` — config is then loaded
+    at startup, not at import."""
+    if services is None and factory is None:
+        raise ValueError("create_app needs services or a factory")
 
-_last_unknown_token_alert = 0.0
-_UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
-
-
-async def _alert_unknown_token(event_type: str | None, token: str | None) -> None:
-    global _last_unknown_token_alert
-    now = time.monotonic()
-    if now - _last_unknown_token_alert < _UNKNOWN_TOKEN_ALERT_INTERVAL:
-        return
-    _last_unknown_token_alert = now
-    await telegram_io.notify_error(
-        "webhook_error", f"Unknown webhook token received: {(token or '')[:10]}...",
-        {"event_type": event_type})
-
-
-async def _verify_instances() -> None:
-    """Startup connectivity check (non-fatal, v1 behavior)."""
-    for instance in settings.gitlab.routes.values():
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if getattr(app.state, "services", None) is None:
+            assert factory is not None
+            app.state.services = factory()
+        svc: Services = app.state.services
+        await svc.start()
         try:
-            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, instance)
-            bot_usernames[instance.name] = getattr(
-                getattr(gl, "user", None), "username", "") or ""
-            logger.info("GitLab instance OK: %s (%s), bot=%s", instance.name,
-                        instance.url, bot_usernames[instance.name] or "?")
-        except Exception as exc:  # noqa: BLE001
-            logger.error("GitLab instance %s connection failed: %s", instance.name, exc)
-            await telegram_io.notify_error(
-                "gitlab_api_error", f"Startup connection failed: {exc}",
-                {"gitlab_instance": instance.name})
+            yield
+        finally:
+            await svc.stop()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.services = services
+    app.state.unknown_token_alert_at = -UNKNOWN_TOKEN_ALERT_INTERVAL
+    app.include_router(router)
+    return app
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("GitLab MR Reviewer v%s starting", __version__)
-    logger.info("Instances: %s", [i.name for i in settings.gitlab.routes.values()])
-    logger.info("Flags: investigator=%s bridge=%s tester_report=%s "
-                "review_repo_tools=%s dialogue=%s provider=%s",
-                settings.pipeline.stages.investigator,
-                settings.bridge.enabled, settings.pipeline.stages.tester_report,
-                settings.pipeline.stages.review_repo_tools, settings.pipeline.stages.dialogue,
-                settings.llm.provider)
-    if settings.llm.provider == "openrouter" and not settings.llm.openrouter.token:
-        logger.error("AI_PROVIDER=openrouter but OPENROUTER_API_TOKEN is empty")
-    for message in retired_env_vars_in_use() + deprecated_env_vars_in_use(settings):
-        logger.warning("%s", message)
-    if settings.network.proxy_url:
-        logger.info("Proxy: %s", settings.network.proxy_url)
-    state_layout.migrate(settings)  # before anything reads overrides/review state
-    await review_queue.start()
-    await bridge.start()
-    verify_task = asyncio.create_task(_verify_instances())
-    yield
-    verify_task.cancel()
-    await bridge.stop()
-    await review_queue.stop()
+router = APIRouter()
 
 
-app = FastAPI(lifespan=lifespan)
+def _svc(request: Request) -> Services:
+    return request.app.state.services
 
 
-@app.get("/")
-async def root() -> dict[str, Any]:
+@router.get("/")
+async def root(request: Request) -> dict[str, Any]:
+    stages = _svc(request).settings.pipeline.stages
     return {
         "status": "GitLab MR Reviewer is running",
         "version": __version__,
         "flags": {
-            "investigator": settings.pipeline.stages.investigator,
-            "bridge": settings.bridge.enabled,
-            "tester_report": settings.pipeline.stages.tester_report,
-            "review_repo_tools": settings.pipeline.stages.review_repo_tools,
-            "dialogue": settings.pipeline.stages.dialogue,
+            "investigator": stages.investigator,
+            "bridge": _svc(request).settings.bridge.enabled,
+            "tester_report": stages.tester_report,
+            "review_repo_tools": stages.review_repo_tools,
+            "dialogue": stages.dialogue,
         },
     }
 
 
-def basic_auth_ok(authorization: str) -> bool:
+def basic_auth_ok(cfg: ServerSection, authorization: str) -> bool:
     """Validate an HTTP Basic header against STATS_USER/STATS_PASSWORD."""
-    if not (settings.server.stats_user and settings.server.stats_password):
+    if not (cfg.stats_user and cfg.stats_password):
         return False
     scheme, _, blob = authorization.partition(" ")
     if scheme.lower() != "basic" or not blob:
@@ -174,77 +158,79 @@ def basic_auth_ok(authorization: str) -> bool:
         user, _, password = base64.b64decode(blob.strip()).decode().partition(":")
     except (ValueError, UnicodeDecodeError):
         return False
-    return (hmac.compare_digest(user, settings.server.stats_user)
-            and hmac.compare_digest(password, settings.server.stats_password))
+    return (hmac.compare_digest(user, cfg.stats_user)
+            and hmac.compare_digest(password, cfg.stats_password))
 
 
-def stats_access_allowed(authorization: str, query_token: str,
+def stats_access_allowed(cfg: ServerSection, authorization: str, query_token: str,
                          forwarded_for: str | None) -> bool:
     """Basic creds and/or STATS_TOKEN when configured; with neither configured,
     only direct local requests (proxied ones carry X-Forwarded-For) pass."""
-    if basic_auth_ok(authorization):
+    if basic_auth_ok(cfg, authorization):
         return True
-    token = settings.server.stats_token
+    token = cfg.stats_token
     if token:
         if hmac.compare_digest(authorization, f"Bearer {token}"):
             return True
         return bool(query_token) and hmac.compare_digest(query_token, token)
-    if settings.server.stats_user and settings.server.stats_password:
+    if cfg.stats_user and cfg.stats_password:
         return False  # basic auth is configured and did not match
     return forwarded_for is None
 
 
 def _dash_guard(request: Request) -> None:
     """Shared auth for /stats, /dashboard and /admin endpoints."""
+    cfg = _svc(request).settings.server
     if stats_access_allowed(
+            cfg,
             request.headers.get("authorization", ""),
             request.query_params.get("token", ""),
             request.headers.get("x-forwarded-for")):
         return
-    if settings.server.stats_user and settings.server.stats_password:
+    if cfg.stats_user and cfg.stats_password:
         # trigger the browser's native login prompt
         raise HTTPException(status_code=401, detail="Unauthorized",
                             headers={"WWW-Authenticate": 'Basic realm="mr-reviewer"'})
     raise HTTPException(status_code=403, detail="Forbidden")
 
 
-@app.get("/stats")
+@router.get("/stats")
 async def stats(request: Request) -> dict[str, Any]:
     """Token/cost stats: overall totals, per-model breakdown, recent reviews."""
     _dash_guard(request)
-    return await asyncio.to_thread(usage.aggregate)
+    return await asyncio.to_thread(_svc(request).usage_log.aggregate)
 
 
-@app.get("/dashboard")
+@router.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
     """Self-contained stats dashboard (same auth as /stats)."""
     _dash_guard(request)
-    from .dashboard import DASHBOARD_HTML
     return HTMLResponse(DASHBOARD_HTML)
 
 
-@app.get("/admin/models")
+@router.get("/admin/models")
 async def get_models(request: Request) -> dict[str, Any]:
     """Current tier models: .env defaults, runtime overrides, effective values,
     plus the full OpenRouter catalog (any of which can be set as a tier override —
     vendor-prefixed ids route via OpenRouter, priced from the live catalog)."""
     _dash_guard(request)
-    ov = overrides.load()
-    defaults = {tier.value: settings.model_for_tier(tier) for tier in Tier}
-    catalog = await asyncio.to_thread(openrouter_models.refresh)
+    svc = _svc(request)
+    ov = svc.overrides.load()
+    defaults = {tier.value: svc.settings.model_for_tier(tier) for tier in Tier}
+    catalog = await asyncio.to_thread(svc.catalog.refresh)
     or_models = [{"id": mid, "in": price[0], "out": price[1]}
                  for mid, price in sorted(catalog.items())]
     return {
         "defaults": defaults,
         "overrides": ov,
         "effective": {t: (ov.get(t) or d) for t, d in defaults.items()},
-        "known_models": sorted(usage.PRICES),
-        "known_prices": {m: list(p) for m, p in usage.PRICES.items()},
+        "known_models": sorted(svc.pricing.prices),
+        "known_prices": {m: list(p) for m, p in svc.pricing.prices.items()},
         "openrouter_models": or_models,
     }
 
 
-@app.post("/admin/models")
+@router.post("/admin/models")
 async def set_models(request: Request) -> dict[str, Any]:
     """Set/clear per-tier model overrides (empty string = back to .env default).
     Applies immediately to new reviews; vendor-prefixed models run via OpenRouter."""
@@ -255,39 +241,51 @@ async def set_models(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid JSON body") from None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="expected an object")
-    saved = overrides.save(body)
+    saved = _svc(request).overrides.save(body)
     return {"overrides": saved}
 
 
-@app.post("/webhook")
+async def _alert_unknown_token(request: Request, event_type: str | None,
+                               token: str | None) -> None:
+    now = time.monotonic()
+    if now - request.app.state.unknown_token_alert_at < UNKNOWN_TOKEN_ALERT_INTERVAL:
+        return
+    request.app.state.unknown_token_alert_at = now
+    await _svc(request).telegram.notify_error(
+        "webhook_error", f"Unknown webhook token received: {(token or '')[:10]}...",
+        {"event_type": event_type})
+
+
+@router.post("/webhook")
 async def handle_gitlab_webhook(request: Request):
+    svc = _svc(request)
     event_type = request.headers.get("X-Gitlab-Event")
     gitlab_token = request.headers.get("X-Gitlab-Token")
 
-    instance = settings.gitlab.routes.get(gitlab_token or "")
+    instance = svc.settings.gitlab.routes.get(gitlab_token or "")
     if not instance:
         logger.warning("No GitLab instance found for webhook token: %s",
                        (gitlab_token or "")[:10])
-        await _alert_unknown_token(event_type, gitlab_token)
+        await _alert_unknown_token(request, event_type, gitlab_token)
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     try:
         payload = await request.json()
     except json.JSONDecodeError:
         logger.error("Invalid JSON in webhook payload")
-        await telegram_io.notify_error("webhook_error", "Invalid JSON in webhook payload")
+        await svc.telegram.notify_error("webhook_error", "Invalid JSON in webhook payload")
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
 
     if event_type == "Note Hook":
-        if not settings.pipeline.stages.dialogue:
+        if not svc.settings.pipeline.stages.dialogue:
             return {"status": "ignored", "reason": "dialogue disabled"}
         note_job = gitlab_io.parse_note_webhook(payload, instance)
         if not note_job:
             return {"status": "ignored", "reason": "not an MR comment"}
-        bot = bot_usernames.get(instance.name, "")
+        bot = svc.bot_usernames.get(instance.name, "")
         if bot and note_job.note_author == bot:
             return {"status": "ignored", "reason": "own note"}
-        queued = review_queue.submit(note_job)
+        queued = svc.queue.submit(note_job)
         logger.info("%s dialogue for note %s on MR !%s in project %s on %s",
                     "Queued" if queued else "Deduped", note_job.note_id,
                     note_job.ref.mr_iid, note_job.ref.project_id, instance.name)
@@ -308,16 +306,16 @@ async def handle_gitlab_webhook(request: Request):
         # exception text stays in our log/alert, the response carries only an id
         job_id = new_job_id()
         logger.exception("job %s: error handling webhook", job_id)
-        await telegram_io.notify_error("webhook_error", str(exc),
-                                       {"event_type": event_type or "unknown",
-                                        "job_id": job_id})
+        await svc.telegram.notify_error("webhook_error", str(exc),
+                                        {"event_type": event_type or "unknown",
+                                         "job_id": job_id})
         return JSONResponse(status_code=500,
                             content={"detail": "internal error", "job_id": job_id})
 
     if not review_job:
         return {"status": "ignored", "reason": "Invalid or unsupported MR action"}
 
-    queued = review_queue.submit(review_job)
+    queued = svc.queue.submit(review_job)
     logger.info("%s quality check for MR !%s in project %s on %s",
                 "Queued" if queued else "Deduped", review_job.ref.mr_iid,
                 review_job.ref.project_id, instance.name)

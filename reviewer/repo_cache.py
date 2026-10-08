@@ -34,7 +34,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import settings
+from .config import RepoCacheSection
 from .domain.models import InstanceRef
 
 logger = logging.getLogger(__name__)
@@ -62,9 +62,7 @@ def _redact(text: str) -> str:
     return _CRED_RE.sub(r"\1***@", text or "")
 
 
-def _proxy_args() -> list[str]:
-    proxy = settings.network.http_proxy or (
-        f"socks5h://{settings.network.socks_proxy}" if settings.network.socks_proxy else "")
+def _proxy_args(proxy: str) -> list[str]:
     return ["-c", f"http.proxy={proxy}"] if proxy else []
 
 
@@ -74,8 +72,9 @@ def _auth_args(token: str) -> list[str]:
     return ["-c", f"http.extraheader=Authorization: Basic {basic}"]
 
 
-def _run_git(*args: str, token: str | None = None, timeout: int = 600) -> str:
-    cmd = ["git", *_proxy_args(), *(_auth_args(token) if token else []), *args]
+def _run_git(*args: str, token: str | None = None, timeout: int = 600,
+             proxy: str = "") -> str:
+    cmd = ["git", *_proxy_args(proxy), *(_auth_args(token) if token else []), *args]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                             encoding="utf-8", errors="replace")
     if result.returncode != 0:
@@ -85,11 +84,17 @@ def _run_git(*args: str, token: str | None = None, timeout: int = 600) -> str:
 
 
 class RepoCache:
-    def __init__(self, cache_dir: str | None = None, max_gb: float | None = None):
-        self.root = Path(cache_dir or settings.repo_cache.dir)
-        self.max_bytes = int((max_gb or settings.repo_cache.max_gb) * 1024**3)
+    def __init__(self, cfg: RepoCacheSection, git_proxy: str = "") -> None:
+        self.root = Path(cfg.dir)
+        self.max_bytes = int(cfg.max_gb * 1024**3)
+        # clone -> investigate -> remove (small disks) instead of an LRU cache
+        self.ephemeral = cfg.ephemeral
+        self.git_proxy = git_proxy
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._evict_lock = threading.Lock()
+
+    def _git(self, *args: str, token: str | None = None, timeout: int = 600) -> str:
+        return _run_git(*args, token=token, timeout=timeout, proxy=self.git_proxy)
 
     def _repo_dir(self, instance_url: str, project_path: str) -> Path:
         host = urlsplit(instance_url).netloc or instance_url
@@ -119,11 +124,11 @@ class RepoCache:
         if not repo_dir.is_dir():
             repo_dir.parent.mkdir(parents=True, exist_ok=True)
             logger.info("Cloning %s (first MR for this project)", project_path)
-            _run_git("clone", "--bare", "--filter=blob:none", url, str(repo_dir),
+            self._git("clone", "--bare", "--filter=blob:none", url, str(repo_dir),
                      token=token)
         # credential-less remote; auth is injected per command via extraheader
-        _run_git("-C", str(repo_dir), "remote", "set-url", "origin", url)
-        _run_git("-C", str(repo_dir), "fetch", "origin",
+        self._git("-C", str(repo_dir), "remote", "set-url", "origin", url)
+        self._git("-C", str(repo_dir), "fetch", "origin",
                  f"+refs/merge-requests/{mr_iid}/head:refs/mr/{mr_iid}", token=token)
         (repo_dir / ".last_used").write_text(str(int(time.time())))
 
@@ -135,7 +140,7 @@ class RepoCache:
         if worktree.exists():  # same MR+sha re-queued: previous run is dead (dedupe gates live ones)
             self._remove_worktree_sync(repo_dir, worktree)
         # partial clone fetches blobs during checkout — needs auth + proxy
-        _run_git("-C", str(repo_dir), "worktree", "add", "--detach",
+        self._git("-C", str(repo_dir), "worktree", "add", "--detach",
                  str(worktree), ref, token=token, timeout=300)
         return worktree
 
@@ -145,7 +150,7 @@ class RepoCache:
         # same lock as checkout_mr: never drop a bare repo mid-checkout of another MR
         async with self._locks[str(repo_dir)]:
             await asyncio.to_thread(self._remove_worktree_sync, repo_dir, worktree)
-            if settings.repo_cache.ephemeral:
+            if self.ephemeral:
                 await asyncio.to_thread(self._drop_repo, repo_dir)
 
     def _drop_repo(self, repo_dir: Path) -> None:
@@ -157,12 +162,12 @@ class RepoCache:
 
     def _remove_worktree_sync(self, repo_dir: Path, worktree: Path) -> None:
         try:
-            _run_git("-C", str(repo_dir), "worktree", "remove", "--force", str(worktree),
+            self._git("-C", str(repo_dir), "worktree", "remove", "--force", str(worktree),
                      timeout=120)
         except (RepoCacheError, subprocess.TimeoutExpired):
             shutil.rmtree(worktree, ignore_errors=True)
             try:
-                _run_git("-C", str(repo_dir), "worktree", "prune")
+                self._git("-C", str(repo_dir), "worktree", "prune")
             except RepoCacheError:
                 pass
 
@@ -461,5 +466,3 @@ def repo_find_symbol(worktree: Path, name: str, max_results: int = 20) -> str:
         lines.append(f"... and {len(matches) - max_results} more")
     return "\n".join(lines)
 
-
-repo_cache = RepoCache()

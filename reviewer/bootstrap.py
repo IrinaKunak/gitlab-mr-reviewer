@@ -1,0 +1,185 @@
+"""Composition root: the only place that reads the environment and wires objects.
+
+    load_config()          .env -> environment -> validated Settings
+    configure_logging()    root logger (was a side effect of importing server)
+    build_services(cfg)    the object graph, every dependency passed explicitly
+    create_app()           FastAPI over it (`app` below is for uvicorn import paths)
+
+Tests call `build_services(cfg, ai=..., telegram=..., ...)` with fakes for any
+edge they want to replace — nothing is monkeypatched at module level.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Any
+
+from dotenv import load_dotenv
+
+from . import __version__, gitlab_io, state_layout
+from .ai_client import AIClient
+from .bridge import ReviewBridge
+from .config import (
+    Settings,
+    deprecated_env_vars_in_use,
+    load_settings,
+    masked_dump,
+    retired_env_vars_in_use,
+)
+from .domain.models import InstanceRef
+from .openrouter_models import OpenRouterCatalog
+from .overrides import ModelOverrides
+from .pipeline import Pipeline
+from .repo_cache import RepoCache
+from .review_state import ReviewStateStore
+from .server import ReviewQueue
+from .server import create_app as _create_app
+from .telegram_io import TelegramClient
+from .usage import Pricing, UsageLog
+
+logger = logging.getLogger(__name__)
+
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+
+def load_config(dotenv: bool = True) -> Settings:
+    """The mounted .env (never overriding real env vars) + config.yaml, validated.
+    A bad value raises SystemExit with a message naming the variable."""
+    if dotenv:
+        load_dotenv()
+    return load_settings()
+
+
+def configure_logging(cfg: Settings) -> None:
+    logging.basicConfig(level=logging.DEBUG if cfg.server.debug else logging.INFO,
+                        format=LOG_FORMAT)
+
+
+@dataclass
+class Services:
+    """The running service's object graph plus its lifecycle."""
+    settings: Settings
+    telegram: TelegramClient
+    bridge: Any  # ReviewBridge, or a scripted fake with the same enabled/ask/start/stop
+    ai: Any  # AIClient, or a scripted fake
+    pipeline: Pipeline
+    queue: ReviewQueue
+    overrides: ModelOverrides
+    catalog: OpenRouterCatalog
+    pricing: Pricing
+    usage_log: UsageLog
+    review_state: ReviewStateStore
+    gitlab_client: Callable[[InstanceRef], Any]
+    # instance name -> the bot's own GitLab username, learned at startup so note
+    # webhooks from the bot itself are dropped at the door instead of queueing a
+    # job (every review post fires one). Runtime state, kept out of the config.
+    bot_usernames: dict[str, str] = field(default_factory=dict)
+    _verify_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        cfg = self.settings
+        logger.info("GitLab MR Reviewer v%s starting", __version__)
+        logger.info("Instances: %s", [i.name for i in cfg.gitlab.routes.values()])
+        stages = cfg.pipeline.stages
+        logger.info("Flags: investigator=%s bridge=%s tester_report=%s "
+                    "review_repo_tools=%s dialogue=%s provider=%s",
+                    stages.investigator, cfg.bridge.enabled, stages.tester_report,
+                    stages.review_repo_tools, stages.dialogue, cfg.llm.provider)
+        if cfg.llm.provider == "openrouter" and not cfg.llm.openrouter.token:
+            logger.error("AI_PROVIDER=openrouter but OPENROUTER_API_TOKEN is empty")
+        for message in retired_env_vars_in_use() + deprecated_env_vars_in_use(cfg):
+            logger.warning("%s", message)
+        if cfg.network.proxy_url:
+            logger.info("Proxy: %s", cfg.network.proxy_url)
+        state_layout.migrate(cfg)  # before anything reads overrides/review state
+        await self.queue.start()
+        await self.bridge.start()
+        self._verify_task = asyncio.create_task(self.verify_instances())
+
+    async def stop(self) -> None:
+        if self._verify_task is not None:
+            self._verify_task.cancel()
+        await self.bridge.stop()
+        await self.queue.stop()
+
+    async def verify_instances(self) -> None:
+        """Startup connectivity check (non-fatal, v1 behavior)."""
+        for instance in self.settings.gitlab.routes.values():
+            try:
+                gl = await asyncio.to_thread(self.gitlab_client, instance)
+                self.bot_usernames[instance.name] = getattr(
+                    getattr(gl, "user", None), "username", "") or ""
+                logger.info("GitLab instance OK: %s (%s), bot=%s", instance.name,
+                            instance.url, self.bot_usernames[instance.name] or "?")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("GitLab instance %s connection failed: %s", instance.name, exc)
+                await self.telegram.notify_error(
+                    "gitlab_api_error", f"Startup connection failed: {exc}",
+                    {"gitlab_instance": instance.name})
+
+
+def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
+                   ai: Any = None, bridge: Any = None, repo_cache: Any = None,
+                   gitlab_client: Callable[[InstanceRef], Any] | None = None,
+                   catalog: OpenRouterCatalog | None = None,
+                   clock: Callable[[], float] = time.monotonic,
+                   workers: int | None = None) -> Services:
+    """Build the object graph from settings, in dependency order. Keyword
+    arguments replace one edge (tests pass fakes); everything else is real."""
+    state_dir = cfg.storage.state_dir
+    telegram = telegram or TelegramClient(cfg.notify.telegram, proxy_url=cfg.network.proxy_url,
+                                          language=cfg.pipeline.language)
+    catalog = catalog or OpenRouterCatalog(state_dir, proxy_url=cfg.network.proxy_url)
+    pricing = Pricing(cfg.llm.prices, catalog)
+    overrides = ModelOverrides(state_dir, cfg)
+    ai = ai or AIClient(cfg, overrides=overrides, alert=telegram.notify_error)
+    bridge = bridge or ReviewBridge(cfg.bridge, telegram)
+    repo_cache = repo_cache or RepoCache(cfg.repo_cache, git_proxy=cfg.network.git_proxy)
+    gitlab_client = gitlab_client or partial(
+        gitlab_io.get_gitlab_client, proxies=cfg.network.requests_proxies)
+    review_state = ReviewStateStore(state_dir)
+    usage_log = UsageLog(cfg.storage.log_dir)
+    pipeline = Pipeline(cfg, ai=ai, telegram=telegram, bridge=bridge, repo_cache=repo_cache,
+                        review_state=review_state, usage_log=usage_log, pricing=pricing,
+                        gitlab_client=gitlab_client)
+    queue = ReviewQueue(cfg.server.workers if workers is None else workers,
+                        cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
+                        pipeline=pipeline, clock=clock)
+    return Services(settings=cfg, telegram=telegram, bridge=bridge, ai=ai, pipeline=pipeline,
+                    queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,
+                    usage_log=usage_log, review_state=review_state,
+                    gitlab_client=gitlab_client)
+
+
+def _services_from_env() -> Services:
+    cfg = load_config()
+    configure_logging(cfg)
+    return build_services(cfg)
+
+
+def create_app(cfg: Settings | None = None):
+    """FastAPI app. With `cfg` the graph is built now; without it the lifespan
+    loads the config at startup (import paths like `uvicorn w-server:app`)."""
+    if cfg is None:
+        return _create_app(factory=_services_from_env)
+    configure_logging(cfg)
+    return _create_app(build_services(cfg))
+
+
+# for `uvicorn reviewer.bootstrap:app` / the w-server.py shim: building it reads
+# nothing — the config is loaded when the app starts
+app = create_app()
+
+
+def main_print_config() -> None:
+    """`python -m reviewer.config`: effective config (secrets masked) or the errors."""
+    cfg = load_config()
+    print(json.dumps(masked_dump(cfg), indent=2, ensure_ascii=False))
+    for message in retired_env_vars_in_use() + deprecated_env_vars_in_use(cfg):
+        print("WARNING:", message)

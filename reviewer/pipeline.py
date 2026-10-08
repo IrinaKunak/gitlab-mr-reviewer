@@ -17,11 +17,14 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
+from functools import partial
+from typing import Any
 
 import gitlab as gitlab_lib
 
-from . import gitlab_io, prompts, review_state, telegram_io, usage
+from . import gitlab_io, prompts, usage
 from .ai_client import (
     CHARS_PER_TOKEN,
     AIClient,
@@ -29,17 +32,17 @@ from .ai_client import (
     AIInputTooLargeError,
     AITimeoutError,
     ToolDef,
-    ai_client,
     estimate_tokens,
 )
-from .bridge import bridge
-from .config import settings
+from .bridge import ReviewBridge
+from .config import Settings
 from .domain import budget
 from .domain.investigation import investigation_from_text
 from .domain.models import (
     ChangeSet,
     Complexity,
     DialogueJob,
+    InstanceRef,
     Investigation,
     MergeRequestRef,
     ReviewJob,
@@ -48,7 +51,10 @@ from .domain.models import (
     TriageResult,
 )
 from .domain.skip import resolve_skip
-from .repo_cache import repo_cache, repo_find_symbol, repo_grep, repo_list_tree, repo_read_file
+from .repo_cache import RepoCache, repo_find_symbol, repo_grep, repo_list_tree, repo_read_file
+from .review_state import ReviewStateStore
+from .telegram_io import TelegramClient
+from .usage import UsageLog
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +103,12 @@ TESTER_REPORT_COMMENT = {
 }
 
 
-def _msg(table: dict[str, str], **kwargs) -> str:
-    template = table.get(settings.pipeline.language, table["en"])
-    return template.format(**kwargs) if kwargs else template
-
-
 def new_job_id() -> str:
     """Short id that ties a queued job's log lines, alerts and MR error note."""
     return uuid.uuid4().hex[:8]
 
 
-def tester_report_targets() -> list[str]:
+def tester_report_targets(settings: Settings) -> list[str]:
     """Chats that receive the tester-report document.
 
     Bridge chat first (AIManager archives reports into its corpus), then the
@@ -124,10 +125,28 @@ def tester_report_targets() -> list[str]:
 
 
 class Pipeline:
-    def __init__(self, client: AIClient | None = None):
-        self.ai = client or ai_client
+    def __init__(self, settings: Settings, *, ai: AIClient, telegram: TelegramClient,
+                 bridge: ReviewBridge, repo_cache: RepoCache,
+                 review_state: ReviewStateStore, usage_log: UsageLog,
+                 pricing: usage.Pricing = usage.BUILTIN_PRICING,
+                 gitlab_client: Callable[[InstanceRef], Any] | None = None) -> None:
+        self.settings = settings
+        self.ai = ai
+        self.telegram = telegram
+        self.bridge = bridge
+        self.repo_cache = repo_cache
+        self.review_state = review_state
+        self.usage_log = usage_log
+        self.pricing = pricing
+        # one authenticated python-gitlab client per call (stage 11 caches per instance)
+        self.gitlab_client = gitlab_client or partial(
+            gitlab_io.get_gitlab_client, proxies=self.settings.network.requests_proxies)
         # (instance, project_id, mr_iid) -> timestamps of dialogue replies sent
         self._dialogue_replies: dict[tuple, list[float]] = {}
+
+    def _msg(self, table: dict[str, str], **kwargs) -> str:
+        template = table.get(self.settings.pipeline.language, table["en"])
+        return template.format(**kwargs) if kwargs else template
 
     # --- entry point ---
 
@@ -139,36 +158,36 @@ class Pipeline:
                "gitlab_instance": ref.instance.name, "job_id": job_id}
         logger.info("job %s: review MR !%s in project %s on %s", job_id,
                     ref.mr_iid, ref.project_id, ref.instance.name)
-        tracker = usage.UsageTracker()
+        tracker = usage.UsageTracker(self.pricing)
         tracker_token = usage.current_tracker.set(tracker)
         try:
             await self._process_inner(job, ctx)
         except gitlab_lib.exceptions.GitlabError as exc:
             logger.error("job %s: GitLab API error: %s", job_id, exc)
-            await telegram_io.notify_error("gitlab_api_error", str(exc), ctx)
+            await self.telegram.notify_error("gitlab_api_error", str(exc), ctx)
         except AIInputTooLargeError:
-            await telegram_io.notify_error("ai_failure", "MR too large to analyze", ctx)
-            await self._safe_note(ref, _msg(TOO_LARGE_MSG))
+            await self.telegram.notify_error("ai_failure", "MR too large to analyze", ctx)
+            await self._safe_note(ref, self._msg(TOO_LARGE_MSG))
         except AITimeoutError:
             logger.error("job %s: AI analysis timed out", job_id)
-            await telegram_io.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
-            await self._safe_note(ref, _msg(TIMEOUT_MSG))
+            await self.telegram.notify_error("timeout", "AI analysis exceeded timeout limit", ctx)
+            await self._safe_note(ref, self._msg(TIMEOUT_MSG))
         except AIError as exc:
             logger.error("job %s: AI analysis failed: %s", job_id, exc)
-            await telegram_io.notify_error("ai_failure", str(exc)[:300], ctx)
-            await self._safe_note(ref, _msg(GENERAL_ERROR_MSG, job_id=job_id))
+            await self.telegram.notify_error("ai_failure", str(exc)[:300], ctx)
+            await self._safe_note(ref, self._msg(GENERAL_ERROR_MSG, job_id=job_id))
         except Exception as exc:  # noqa: BLE001 — top-level pipeline guard
             logger.exception("job %s: error in quality check", job_id)
-            await telegram_io.notify_error("general", str(exc), ctx)
-            await self._safe_note(ref, _msg(GENERAL_ERROR_MSG, job_id=job_id))
+            await self.telegram.notify_error("general", str(exc), ctx)
+            await self._safe_note(ref, self._msg(GENERAL_ERROR_MSG, job_id=job_id))
         finally:
             usage.current_tracker.reset(tracker_token)
-            usage.persist(tracker, job)
+            self.usage_log.persist(tracker, job)
 
     async def _safe_note(self, ref: MergeRequestRef, body: str) -> None:
         """Best-effort MR comment on error paths (v1 behavior)."""
         try:
-            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, ref.instance)
+            gl = await asyncio.to_thread(self.gitlab_client, ref.instance)
             project = await asyncio.to_thread(gl.projects.get, ref.project_id)
             mr = await asyncio.to_thread(project.mergerequests.get, ref.mr_iid)
             await gitlab_io.post_note(mr, body)
@@ -186,17 +205,17 @@ class Pipeline:
         logger.info("Starting quality check for MR !%s in project %s on %s",
                     ref.mr_iid, ref.project_id, ref.instance.name)
 
-        gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, ref.instance)
+        gl = await asyncio.to_thread(self.gitlab_client, ref.instance)
         try:
             project = await asyncio.to_thread(gl.projects.get, ref.project_id)
         except gitlab_lib.exceptions.GitlabGetError as exc:
-            await telegram_io.notify_error(
+            await self.telegram.notify_error(
                 "gitlab_api_error", f"Failed to get project {ref.project_id}: {exc}", ctx)
             return
         try:
             mr = await asyncio.to_thread(project.mergerequests.get, ref.mr_iid)
         except gitlab_lib.exceptions.GitlabGetError as exc:
-            await telegram_io.notify_error(
+            await self.telegram.notify_error(
                 "gitlab_api_error", f"Failed to get MR !{ref.mr_iid}: {exc}", ctx)
             return
 
@@ -218,7 +237,7 @@ class Pipeline:
         # narrow this run to the delta since then — full re-reviews rehashed
         # remarks about earlier commits on every push (dev feedback 2026-07-23)
         head_sha = job.last_commit or getattr(mr, "sha", "") or ""
-        prev_sha = review_state.get_last_sha(ref.instance.name, ref.project_id, ref.mr_iid)
+        prev_sha = self.review_state.get_last_sha(ref.instance.name, ref.project_id, ref.mr_iid)
         if job.force_full:
             # re-review label / [re-review] marker: full fresh review on demand
             logger.info("MR !%s: force_full requested — ignoring incremental state",
@@ -230,12 +249,12 @@ class Pipeline:
             return
 
         has_conflicts = await asyncio.to_thread(gitlab_io.check_merge_conflicts, mr)
-        await telegram_io.notify(telegram_io.format_mr_message(
+        await self.telegram.notify(self.telegram.format_mr_message(
             job, project.path_with_namespace, has_conflicts,
             gitlab_instance=ref.instance.url))
 
-        if has_conflicts and not settings.pipeline.review_for_conflict:
-            await gitlab_io.post_note(mr, _msg(CONFLICT_SKIP_MSG))
+        if has_conflicts and not self.settings.pipeline.review_for_conflict:
+            await gitlab_io.post_note(mr, self._msg(CONFLICT_SKIP_MSG))
             logger.info("Skipped review for MR !%s due to conflicts", ref.mr_iid)
             return
 
@@ -246,7 +265,7 @@ class Pipeline:
                 gitlab_io.fetch_delta_changes, project, prev_sha, head_sha)
 
         await gitlab_io.post_note(
-            mr, _msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
+            mr, self._msg(INITIAL_MSG_CONFLICT if has_conflicts else INITIAL_MSG))
 
         # access_raw_diffs bypasses GitLab's per-file collapse limit, which
         # otherwise returns empty diffs for large files (silently unreviewed)
@@ -261,18 +280,18 @@ class Pipeline:
 
         def _mark_reviewed(posted: bool) -> None:
             if posted:
-                review_state.set_last_sha(ref.instance.name, ref.project_id, ref.mr_iid,
+                self.review_state.set_last_sha(ref.instance.name, ref.project_id, ref.mr_iid,
                                           head_sha)
 
         async def _build_content(skip: set[str]) -> tuple[str, str]:
             diff_only = gitlab_io.extract_diff_only(changes, skip=skip)
             readable = sum(1 for f in changes.files if f.path not in skip and f.readable)
             if not budget.file_context_fits(estimate_tokens(diff_only), readable,
-                                            settings.llm.max_input_tokens):
+                                            self.settings.llm.max_input_tokens):
                 logger.info("MR !%s: skipping file-context fetch for %d files "
                             "(~%d tok diff + context > %d budget) — diffs only",
                             ref.mr_iid, readable, estimate_tokens(diff_only),
-                            settings.llm.max_input_tokens)
+                            self.settings.llm.max_input_tokens)
                 content = diff_only + (budget.FILE_CONTEXT_OMITTED_NOTE if diff_only else "")
             else:
                 content = await asyncio.to_thread(
@@ -297,7 +316,7 @@ class Pipeline:
                         list(triage.skip_globs), len(skip), len(changes))
         review_content, diff_only = await _build_content(skip)
         if not review_content:
-            await gitlab_io.post_note(mr, _msg(NO_CHANGES_MSG))
+            await gitlab_io.post_note(mr, self._msg(NO_CHANGES_MSG))
             return
 
         # per-project reviewer config (.ai-review.md) + incremental focus
@@ -316,15 +335,15 @@ class Pipeline:
         # with it instead of asking the author to "confirm" them (dev feedback
         # 2026-07-31: a diff-only reviewer structurally cannot check anything
         # outside the diff, so prompt rules alone kept letting hedges through).
-        need_investigation = (settings.pipeline.stages.investigator
+        need_investigation = (self.settings.pipeline.stages.investigator
                               and triage.needs_investigation
                               and triage.complexity is Complexity.COMPLEX)
-        want_review_tools = (settings.pipeline.stages.review_repo_tools
+        want_review_tools = (self.settings.pipeline.stages.review_repo_tools
                              and triage.complexity is not Complexity.TRIVIAL)
         worktree = None
         if want_review_tools or need_investigation:
             try:
-                worktree = await repo_cache.checkout_mr(
+                worktree = await self.repo_cache.checkout_mr(
                     ref.instance, ref.project_path, ref.mr_iid, job.last_commit)
             except Exception as exc:  # noqa: BLE001 — tools degrade, review still runs
                 logger.error("repo checkout failed, continuing without repo tools: %s", exc)
@@ -345,13 +364,13 @@ class Pipeline:
                     review_en += "\n\n---\n\n" + investigation.impact
         finally:
             if worktree is not None:
-                await repo_cache.release(worktree)
+                await self.repo_cache.release(worktree)
 
         review_out = await self._translate_if_needed(review_en, tier=Tier.FAST)
         _mark_reviewed(await self._deliver_review(
             mr, job, project, has_conflicts, review_out))
 
-        if (investigation and settings.pipeline.stages.tester_report
+        if (investigation and self.settings.pipeline.stages.tester_report
                 and investigation.tester_report):
             report_ru = await self._translate_if_needed(
                 investigation.tester_report, tier=Tier.MAIN)
@@ -391,7 +410,7 @@ class Pipeline:
                 Tier.FAST, prompts.TRIVIAL_REVIEW_SYSTEM + system_extra, user,
                 max_tokens=1024)
             return ReviewResult(result.text)
-        system = (settings.pipeline.review_prompt or prompts.REVIEW_SYSTEM) + system_extra
+        system = (self.settings.pipeline.review_prompt or prompts.REVIEW_SYSTEM) + system_extra
         if triage.risk_areas:
             system += "\nTriage flagged risk areas: " + ", ".join(triage.risk_areas)
         if worktree is not None:
@@ -417,7 +436,7 @@ class Pipeline:
         header = self._header(job)
         trimmed = None
         if changes is not None:
-            limit = budget.trim_budget_chars(settings.llm.max_input_tokens, CHARS_PER_TOKEN,
+            limit = budget.trim_budget_chars(self.settings.llm.max_input_tokens, CHARS_PER_TOKEN,
                                              budget.REVIEW_TRIM_SHARE)
             trimmed = lambda: gitlab_io.extract_diff_only(changes, limit)  # noqa: E731
         ladder = budget.review_input_ladder(review_content, diff_only, trimmed)
@@ -452,7 +471,7 @@ class Pipeline:
         to. Returns None when the loop produced no usable review — the caller
         falls back to the plain single-shot path."""
         system = system + prompts.REVIEW_TOOLS_NOTE.format(
-            max_calls=settings.pipeline.review_max_tool_calls)
+            max_calls=self.settings.pipeline.review_max_tool_calls)
         tools = self._repo_tools(worktree)
         last_exc: AIInputTooLargeError | None = None
         for user in self._user_prompts(job, review_content, diff_only, changes):
@@ -461,7 +480,7 @@ class Pipeline:
                     Tier.MAIN, system, user, tools,
                     # the prompt budgets N tool calls; the loop needs turns for
                     # them plus a final text-only answer
-                    max_iterations=settings.pipeline.review_max_tool_calls + 2,
+                    max_iterations=self.settings.pipeline.review_max_tool_calls + 2,
                     max_tokens=16000)
             except AIInputTooLargeError as exc:
                 last_exc = exc
@@ -487,7 +506,7 @@ class Pipeline:
         is exactly what the review's own size guard just rejected — checking
         after the clone means cloning a whole repo only to give up."""
         system = prompts.INVESTIGATOR_SYSTEM.format(
-            max_iterations=settings.pipeline.investigator_max_iterations)
+            max_iterations=self.settings.pipeline.investigator_max_iterations)
         for content in (review_content, diff_only):
             if not content:
                 continue
@@ -498,7 +517,7 @@ class Pipeline:
                 return content
             except AIInputTooLargeError:
                 continue
-        limit = budget.trim_budget_chars(settings.llm.max_input_tokens, CHARS_PER_TOKEN,
+        limit = budget.trim_budget_chars(self.settings.llm.max_input_tokens, CHARS_PER_TOKEN,
                                          budget.INVESTIGATOR_TRIM_SHARE)
         logger.warning("MR !%s: investigating on a %d-char diff subset",
                        job.ref.mr_iid, limit)
@@ -557,19 +576,19 @@ class Pipeline:
         if worktree is None:
             logger.warning("investigating without repo tools (no checkout)")
 
-        questions_left = settings.bridge.max_questions_per_mr
+        questions_left = self.settings.bridge.max_questions_per_mr
 
         async def ask_aimanager(question: str) -> str:
             nonlocal questions_left
-            if not bridge.enabled:
+            if not self.bridge.enabled:
                 return "AIManager is not available in this deployment."
             if questions_left <= 0:
                 return "Question budget for this MR is exhausted."
             questions_left -= 1
-            answer = await bridge.ask(question)
+            answer = await self.bridge.ask(question)
             return answer or "No answer received (timeout or not found)."
 
-        if bridge.enabled:
+        if self.bridge.enabled:
             tools.append(ToolDef(
                 "ask_aimanager",
                 "Ask the company knowledge bot (Jira corpus + project chats) one focused "
@@ -580,12 +599,12 @@ class Pipeline:
                 handler=ask_aimanager))
 
         system = prompts.INVESTIGATOR_SYSTEM.format(
-            max_iterations=settings.pipeline.investigator_max_iterations)
+            max_iterations=self.settings.pipeline.investigator_max_iterations)
         user = prompts.investigator_user_prompt(job, review_content, triage, review_en)
         try:
             result = await self.ai.agent_loop(
                 Tier.SMART, system, user, tools,
-                max_iterations=settings.pipeline.investigator_max_iterations,
+                max_iterations=self.settings.pipeline.investigator_max_iterations,
                 # 32k: adaptive thinking bills against max_tokens on the smart
                 # tier — 16k could be consumed before any visible text
                 max_tokens=32000, effort="high")
@@ -600,7 +619,7 @@ class Pipeline:
         return investigation
 
     async def _translate_if_needed(self, text: str, tier: Tier) -> str:
-        if settings.pipeline.language != "ru" or not text:
+        if self.settings.pipeline.language != "ru" or not text:
             return text
         # long documents overwhelm Haiku: it starts leaving half the prose in
         # English mid-sentence (dev feedback 2026-07-23) — main tier handles them
@@ -631,7 +650,7 @@ class Pipeline:
             job = replace(job, job_id=new_job_id())
         logger.info("job %s: dialogue for note %s in MR !%s", job.job_id,
                     job.note_id, job.ref.mr_iid)
-        tracker = usage.UsageTracker()
+        tracker = usage.UsageTracker(self.pricing)
         tracker_token = usage.current_tracker.set(tracker)
         try:
             await self._process_note_inner(job)
@@ -640,12 +659,12 @@ class Pipeline:
                              job.note_id, job.ref.mr_iid)
         finally:
             usage.current_tracker.reset(tracker_token)
-            usage.persist(tracker, job)
+            self.usage_log.persist(tracker, job)
 
     async def _process_note_inner(self, job: DialogueJob) -> None:
         ref, note_id = job.ref, job.note_id
         mr_iid = ref.mr_iid
-        gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, ref.instance)
+        gl = await asyncio.to_thread(self.gitlab_client, ref.instance)
         bot = getattr(getattr(gl, "user", None), "username", "") or ""
         author = job.note_author
         if bot and author == bot:
@@ -683,7 +702,7 @@ class Pipeline:
 
         worktree = None
         try:
-            worktree = await repo_cache.checkout_mr(
+            worktree = await self.repo_cache.checkout_mr(
                 ref.instance, ref.project_path, mr_iid,
                 job.last_commit or getattr(mr, "sha", None))
         except Exception as exc:  # noqa: BLE001 — answer from the diff alone
@@ -694,11 +713,11 @@ class Pipeline:
             result = await self.ai.agent_loop(
                 Tier.MAIN, prompts.DIALOGUE_SYSTEM, user,
                 self._repo_tools(worktree) if worktree is not None else [],
-                max_iterations=settings.pipeline.review_max_tool_calls + 2,
+                max_iterations=self.settings.pipeline.review_max_tool_calls + 2,
                 max_tokens=4000)
         finally:
             if worktree is not None:
-                await repo_cache.release(worktree)
+                await self.repo_cache.release(worktree)
 
         text = (result.text or "").strip()
         if not text or text.upper().startswith("NO_REPLY"):
@@ -729,7 +748,7 @@ class Pipeline:
             self._dialogue_replies = {
                 k: v for k, v in self._dialogue_replies.items()
                 if v and now - v[-1] < DIALOGUE_WINDOW_SECONDS}
-        return len(stamps) < settings.pipeline.dialogue_max_replies_per_mr
+        return len(stamps) < self.settings.pipeline.dialogue_max_replies_per_mr
 
     def _dialogue_replied(self, key: tuple) -> None:
         self._dialogue_replies.setdefault(key, []).append(time.time())
@@ -741,24 +760,24 @@ class Pipeline:
         """Returns True when the review comment was posted (drives the
         last-reviewed-sha state for incremental re-reviews)."""
         ref = job.ref
-        comment = gitlab_io.format_review_comment(review_text)
+        comment = gitlab_io.format_review_comment(review_text, self.settings.pipeline.language)
         try:
             await gitlab_io.post_note(mr, comment)
             logger.info("Posted review for MR !%s", ref.mr_iid)
         except Exception as exc:  # noqa: BLE001
             job_id = job.job_id or "?"
             logger.error("job %s: failed to post review comment: %s", job_id, exc)
-            await telegram_io.notify_error(
+            await self.telegram.notify_error(
                 "gitlab_api_error", f"Failed to post review comment: {exc}",
                 {"project_id": ref.project_id, "mr_iid": ref.mr_iid,
                  "gitlab_instance": ref.instance.name, "job_id": job_id})
             try:
-                await gitlab_io.post_note(mr, _msg(POST_FAILED_MSG, job_id=job_id))
+                await gitlab_io.post_note(mr, self._msg(POST_FAILED_MSG, job_id=job_id))
             except Exception:  # noqa: BLE001
                 logger.error("Failed to post error message as well")
             return False
-        if settings.notify.telegram.enabled:
-            await telegram_io.notify(telegram_io.format_mr_message(
+        if self.settings.notify.telegram.enabled:
+            await self.telegram.notify(self.telegram.format_mr_message(
                 job, project.path_with_namespace, has_conflicts,
                 review_text, ref.instance.url))
         return True
@@ -770,14 +789,12 @@ class Pipeline:
                     f"-MR{ref.mr_iid}.md")
         link = await gitlab_io.upload_tester_report(project, filename, report_ru)
         if link:
-            await gitlab_io.post_note(mr, _msg(TESTER_REPORT_COMMENT, link=link))
+            await gitlab_io.post_note(mr, self._msg(TESTER_REPORT_COMMENT, link=link))
         else:  # upload failed — inline the report so it isn't lost
             await gitlab_io.post_note(mr, report_ru[:60_000])
 
         caption = (f"🧪 Tester report: {ref.project_path} "
                    f"!{ref.mr_iid}\n{ref.url}")
-        for chat_id in tester_report_targets():
-            await telegram_io.send_document(
+        for chat_id in tester_report_targets(self.settings):
+            await self.telegram.send_document(
                 chat_id, filename, report_ru.encode("utf-8"), caption)
-
-pipeline = Pipeline()
