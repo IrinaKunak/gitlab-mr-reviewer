@@ -26,6 +26,8 @@ from .adapters.gitlab import GitLabVcs
 from .adapters.knowledge import ReviewBridge
 from .adapters.notify import CompositeNotifier
 from .adapters.notify.telegram import TelegramClient, TelegramFormatter, TelegramNotifier
+from .adapters.storage import Database
+from .adapters.storage.legacy_import import import_legacy
 from .ai_client import AIClient
 from .application.answer_note import AnswerNote
 from .application.jobs import JobRunner
@@ -83,6 +85,7 @@ class Services:
     pricing: Pricing
     usage_log: UsageLog
     review_state: ReviewStateStore
+    db: Database
     # instance -> its VCS client; the startup check learns each one's bot username,
     # so note webhooks from the bot itself are dropped at the door
     vcs_for: Callable[[InstanceRef], VcsPort]
@@ -104,6 +107,7 @@ class Services:
         if cfg.network.proxy_url:
             logger.info("Proxy: %s", cfg.network.proxy_url)
         state_layout.migrate(cfg)  # before anything reads overrides/review state
+        import_legacy(self.db, cfg.storage.state_dir, cfg.storage.log_dir)
         await self.queue.start()
         await self.bridge.start()
         self._verify_task = asyncio.create_task(self.verify_instances())
@@ -113,6 +117,7 @@ class Services:
             self._verify_task.cancel()
         await self.bridge.stop()
         await self.queue.stop()
+        self.db.close()
 
     async def verify_instances(self) -> None:
         """Startup connectivity check (non-fatal, v1 behavior): the one
@@ -174,7 +179,8 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
 
     catalog = catalog or OpenRouterCatalog(state_dir, proxy_url=cfg.network.proxy_url)
     pricing = Pricing(cfg.llm.price_table(), catalog)
-    overrides = ModelOverrides(state_dir, cfg)
+    db = Database.in_dir(state_dir)
+    overrides = ModelOverrides(db, cfg)
     ai = ai or AIClient(cfg, overrides=overrides, alert=alert)
     # the bridge's own bot (default: the notification bot) — independent of notify.*
     bridge = bridge or ReviewBridge(cfg.bridge, TelegramClient(
@@ -185,8 +191,8 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
             i.name: GitLabVcs(i, proxies=cfg.network.requests_proxies)
             for i in cfg.gitlab.routes.values()}
         vcs_for = lambda instance: clients[instance.name]  # noqa: E731
-    review_state = ReviewStateStore(state_dir)
-    usage_log = UsageLog(cfg.storage.log_dir)
+    review_state = ReviewStateStore(db)
+    usage_log = UsageLog(cfg.storage.log_dir, db)
     workspace = CacheWorkspace(repo_cache)
     translator = Translator(ai, cfg.pipeline.language)
     review_mr = ReviewMergeRequest(
@@ -196,14 +202,14 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     answer_note = AnswerNote(
         cfg, ai=ai, workspace=workspace, usage_log=usage_log, vcs=vcs_for,
         translator=translator, pricing=pricing,
-        budget=DialogueBudget(state_dir, lambda: cfg.pipeline.dialogue_max_replies_per_mr))
+        budget=DialogueBudget(db, lambda: cfg.pipeline.dialogue_max_replies_per_mr))
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
                         cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
                         runner=JobRunner(review_mr, answer_note), clock=clock)
     return Services(settings=cfg, notifier=notifier, bridge=bridge, ai=ai,
                     review_mr=review_mr, answer_note=answer_note,
                     queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,
-                    usage_log=usage_log, review_state=review_state, vcs_for=vcs_for)
+                    usage_log=usage_log, review_state=review_state, db=db, vcs_for=vcs_for)
 
 
 def _services_from_env() -> Services:

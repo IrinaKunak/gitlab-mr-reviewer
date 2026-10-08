@@ -96,13 +96,23 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   reports to the bridge chat (AIManager's corpus). Own bot (`BRIDGE_BOT_TOKEN`,
   default `TELEGRAM_BOT_TOKEN`) and chat — independent of the notification channels.
 - **reviewer/usage.py** — per-review token/cost accounting (contextvar tracker), model
-  price table (`MODEL_PRICES` override), `logs/usage.jsonl`, `/stats` aggregation;
+  price table (`MODEL_PRICES` override), `UsageLog` (the `usage` table + `logs/usage.jsonl`
+  written in parallel), `/stats` = SQL aggregates over the table;
   `UsageTracker.summary()` → the `UsageSummary` a `ReviewPosted` event carries
-- **reviewer/json_store.py** — `JsonStore`: the one implementation behind the state files
-  (`review_state`, `overrides`, `openrouter_models`): lazy read, lock, fail-open (a
-  corrupt file reads as empty, an unwritable one stays in memory), atomic writes via
-  temp file + `os.replace` (`atomic_write_text`, also used by the AI response cache —
-  the cache sweep removes orphaned `<sha256>.*.tmp` too)
+- **reviewer/adapters/storage/** — `state/reviewer.db` (SQLite, WAL, numbered
+  migrations in `sqlite.MIGRATIONS` tracked by `PRAGMA user_version`; append only):
+  `reviewed_shas` (`ReviewStateStore`), `kv` (dashboard overrides, import markers),
+  `dialogue_replies` (`DialogueBudget`), `usage`. One `Database` per graph, built by
+  bootstrap; stores also accept a dir (tests). Fail-open: an unusable STATE_DIR →
+  in-memory db + ERROR; failed writes are logged, never raised into a review.
+  `legacy_import.import_legacy` (startup, after `state_layout.migrate`) imports
+  `reviewed_shas.json` / `model_overrides.json` / `dialogue_replies.json` /
+  `usage.jsonl` once each (kv `imports` markers) and leaves the files for rollback.
+  Webhook dedupe stays in memory on purpose (monotonic clock, 10-min window).
+- **reviewer/json_store.py** — `JsonStore` (lazy read, lock, fail-open, atomic writes via
+  temp file + `os.replace`): now only the OpenRouter catalog cache file;
+  `atomic_write_text` is also used by the AI response cache (the cache sweep removes
+  orphaned `<sha256>.*.tmp` too)
 - **Notifications** — the use cases emit domain events (`domain/events.py`:
   `ReviewStarted`, `ReviewPosted`, `ReviewFailed`, `TesterReportReady`, `SystemAlert`;
   structured fields, no text/markup) to the `Notifier` port (`notify(event)`, never
@@ -244,8 +254,9 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   shared `cache/` with the state files and deleted `model_overrides.json` /
   `reviewed_shas.json` — overrides silently reverted on restart). `AI_CACHE_DIR`
   (`cache/ai`) is disposable and the sweep only touches sha256-named entries;
-  `STATE_DIR` (`state/`) is durable. `state_layout.migrate` moves legacy files at
-  startup (idempotent, an existing file in `state/` wins).
+  `STATE_DIR` (`state/`) is durable (`reviewer.db` + the OpenRouter catalog file).
+  `state_layout.migrate` moves legacy files at startup (idempotent, an existing file in
+  `state/` wins), then they are imported into SQLite once.
 - **Zero prompt-cache reads are alerted**: an agent loop of >1 turn reading
   ≥`AI_CACHE_ALERT_MIN_INPUT` (100k) input with 0 cache reads logs a WARNING and sends
   one Telegram alert per review (prod !493: 677k in, 0 cached on the tool review).
@@ -365,8 +376,10 @@ git pull && docker compose up -d --build
 
 ## Observability
 
-- `GET /stats` — overall totals, per-model aggregates, last 20 reviews (localhost/Caddy)
-- `logs/usage.jsonl` — one JSON entry per review (tokens, cost, per-model breakdown)
+- `GET /stats` — overall totals, per-model aggregates, last 20 reviews (localhost/Caddy),
+  SQL over the `usage` table of `state/reviewer.db`
+- `logs/usage.jsonl` — one JSON entry per review (tokens, cost, per-model breakdown),
+  still appended in parallel; `sqlite3 state/reviewer.db 'select ...'` for ad-hoc queries
 - `logs/ai-debug.log` — request/response dumps when `AI_DEBUG=true` (rotating)
 - Telegram review notifications end with a usage footer:
   `haiku-4-5: →19448 ←446 | sonnet-5: →104634 ←7457 | 💰$0.63`

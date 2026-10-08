@@ -1759,8 +1759,9 @@ def test_state_files_live_outside_ai_cache_dir(tmp_path):
     cfg = make_settings(storage__state_dir=str(tmp_path / "state"),
                         storage__ai_cache_dir=str(tmp_path / "cache" / "ai"))
     svc = make_services(cfg)
-    for store in (svc.overrides, svc.review_state, svc.catalog):
-        assert store._store.path.parent == tmp_path / "state"
+    assert svc.db.path == str(tmp_path / "state" / "reviewer.db")
+    assert svc.overrides.db is svc.db and svc.review_state.db is svc.db
+    assert svc.catalog._store.path.parent == tmp_path / "state"
     assert Settings().storage.ai_cache_dir != Settings().storage.state_dir
 
 

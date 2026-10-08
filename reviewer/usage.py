@@ -1,9 +1,9 @@
 """Per-review token/cost accounting.
 
 Every AI call records (tier, model, provider, tokens) into a per-review
-tracker held in a contextvar; the pipeline persists one JSONL entry per
-review through `UsageLog` (logs/usage.jsonl), whose `aggregate()` folds that
-file into overall stats for the /stats endpoint. `Pricing` turns tokens into
+tracker held in a contextvar; the use cases persist one entry per review
+through `UsageLog` (the `usage` table in state/reviewer.db + logs/usage.jsonl),
+whose `aggregate()` is the SQL behind the /stats endpoint. `Pricing` turns tokens into
 list-price dollars (curated table + MODEL_PRICES + live OpenRouter catalog).
 """
 
@@ -12,11 +12,13 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from .adapters.storage import Database
 from .config import DEFAULT_MODELS, match_model_key
 from .domain.events import ModelUsage, UsageSummary
 from .domain.models import Job
@@ -198,11 +200,15 @@ def record(**kwargs) -> None:
 
 
 class UsageLog:
-    """logs/usage.jsonl: one entry per review/dialogue. Fail-open — the logs
-    dir can be unwritable (bind-mount ownership); accounting never breaks a review."""
+    """One entry per review/dialogue: the `usage` table in state/reviewer.db
+    (what /stats aggregates, in SQL) plus logs/usage.jsonl, still written in
+    parallel for a while (grep-able, and the rollback path). Fail-open — the
+    logs dir can be unwritable (bind-mount ownership); accounting never
+    breaks a review."""
 
-    def __init__(self, log_dir: str | Path) -> None:
+    def __init__(self, log_dir: str | Path, db: Database | None = None) -> None:
         self.path = Path(log_dir) / "usage.jsonl"
+        self.db = db if db is not None else Database.memory()
 
     def persist(self, tracker: UsageTracker, job: Job) -> None:
         """Append one per-review entry; never let accounting break a review."""
@@ -223,60 +229,59 @@ class UsageLog:
         }
         logger.info("usage: %s !%s — %s", entry["project"], entry["mr_iid"],
                     tracker.summary_line())
+        self.insert(entry)
         try:
             path = self.path
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as exc:
+            logger.warning("usage.jsonl append failed (%s)", exc)
+
+    def insert(self, entry: dict) -> None:
+        """One entry into the usage table (also the usage.jsonl import path)."""
+        try:
+            self.db.execute(
+                "INSERT INTO usage (ts, kind, instance, project, mr_iid, input_tokens, "
+                "cached_tokens, cache_savings_usd, output_tokens, cost_usd, entry) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry.get("ts") or "", entry.get("kind") or "review",
+                 entry.get("instance") or "", entry.get("project") or "",
+                 entry.get("mr_iid"), entry.get("input_tokens", 0),
+                 entry.get("cached_tokens", 0), entry.get("cache_savings_usd", 0.0),
+                 entry.get("output_tokens", 0), entry.get("cost_usd", 0.0),
+                 json.dumps(entry, ensure_ascii=False)))
+        except sqlite3.Error as exc:
             logger.warning("usage persist failed (%s) — stats entry lost", exc)
 
-
     def aggregate(self) -> dict:
-        """Overall stats from usage.jsonl for the /stats endpoint and dashboard."""
-        totals = {"reviews": 0, "input_tokens": 0, "cached_tokens": 0,
-                  "output_tokens": 0, "cost_usd": 0.0, "cache_savings_usd": 0.0}
+        """Overall stats for the /stats endpoint and dashboard (SQL over the
+        usage table — no longer a full read of usage.jsonl per request)."""
+        q = self.db.query
+        row = q("SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), "
+                "COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(output_tokens), 0), "
+                "COALESCE(SUM(cost_usd), 0), COALESCE(SUM(cache_savings_usd), 0) "
+                "FROM usage")[0]
+        totals = {"reviews": row[0], "input_tokens": row[1], "cached_tokens": row[2],
+                  "output_tokens": row[3], "cost_usd": round(row[4], 6),
+                  "cache_savings_usd": round(row[5], 6)}
         models: dict[str, dict] = {}
-        daily: dict[str, dict] = {}
-        recent: list[dict] = []
-        try:
-            with self.path.open(encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    totals["reviews"] += 1
-                    totals["input_tokens"] += entry.get("input_tokens", 0)
-                    totals["cached_tokens"] += entry.get("cached_tokens", 0)
-                    totals["output_tokens"] += entry.get("output_tokens", 0)
-                    totals["cost_usd"] = round(
-                        totals["cost_usd"] + entry.get("cost_usd", 0.0), 6)
-                    totals["cache_savings_usd"] = round(
-                        totals["cache_savings_usd"]
-                        + entry.get("cache_savings_usd", 0.0), 6)
-                    for model, stats in (entry.get("models") or {}).items():
-                        m = models.setdefault(model, {
-                            "calls": 0, "input_tokens": 0, "cached_tokens": 0,
-                            "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                            "output_tokens": 0, "cost_usd": 0.0})
-                        m["calls"] += stats.get("calls", 0)
-                        m["input_tokens"] += stats.get("input_tokens", 0)
-                        m["cached_tokens"] += stats.get("cached_tokens", 0)
-                        m["cache_read_tokens"] += stats.get("cache_read_tokens", 0)
-                        m["cache_creation_tokens"] += stats.get(
-                            "cache_creation_tokens", 0)
-                        m["output_tokens"] += stats.get("output_tokens", 0)
-                        m["cost_usd"] = round(
-                            m["cost_usd"] + stats.get("cost_usd", 0.0), 6)
-                    day = (entry.get("ts") or "")[:10]
-                    if day:
-                        d = daily.setdefault(day, {"reviews": 0, "cost_usd": 0.0})
-                        d["reviews"] += 1
-                        d["cost_usd"] = round(
-                            d["cost_usd"] + entry.get("cost_usd", 0.0), 6)
-                    recent.append(entry)
-        except FileNotFoundError:
-            pass
-        return {"totals": totals, "by_model": models, "daily": daily,
-                "recent": recent[-20:]}
+        for m in q("SELECT m.key, "
+                   "SUM(COALESCE(json_extract(m.value, '$.calls'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.input_tokens'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.cached_tokens'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.cache_read_tokens'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.cache_creation_tokens'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.output_tokens'), 0)), "
+                   "SUM(COALESCE(json_extract(m.value, '$.cost_usd'), 0)) "
+                   "FROM usage, json_each(usage.entry, '$.models') AS m "
+                   "GROUP BY m.key ORDER BY m.key"):
+            models[m[0]] = {"calls": m[1], "input_tokens": m[2], "cached_tokens": m[3],
+                            "cache_read_tokens": m[4], "cache_creation_tokens": m[5],
+                            "output_tokens": m[6], "cost_usd": round(m[7], 6)}
+        daily = {d[0]: {"reviews": d[1], "cost_usd": round(d[2], 6)}
+                 for d in q("SELECT substr(ts, 1, 10) AS day, COUNT(*), SUM(cost_usd) "
+                            "FROM usage WHERE ts != '' GROUP BY day ORDER BY day")}
+        recent = [json.loads(r[0]) for r in
+                  q("SELECT entry FROM usage ORDER BY id DESC LIMIT 20")][::-1]
+        return {"totals": totals, "by_model": models, "daily": daily, "recent": recent}

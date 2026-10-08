@@ -3,50 +3,59 @@
 On the first review of an MR the whole diff is reviewed; on subsequent pushes
 only the delta since the last reviewed SHA is (developer feedback 2026-07-23:
 full re-reviews rehashed remarks about earlier commits on every push).
-Persisted to the state volume; bounded; fail-open — losing state just means
-the next review is a full one.
+Persisted in state/reviewer.db (table reviewed_shas); bounded; fail-open —
+losing state just means the next review is a full one.
 """
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from pathlib import Path
 
-from .json_store import JsonStore
+from .adapters.storage import Database, as_database
 
-MAX_ENTRIES = 500  # oldest-inserted dropped beyond this
-FILENAME = "reviewed_shas.json"
+logger = logging.getLogger(__name__)
 
-
-def _parse(data) -> dict[str, str]:
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+MAX_ENTRIES = 500  # least recently written dropped beyond this
+FILENAME = "reviewed_shas.json"  # the pre-SQLite file, imported once at startup
 
 
-def _key(instance: str, project_id, mr_iid) -> str:
+def mr_key(instance: str, project_id, mr_iid) -> str:
     return f"{instance}:{project_id}:{mr_iid}"
 
 
 class ReviewStateStore:
-    """state_dir/reviewed_shas.json: (instance, project, iid) -> last reviewed sha."""
+    """(instance, project, iid) -> last reviewed sha."""
 
-    def __init__(self, state_dir: str | Path, max_entries: int = MAX_ENTRIES) -> None:
+    def __init__(self, db: Database | str | Path, max_entries: int = MAX_ENTRIES) -> None:
+        self.db = as_database(db)
         self.max_entries = max_entries
-        self._store: JsonStore[dict[str, str]] = JsonStore(
-            Path(state_dir) / FILENAME, parse=_parse, empty=dict, label="review state")
 
     def get_last_sha(self, instance: str, project_id, mr_iid) -> str | None:
-        return self._store.read().get(_key(instance, project_id, mr_iid)) or None
+        try:
+            rows = self.db.query("SELECT sha FROM reviewed_shas WHERE mr_key = ?",
+                                 (mr_key(instance, project_id, mr_iid),))
+        except sqlite3.Error as exc:
+            logger.warning("review state not readable (%s) — full review", exc)
+            return None
+        return (rows[0][0] or None) if rows else None
 
     def set_last_sha(self, instance: str, project_id, mr_iid, sha: str) -> None:
         if not sha:
             return
-        key = _key(instance, project_id, mr_iid)
+        self.put(mr_key(instance, project_id, mr_iid), sha)
 
-        def _put(old: dict[str, str]) -> dict[str, str]:
-            state = dict(old)
-            state.pop(key, None)  # re-insert as newest
-            state[key] = sha
-            while len(state) > self.max_entries:
-                state.pop(next(iter(state)))
-            return state
-
-        self._store.update(_put)
+    def put(self, key: str, sha: str) -> None:
+        try:
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO reviewed_shas (mr_key, sha, seq) VALUES "
+                    "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM reviewed_shas)) "
+                    "ON CONFLICT (mr_key) DO UPDATE SET sha = excluded.sha, "
+                    "seq = excluded.seq", (key, sha))
+                conn.execute(
+                    "DELETE FROM reviewed_shas WHERE mr_key NOT IN (SELECT mr_key FROM "
+                    "reviewed_shas ORDER BY seq DESC LIMIT ?)", (self.max_entries,))
+        except sqlite3.Error as exc:
+            logger.warning("review state not persisted (%s)", exc)
