@@ -29,7 +29,8 @@ from reviewer.server import ReviewQueue
 from tests.factories import (
     INSTANCE,
     dialogue_job,
-    make_pipeline,
+    make_answer_note,
+    make_review_mr,
     make_services,
     make_settings,
     mr_ref,
@@ -838,7 +839,7 @@ def test_process_skips_merged_or_closed_mr():
         gitlab.add_project(1).add_mr(2, changes=[], state=state)
         # the AI is unwired: touching it fails the test
         svc = make_services(vcs_for=lambda instance: gitlab)
-        asyncio.run(svc.pipeline.review_mr.run(review_job(), {}))
+        asyncio.run(svc.review_mr.run(review_job(), {}))
         assert svc.telegram.messages == []
         assert [c[0] for c in gitlab.calls] == ["mr_get"]  # no notes, no diffs
 
@@ -1105,7 +1106,7 @@ def test_process_skips_already_reviewed_sha(tmp_path):
     svc = make_services(make_settings(tmp_path), vcs_for=lambda instance: gitlab)
     job = review_job(last_commit="abc123")
     svc.review_state.set_last_sha(*job.ref.key, "abc123")
-    asyncio.run(svc.pipeline.review_mr.run(job, {}))
+    asyncio.run(svc.review_mr.run(job, {}))
     assert svc.telegram.messages == []
     assert [c[0] for c in gitlab.calls] == ["mr_get"]
 
@@ -1493,7 +1494,7 @@ def test_thread_helpers():
     assert asyncio.run(broken.find_discussion(mr_ref(), 5, "d9")) is None
 
 
-def test_dialogue_answers_in_thread():
+def test_dialogue_answers_in_thread(tmp_path):
     # "Пусть сам подтверждает" — the bot answers a dev's reply, checking the
     # repo itself; NO_REPLY suppresses the answer; budget caps runaway threads
     from reviewer.ai_client import AIResult
@@ -1520,13 +1521,13 @@ def test_dialogue_answers_in_thread():
             seen_prompts.append(user)
             return next(answers)
 
-    cfg = make_settings(pipeline__language="en")
-    p = make_pipeline(cfg, ai=StubAI(), repo_cache=_NoRepo(),
+    cfg = make_settings(tmp_path, pipeline__language="en")
+    p = make_answer_note(cfg, ai=StubAI(), repo_cache=_NoRepo(),
                       vcs_for=lambda instance: gitlab)
     note = dialogue_job(project_id=1, project_path="g/p", mr_iid=10, note_id=question.id,
                         discussion_id=finding.discussion_id, note_body="точно?",
                         note_author="irina", last_commit="sha1")
-    asyncio.run(p.process_note(note))
+    asyncio.run(p.execute(note))
     assert mr.bot_notes == ["finding", "Checked views.py:12 — IsAuthenticated is intact."]
     assert ("discussion_reply", finding.discussion_id) in gitlab.calls
     # the model sees the thread, knows which side it is, and the diff
@@ -1536,23 +1537,23 @@ def test_dialogue_answers_in_thread():
 
     # a newer question in the same thread; NO_REPLY -> nothing posted
     again = mr.add_note("ещё?", author="irina", discussion_id=finding.discussion_id)
-    asyncio.run(p.process_note(replace(note, note_id=again.id, note_body="ещё?")))
+    asyncio.run(p.execute(replace(note, note_id=again.id, note_body="ещё?")))
     assert len(mr.bot_notes) == 2
 
     # the bot's own note must never trigger an answer (loop guard)
-    asyncio.run(p.process_note(replace(note, note_id=4, note_author="reviewer-bot")))
+    asyncio.run(p.execute(replace(note, note_id=4, note_author="reviewer-bot")))
     assert len(mr.bot_notes) == 2
 
     # a thread without the bot and without a mention is the humans talking
     chat = mr.add_note("hi", author="artem")
-    asyncio.run(p.process_note(replace(note, note_id=chat.id, note_author="artem",
+    asyncio.run(p.execute(replace(note, note_id=chat.id, note_author="artem",
                                        discussion_id=chat.discussion_id, note_body="hi")))
     assert len(mr.bot_notes) == 2
 
     # per-MR budget: once exhausted the bot stays silent
     cfg.pipeline.dialogue_max_replies_per_mr = 1
-    assert p._dialogue_budget_ok(("primary", 1, 10)) is False
-    assert p._dialogue_budget_ok(("primary", 1, 11)) is True
+    assert p.budget.allows(("primary", 1, 10)) is False
+    assert p.budget.allows(("primary", 1, 11)) is True
 
 
 def test_review_with_tools_verifies_and_falls_back(monkeypatch):
@@ -1889,8 +1890,8 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
     monkeypatch.setattr(ReviewMergeRequest, "run", fake_inner)
     monkeypatch.setattr(ReviewMergeRequest, "_safe_note", fake_note)
 
-    p = make_pipeline(telegram=SimpleNamespace(notify_error=fake_alert))
-    asyncio.run(p.process(review_job(job_id="deadbeef")))
+    p = make_review_mr(telegram=SimpleNamespace(notify_error=fake_alert))
+    asyncio.run(p.execute(review_job(job_id="deadbeef")))
     assert len(notes) == 1
     assert "10.0.0.5" not in notes[0] and "/srv/app" not in notes[0]
     assert "deadbeef" in notes[0]
@@ -2313,7 +2314,7 @@ def test_composition_root_builds_independent_graphs(tmp_path):
 
     ru = make_services(make_settings(tmp_path / "a", pipeline__language="ru"))
     en = make_services(make_settings(tmp_path / "b", pipeline__language="en"))
-    assert ru.pipeline is not en.pipeline and ru.queue is not en.queue
+    assert ru.review_mr is not en.review_mr and ru.queue is not en.queue
     assert ru.telegram.language == "ru" and en.telegram.language == "en"
     job = review_job(last_commit="abc")
     ru.review_state.set_last_sha(*job.ref.key, "abc")

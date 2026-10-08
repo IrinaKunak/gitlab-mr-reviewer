@@ -179,3 +179,22 @@ def test_cache_workspace_session(tmp_path):
 
 def test_triage_result_default_is_normal():
     assert TriageResult().complexity is Complexity.NORMAL
+
+
+def test_dialogue_budget_survives_restart_and_window(tmp_path):
+    # the reply budget used to live in memory: every deploy reset it mid-day
+    from reviewer.dialogue_budget import WINDOW_SECONDS, DialogueBudget
+
+    now = [1_000_000.0]
+    budget = DialogueBudget(tmp_path, lambda: 2, clock=lambda: now[0])
+    key = ("primary", 1, 7)
+    budget.record(key)
+    budget.record(key)
+    assert budget.allows(key) is False
+    assert budget.allows(("primary", 1, 8)) is True
+
+    restarted = DialogueBudget(tmp_path, lambda: 2, clock=lambda: now[0])
+    assert restarted.allows(key) is False
+
+    now[0] += WINDOW_SECONDS + 1  # a day later the MR may talk again
+    assert restarted.allows(key) is True

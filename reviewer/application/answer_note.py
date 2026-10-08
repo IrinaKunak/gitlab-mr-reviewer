@@ -1,72 +1,57 @@
-"""Review pipeline facade (refactoring stage 13).
+"""Use case: answer a developer's note in an MR discussion thread.
 
-The MR review itself is the `application.review_mr.ReviewMergeRequest` use
-case over the stages in `application/stages/`; this class still hosts the MR
-discussion dialogue until stage 14 moves it out.
-AI_PROVIDER=openrouter: every tier goes to OpenRouter, not only after a gateway failure.
+"Пусть сам подтверждает" (dev feedback 2026-07-31): instead of the reviewer
+asking humans to confirm things, humans can ask IT, and it checks the repo.
+Guards, in order: the bot's own note, a thread the bot is not part of (and no
+@mention), an already-answered note, the per-MR daily reply budget. The model
+may decline with NO_REPLY (acks, thanks). A failed reply is never posted — a
+broken answer must not spam the thread.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any, Protocol
 
-from . import prompts, usage
-from .ai_client import AIClient
-from .application import content
-from .application.common import bot_username, new_job_id
-from .application.ports import RepoWorkspace, VcsPort
-from .application.review_mr import ReviewMergeRequest
-from .application.stages import Translator, tester_report_targets
-from .bridge import ReviewBridge
-from .config import Settings
-from .domain.models import DialogueJob, InstanceRef, ReviewJob, Tier
-from .review_state import ReviewStateStore
-from .telegram_io import TelegramClient
-from .usage import UsageLog
+from .. import prompts, usage
+from ..config import Settings
+from ..domain.models import DialogueJob, InstanceRef, Tier
+from ..usage import UsageLog
+from . import content
+from .common import bot_username, new_job_id
+from .ports import RepoWorkspace, VcsPort
+from .stages import Translator
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Pipeline", "new_job_id", "tester_report_targets"]
-
 # dialogue replies get the diff as reference, capped — repo tools cover the rest
 DIALOGUE_DIFF_MAX_CHARS = 60_000
-DIALOGUE_WINDOW_SECONDS = 86_400  # per-MR reply budget window
+NO_REPLY = "NO_REPLY"
 
 
-class Pipeline:
-    def __init__(self, settings: Settings, *, ai: AIClient, telegram: TelegramClient,
-                 bridge: ReviewBridge, workspace: RepoWorkspace,
-                 review_state: ReviewStateStore, usage_log: UsageLog,
-                 vcs: Callable[[InstanceRef], VcsPort],
+class ReplyBudget(Protocol):
+    def allows(self, mr_key: tuple) -> bool: ...
+
+    def record(self, mr_key: tuple) -> None: ...
+
+
+class AnswerNote:
+    def __init__(self, settings: Settings, *, ai: Any, workspace: RepoWorkspace,
+                 usage_log: UsageLog, vcs: Callable[[InstanceRef], VcsPort],
+                 translator: Translator, budget: ReplyBudget,
                  pricing: usage.Pricing = usage.BUILTIN_PRICING) -> None:
         self.settings = settings
         self.ai = ai
-        self.telegram = telegram
         self.workspace = workspace
         self.usage_log = usage_log
-        self.pricing = pricing
-        # instance -> its VCS client (one per instance, built by bootstrap)
         self.vcs = vcs
-        self.translator = Translator(ai, settings.pipeline.language)
-        self.review_mr = ReviewMergeRequest(
-            settings, ai=ai, telegram=telegram, bridge=bridge, workspace=workspace,
-            review_state=review_state, usage_log=usage_log, vcs=vcs,
-            translator=self.translator, pricing=pricing)
-        # (instance, project_id, mr_iid) -> timestamps of dialogue replies sent
-        self._dialogue_replies: dict[tuple, list[float]] = {}
+        self.translator = translator
+        self.budget = budget
+        self.pricing = pricing
 
-    async def process(self, job: ReviewJob) -> None:
-        await self.review_mr.execute(job)
-
-    # --- MR discussion dialogue ---
-
-    async def process_note(self, job: DialogueJob) -> None:
-        """Answer a developer's reply in an MR discussion thread ("Пусть сам
-        подтверждает" — dev feedback 2026-07-31: instead of the reviewer asking
-        humans to confirm things, humans can now ask IT, and it checks the repo)."""
+    async def execute(self, job: DialogueJob) -> None:
         if not job.job_id:
             job = replace(job, job_id=new_job_id())
         logger.info("job %s: dialogue for note %s in MR !%s", job.job_id,
@@ -74,7 +59,7 @@ class Pipeline:
         tracker = usage.UsageTracker(self.pricing)
         tracker_token = usage.current_tracker.set(tracker)
         try:
-            await self._process_note_inner(job)
+            await self.run(job)
         except Exception:  # noqa: BLE001 — a failed reply must not spam the thread
             logger.exception("job %s: dialogue failed for note %s in MR !%s", job.job_id,
                              job.note_id, job.ref.mr_iid)
@@ -82,7 +67,7 @@ class Pipeline:
             usage.current_tracker.reset(tracker_token)
             self.usage_log.persist(tracker, job)
 
-    async def _process_note_inner(self, job: DialogueJob) -> None:
+    async def run(self, job: DialogueJob) -> None:
         ref, note_id = job.ref, job.note_id
         mr_iid = ref.mr_iid
         vcs = self.vcs(ref.instance)
@@ -103,7 +88,7 @@ class Pipeline:
         if content.bot_answered_after(notes, note_id, bot):
             logger.info("note %s: already answered — skipping", note_id)
             return
-        if not self._dialogue_budget_ok(ref.key):
+        if not self.budget.allows(ref.key):
             logger.warning("dialogue reply budget exhausted for MR !%s — staying "
                            "silent", mr_iid)
             return
@@ -125,7 +110,7 @@ class Pipeline:
                 max_tokens=4000)
 
         text = (result.text or "").strip()
-        if not text or text.upper().startswith("NO_REPLY"):
+        if not text or text.upper().startswith(NO_REPLY):
             logger.info("dialogue: nothing to answer in note %s", note_id)
             return
         reply = await self.translator.translate(text, tier=Tier.FAST)
@@ -140,20 +125,6 @@ class Pipeline:
         if not posted:
             quote = "\n".join("> " + line for line in job.note_body.splitlines()[:6])
             await vcs.post_note(ref, f"@{author}\n\n{quote}\n\n{reply}")
-        self._dialogue_replied(ref.key)
+        self.budget.record(ref.key)
         logger.info("dialogue: replied in MR !%s (thread %s)", mr_iid,
                     discussion_id or "new")
-
-    def _dialogue_budget_ok(self, key: tuple) -> bool:
-        now = time.time()
-        stamps = [t for t in self._dialogue_replies.get(key, ())
-                  if now - t < DIALOGUE_WINDOW_SECONDS]
-        self._dialogue_replies[key] = stamps
-        if len(self._dialogue_replies) > 500:  # bound the map itself
-            self._dialogue_replies = {
-                k: v for k, v in self._dialogue_replies.items()
-                if v and now - v[-1] < DIALOGUE_WINDOW_SECONDS}
-        return len(stamps) < self.settings.pipeline.dialogue_max_replies_per_mr
-
-    def _dialogue_replied(self, key: tuple) -> None:
-        self._dialogue_replies.setdefault(key, []).append(time.time())

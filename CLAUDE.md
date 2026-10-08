@@ -20,7 +20,7 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 
 - **reviewer/bootstrap.py** — composition root, the ONLY place that reads `.env`
   (`load_config`), configures logging and builds objects: `build_services(cfg, **fakes)`
-  → `Services` (settings, TelegramClient, ReviewBridge, AIClient, Pipeline, ReviewQueue,
+  → `Services` (settings, TelegramClient, ReviewBridge, AIClient, ReviewMergeRequest, AnswerNote, ReviewQueue,
   ModelOverrides, OpenRouterCatalog, Pricing, UsageLog, ReviewStateStore, gitlab client
   factory, `bot_usernames`) with `start()`/`stop()` (startup logs, state migration,
   workers, bridge listener, instance check). No module in `reviewer/` holds a
@@ -64,9 +64,12 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   review|dialogue` in usage.jsonl). The v1-parity (`PIPELINE_V2=off`) and
   `AI_PROVIDER=gemini` paths were removed in refactoring stage 6 (tag `v2-pre-cleanup`
   still has them)
-- **reviewer/pipeline.py** — facade over the use cases; `process_note` answers
-  developer replies in MR discussion threads (main tier + repo tools, `NO_REPLY`
-  sentinel, per-MR daily reply budget)
+- **reviewer/application/answer_note.py** — use case `AnswerNote`: answers developer
+  replies in MR discussion threads (main tier + repo tools, `NO_REPLY` sentinel);
+  guards: own note, not a bot thread and no @mention, already answered, per-MR daily
+  reply budget (`dialogue_budget.DialogueBudget`, `state/dialogue_replies.json` —
+  survives restarts). `application/jobs.JobRunner` routes a queued job to its use case.
+  `pipeline.py` is gone (stage 14).
 - **reviewer/ai_client.py** — Anthropic SDK via Cloudflare AI Gateway with OpenRouter
   fallback (Anthropic-compatible `/api/v1/messages`, `models` array failover); response
   cache (key includes `max_tokens` + effort), rate limiting, empty-response retry, agent

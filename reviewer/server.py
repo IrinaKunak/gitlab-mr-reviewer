@@ -29,11 +29,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__
 from .adapters.gitlab import parse_merge_request_webhook, parse_note_webhook
+from .application.common import new_job_id
+from .application.jobs import JobRunner
 from .config import ServerSection
 from .dashboard import DASHBOARD_HTML
 from .domain.dedupe import DedupePolicy
-from .domain.models import DialogueJob, Job, ReviewJob, Tier
-from .pipeline import Pipeline, new_job_id
+from .domain.models import Job, Tier
 
 if TYPE_CHECKING:  # bootstrap imports this module; the type is all we need
     from .bootstrap import Services
@@ -47,11 +48,11 @@ class ReviewQueue:
     """Bounded-concurrency MR processing with webhook-retry dedupe."""
 
     def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30, *,
-                 pipeline: Pipeline | None = None,
+                 runner: JobRunner | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.workers = workers
-        self.pipeline = pipeline  # None only for a queue that never starts workers
+        self.runner = runner  # None only for a queue that never starts workers
         self.dedupe = DedupePolicy(dedupe_ttl, burst_window)
         self.clock = clock
         self._tasks: list[asyncio.Task] = []
@@ -69,11 +70,8 @@ class ReviewQueue:
 
     async def run(self, job: Job) -> None:
         """Process one job (what a worker does with it)."""
-        assert self.pipeline is not None, "ReviewQueue without a pipeline cannot run jobs"
-        if isinstance(job, DialogueJob):
-            await self.pipeline.process_note(job)
-        elif isinstance(job, ReviewJob):
-            await self.pipeline.process(job)
+        assert self.runner is not None, "ReviewQueue without a runner cannot run jobs"
+        await self.runner.run(job)
 
     async def start(self) -> None:
         self._tasks = [asyncio.create_task(self._worker(i), name=f"review-worker-{i}")
@@ -91,7 +89,7 @@ class ReviewQueue:
             try:
                 await self.run(job)
             except Exception:  # noqa: BLE001 — workers must survive anything
-                logger.exception("worker %d: unhandled pipeline error", idx)
+                logger.exception("worker %d: unhandled job error", idx)
             finally:
                 self.queue.task_done()
 

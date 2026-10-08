@@ -89,5 +89,9 @@ def make_services(cfg: Any = None, **deps: Any) -> Any:
     return build_services(cfg, **deps)
 
 
-def make_pipeline(cfg: Any = None, **deps: Any) -> Any:
-    return make_services(cfg, **deps).pipeline
+def make_review_mr(cfg: Any = None, **deps: Any) -> Any:
+    return make_services(cfg, **deps).review_mr
+
+
+def make_answer_note(cfg: Any = None, **deps: Any) -> Any:
+    return make_services(cfg, **deps).answer_note

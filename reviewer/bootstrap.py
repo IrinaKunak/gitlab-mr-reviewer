@@ -24,7 +24,11 @@ from dotenv import load_dotenv
 from . import __version__, state_layout
 from .adapters.gitlab import GitLabVcs
 from .ai_client import AIClient
+from .application.answer_note import AnswerNote
+from .application.jobs import JobRunner
 from .application.ports import VcsPort
+from .application.review_mr import ReviewMergeRequest
+from .application.stages import Translator
 from .bridge import ReviewBridge
 from .config import (
     Settings,
@@ -33,10 +37,10 @@ from .config import (
     masked_dump,
     retired_env_vars_in_use,
 )
+from .dialogue_budget import DialogueBudget
 from .domain.models import InstanceRef
 from .openrouter_models import OpenRouterCatalog
 from .overrides import ModelOverrides
-from .pipeline import Pipeline
 from .repo_cache import CacheWorkspace, RepoCache
 from .review_state import ReviewStateStore
 from .server import ReviewQueue
@@ -69,7 +73,8 @@ class Services:
     telegram: TelegramClient
     bridge: Any  # ReviewBridge, or a scripted fake with the same enabled/ask/start/stop
     ai: Any  # AIClient, or a scripted fake
-    pipeline: Pipeline
+    review_mr: ReviewMergeRequest
+    answer_note: AnswerNote
     queue: ReviewQueue
     overrides: ModelOverrides
     catalog: OpenRouterCatalog
@@ -146,14 +151,21 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
         vcs_for = lambda instance: clients[instance.name]  # noqa: E731
     review_state = ReviewStateStore(state_dir)
     usage_log = UsageLog(cfg.storage.log_dir)
-    pipeline = Pipeline(cfg, ai=ai, telegram=telegram, bridge=bridge,
-                        workspace=CacheWorkspace(repo_cache),
-                        review_state=review_state, usage_log=usage_log, pricing=pricing,
-                        vcs=vcs_for)
+    workspace = CacheWorkspace(repo_cache)
+    translator = Translator(ai, cfg.pipeline.language)
+    review_mr = ReviewMergeRequest(
+        cfg, ai=ai, telegram=telegram, bridge=bridge, workspace=workspace,
+        review_state=review_state, usage_log=usage_log, vcs=vcs_for,
+        translator=translator, pricing=pricing)
+    answer_note = AnswerNote(
+        cfg, ai=ai, workspace=workspace, usage_log=usage_log, vcs=vcs_for,
+        translator=translator, pricing=pricing,
+        budget=DialogueBudget(state_dir, lambda: cfg.pipeline.dialogue_max_replies_per_mr))
     queue = ReviewQueue(cfg.server.workers if workers is None else workers,
                         cfg.dedupe.ttl, cfg.dedupe.burst_seconds,
-                        pipeline=pipeline, clock=clock)
-    return Services(settings=cfg, telegram=telegram, bridge=bridge, ai=ai, pipeline=pipeline,
+                        runner=JobRunner(review_mr, answer_note), clock=clock)
+    return Services(settings=cfg, telegram=telegram, bridge=bridge, ai=ai,
+                    review_mr=review_mr, answer_note=answer_note,
                     queue=queue, overrides=overrides, catalog=catalog, pricing=pricing,
                     usage_log=usage_log, review_state=review_state, vcs_for=vcs_for)
 
