@@ -134,7 +134,7 @@ def build_services(cfg: Settings, *, telegram: TelegramClient | None = None,
     telegram = telegram or TelegramClient(cfg.notify.telegram, proxy_url=cfg.network.proxy_url,
                                           language=cfg.pipeline.language)
     catalog = catalog or OpenRouterCatalog(state_dir, proxy_url=cfg.network.proxy_url)
-    pricing = Pricing(cfg.llm.prices, catalog)
+    pricing = Pricing(cfg.llm.price_table(), catalog)
     overrides = ModelOverrides(state_dir, cfg)
     ai = ai or AIClient(cfg, overrides=overrides, alert=telegram.notify_error)
     bridge = bridge or ReviewBridge(cfg.bridge, telegram)

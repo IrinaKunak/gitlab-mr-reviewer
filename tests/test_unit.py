@@ -13,6 +13,7 @@ import pytest
 
 from reviewer import ai_client as ai_mod
 from reviewer import bridge as bridge_mod
+from reviewer import llm_requests
 from reviewer.adapters.gitlab import (
     GitLabVcs,
     parse_merge_request_webhook,
@@ -97,8 +98,8 @@ def test_openrouter_provider_skips_gateway(tmp_path):
     assert seen["chain"][0] == "anthropic/claude-sonnet-5"
     assert seen["primary_built"] is False
     # default provider still keeps plain Claude ids on the gateway
-    assert ai_mod.uses_openrouter("anthropic", "claude-sonnet-5") is False
-    assert ai_mod.uses_openrouter("anthropic", "openai/gpt-5.6-terra") is True
+    assert llm_requests.uses_openrouter("anthropic", "claude-sonnet-5") is False
+    assert llm_requests.uses_openrouter("anthropic", "openai/gpt-5.6-terra") is True
 
 
 # --- ai_client helpers ---
@@ -116,6 +117,10 @@ def test_cache_roundtrip(tmp_path):
     cfg.llm.cache_ttl = 3600
     client = AIClient(cfg)
     key = client._cache_key("m", "sys", "user")
+    # #22: a different output budget or effort is a different request
+    assert client._cache_key("m", "sys", "user", 4096, None) == key
+    assert client._cache_key("m", "sys", "user", 16000, None) != key
+    assert client._cache_key("m", "sys", "user", 4096, "high") != key
     assert client._cache_get(key) is None
     client._cache_put(key, "result text")
     assert client._cache_get(key) == "result text"
@@ -210,50 +215,84 @@ def test_gateway_auth_modes():
     assert primary3.default_headers.get("cf-aig-authorization") is None
 
 
-def test_primary_params_per_tier():
-    client = AIClient(Settings())
-    assert client._primary_params("fast", None) == {}        # Haiku: no thinking/effort
-    smart = client._primary_params("smart", "high")
-    assert smart["thinking"] == {"type": "adaptive"}
-    assert smart["output_config"] == {"effort": "high"}
-    # main tier: thinking EXPLICITLY disabled — sonnet-5 runs adaptive thinking
-    # when the param is omitted (changed from sonnet-4-6), and it consumed the
-    # whole max_tokens budget before any text on big diffs (prod 2026-07-22)
-    assert client._primary_params("main", None) == {"thinking": {"type": "disabled"}}
-    assert client._primary_params("main", "high") == {"thinking": {"type": "disabled"}}
-    # claude-opus-5 rejects disabled thinking at effort xhigh/max — effort must
-    # never be emitted alongside it, whatever the caller passes
-    for eff in (None, "high", "xhigh", "max"):
-        assert "output_config" not in client._primary_params("main", eff, "claude-opus-5")
-    # smart tier keeps adaptive + effort, which opus-5 accepts
-    assert client._primary_params("smart", "high", "claude-opus-5") == {
-        "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
-
-
-def test_primary_params_models_without_disabled_thinking():
-    # prod 2026-09-29 (!127): main switched to claude-sonnet-5-5 -> 400
-    # '"thinking.type.disabled" is not supported for this model'
-    client = AIClient(Settings())
-    for eff in (None, "high", "xhigh", "max"):
-        # between_tools takes no other field and 400s at effort xhigh/max
-        assert client._primary_params("main", eff, "claude-sonnet-5-5") == {
-            "thinking": {"type": "between_tools"}}
+# 12.5: the model table reproduces the old per-model branches one for one —
+# (tier, model, requested effort) -> thinking/effort params sent on the gateway
+_ADAPTIVE = {"type": "adaptive"}
+_PARAM_CASES = [
+    # haiku: any thinking param or effort is a 400 — nothing on any tier
+    ("fast", "claude-haiku-4-5", None, {}),
+    ("main", "claude-haiku-4-5-20251001", "high", {}),
+    ("smart", "claude-haiku-4-5", "high", {}),
+    # fast: thinking param omitted whatever the model
+    ("fast", "claude-sonnet-5", "high", {}),
+    # main: thinking OFF the model's own way, never an effort
+    # (sonnet-5 runs ADAPTIVE when the param is omitted — prod 2026-07-22)
+    ("main", "claude-sonnet-5", None, {"thinking": {"type": "disabled"}}),
+    ("main", "claude-sonnet-5", "high", {"thinking": {"type": "disabled"}}),
+    ("main", "claude-sonnet-4-6", "high", {"thinking": {"type": "disabled"}}),
+    ("main", "claude-opus-4-8", "high", {"thinking": {"type": "disabled"}}),
+    # opus-5: disabled thinking is a 400 at xhigh/max -> effort never sent
+    ("main", "claude-opus-5", "xhigh", {"thinking": {"type": "disabled"}}),
+    ("main", "claude-opus-5", "max", {"thinking": {"type": "disabled"}}),
+    # sonnet-5-5 400s on "disabled" (prod 2026-09-29, !127); between_tools
+    # takes no other field and 400s at xhigh/max
+    ("main", "claude-sonnet-5-5", None, {"thinking": {"type": "between_tools"}}),
+    ("main", "claude-sonnet-5-5", "max", {"thinking": {"type": "between_tools"}}),
+    ("main", "claude-sonnet-5-5-20261001", "high", {"thinking": {"type": "between_tools"}}),
     # no thinking-off mode at all: adaptive at the lowest effort
-    for model in ("claude-opus-5-5", "claude-fable-5-1"):
-        assert client._primary_params("main", None, model) == {
-            "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
-    # older main models keep the explicit disable
-    assert client._primary_params("main", None, "claude-sonnet-5") == {
-        "thinking": {"type": "disabled"}}
-    assert client._primary_params("smart", "high", "claude-sonnet-5-5") == {
-        "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+    ("main", "claude-opus-5-5", None, {"thinking": _ADAPTIVE, "output_config": {"effort": "low"}}),
+    ("main", "claude-fable-5-1", "high",
+     {"thinking": _ADAPTIVE, "output_config": {"effort": "low"}}),
+    ("main", "claude-mythos-1", None, {"thinking": _ADAPTIVE, "output_config": {"effort": "low"}}),
+    # an unknown future model gets the explicit disable (the safe default)
+    ("main", "claude-sonnet-6", None, {"thinking": {"type": "disabled"}}),
+    # smart: adaptive + the caller's effort (the investigator thinks)
+    ("smart", "claude-opus-5", "high", {"thinking": _ADAPTIVE, "output_config": {"effort": "high"}}),
+    ("smart", "claude-sonnet-5-5", "high",
+     {"thinking": _ADAPTIVE, "output_config": {"effort": "high"}}),
+    ("smart", "claude-opus-5-5", "max", {"thinking": _ADAPTIVE, "output_config": {"effort": "max"}}),
+    ("smart", "claude-opus-5", None, {"thinking": _ADAPTIVE}),
+]
+
+
+@pytest.mark.parametrize(("tier", "model", "effort", "expected"), _PARAM_CASES)
+def test_thinking_params_per_model(tier, model, effort, expected):
+    builder = llm_requests.RequestBuilder(Settings())
+    assert builder.thinking_params(tier, model, effort) == expected
+    request = builder.gateway(tier, model, "sys", [{"role": "user", "content": "u"}], 100,
+                              effort=effort)
+    assert {k: v for k, v in request.items() if k in ("thinking", "output_config")} == expected
+    # never an effort on the main tier unless the table allows it with thinking off
+    if tier == "main" and builder.cfg.llm.model_spec(model).thinking_off != "none":
+        assert "output_config" not in request
+
+
+def test_model_table_is_config_not_code(tmp_path, monkeypatch):
+    # #8: a new model's thinking mode is a config.yaml entry, not a release
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "llm:\n  models:\n    claude-sonnet-6:\n      thinking_off: between_tools\n"
+        "      price: [3, 15]\n    claude-sonnet-5:\n      thinking_off: disabled\n"
+        "      max_effort_with_thinking_off: high\n", encoding="utf-8")
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
+    cfg = Settings()
+    builder = llm_requests.RequestBuilder(cfg)
+    assert builder.thinking_params("main", "claude-sonnet-6", None) == {
+        "thinking": {"type": "between_tools"}}
+    # an effort cap lets main send effort with thinking off, up to the cap only
+    assert builder.thinking_params("main", "claude-sonnet-5", "high") == {
+        "thinking": {"type": "disabled"}, "output_config": {"effort": "high"}}
+    assert "output_config" not in builder.thinking_params("main", "claude-sonnet-5", "max")
+    assert cfg.llm.price_table()["claude-sonnet-6"] == (3.0, 15.0)
+    assert "claude-opus-5" in cfg.llm.models  # built-in entries stay
 
 
 def test_openrouter_models_array_capped():
     # prod !779: smart overridden to openai/gpt-5.6-terra + a 3-entry fallback
     # chain -> 4 models -> OpenRouter 400 "'models' array must have 3 items or
     # fewer" -> the whole investigation was lost after the review had run
-    from reviewer.ai_client import MAX_OPENROUTER_MODELS, _routing_chain
+    from reviewer.llm_requests import MAX_OPENROUTER_MODELS
+    from reviewer.llm_requests import routing_chain as _routing_chain
 
     chain = ["anthropic/claude-opus-5", "google/gemini-3.6-flash",
              "deepseek/deepseek-v4-pro"]
@@ -506,7 +545,7 @@ def test_agent_loop_marks_prompt_cache_breakpoints(tmp_path, monkeypatch):
     assert sent[-1][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
 
     # OpenRouter models auto-cache and may reject the marker — strip it there
-    stripped = ai_mod._strip_cache_control(sent[-1])
+    stripped = llm_requests.strip_cache_control(sent[-1])
     assert breakpoints(stripped) == []
     assert stripped[0]["content"][0]["text"] == "big diff"  # content preserved
 
@@ -567,7 +606,7 @@ def test_openrouter_agent_loop_keeps_cache_control_for_claude(tmp_path, monkeypa
 
     other = run("openai/gpt-5.6-terra")
     assert all(breakpoints(req["messages"]) == [] for req in other)
-    assert ai_mod.wants_cache_control(False, "claude-sonnet-5-5") is True
+    assert llm_requests.wants_cache_control(False, "claude-sonnet-5-5") is True
 
 
 def test_cached_prompt_tokens_are_counted(tmp_path, monkeypatch):
@@ -1249,7 +1288,7 @@ def test_strip_thinking_blocks():
             {"type": "tool_use", "id": "1", "name": "t", "input": {}},
         ]},
     ]
-    cleaned = ai_mod._strip_thinking(messages)
+    cleaned = llm_requests.strip_thinking(messages)
     types = [b["type"] for b in cleaned[1]["content"]]
     assert types == ["text", "tool_use"]
     assert messages[1]["content"][0]["type"] == "thinking"  # original untouched

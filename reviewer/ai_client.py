@@ -1,5 +1,8 @@
 """Tiered AI client. Replaces gemini-wrapper.sh.
 
+Request bodies, routing and the per-model thinking policy live in
+llm_requests.RequestBuilder (driven by the model table in config).
+
 Primary:  Anthropic Messages API via Cloudflare AI Gateway.
           cfut_ gateway tokens go in the `cf-aig-authorization: Bearer ...` header
           (NOT x-api-key); a real Anthropic key is passed as api_key directly.
@@ -34,17 +37,15 @@ from . import usage
 from .config import Settings
 from .domain.models import Tier
 from .json_store import atomic_write_text
+from .llm_requests import CACHE_CONTROL, RequestBuilder, Route
 from .overrides import ModelOverrides
+from .usage import UsageAccumulator
 
 logger = logging.getLogger(__name__)
 
 # appended when a response hits max_tokens; a result that is ONLY this marker
 # produced no visible text (adaptive thinking consumed the whole output budget)
 TRUNCATION_MARKER = "*[response truncated at the output limit]*"
-
-# thinking:{"type":"disabled"} is a 400 on these at every effort level, and
-# they have no thinking-off mode (sonnet-5-5 has one: "between_tools")
-_ALWAYS_THINKING_PREFIXES = ("claude-opus-5-5", "claude-fable", "claude-mythos")
 
 # Cross-vendor fallbacks may reject Anthropic-specific params — sent only to primary.
 _RETRYABLE = (
@@ -66,87 +67,6 @@ def _should_fallback(exc: Exception) -> bool:
     if isinstance(exc, anthropic.APIStatusError):
         return exc.status_code == 429 or exc.status_code >= 500
     return False
-
-
-# Anthropic prompt caching is OPT-IN: without a cache_control breakpoint every
-# agent-loop iteration re-bills the whole repo/diff prefix at full price. (The
-# auto-caching models we reach through OpenRouter do this for us — that asymmetry
-# is why terra investigations cost ~half what the same loop costs on the gateway.)
-CACHE_CONTROL = {"type": "ephemeral"}  # 5-min TTL: reads 0.1x, writes 1.25x
-
-# OpenRouter rejects a longer models array with a 400 ("'models' array must have
-# 3 items or fewer") — prepending a runtime override to a 3-entry chain hits it
-MAX_OPENROUTER_MODELS = 3
-
-
-def _routing_chain(model: str, chain: list[str]) -> list[str]:
-    """Preferred model first, then its fallbacks, deduped and length-capped."""
-    ordered = [model] + [m for m in chain if m != model] if model else list(chain)
-    return ordered[:MAX_OPENROUTER_MODELS]
-
-
-def uses_openrouter(provider: str, model: str) -> bool:
-    """OpenRouter is the route when chosen explicitly, or when the model id is
-    vendor-prefixed (the CF gateway cannot serve openai/gpt-*, google/gemini-*)."""
-    return provider == "openrouter" or "/" in model
-
-
-def openrouter_model(model: str, chain: list[str]) -> str:
-    """Id to send to OpenRouter. A slash id is used as-is; a plain Claude id
-    (AI_PROVIDER=openrouter with the default ANTHROPIC_*_MODEL) maps to the
-    head of that tier's OPENROUTER_FALLBACK_* chain."""
-    if "/" in model:
-        return model
-    return chain[0] if chain else model
-
-
-def wants_cache_control(via_openrouter: bool, model: str) -> bool:
-    """Explicit cache breakpoints: always on the gateway, and on OpenRouter for
-    anthropic/* — Claude does NOT auto-cache there (only OpenAI/Gemini/DeepSeek
-    do), so stripping the markers billed every agent turn at full price
-    (!493 via AI_PROVIDER=openrouter: 1.57M input, 0 cached, $6.05)."""
-    return not via_openrouter or model.startswith("anthropic/")
-
-
-def _openrouter_messages(messages: list[dict], model: str) -> list[dict]:
-    """Messages as sent to OpenRouter: thinking blocks always dropped,
-    cache_control kept only when the head model needs explicit caching."""
-    if not wants_cache_control(True, model):
-        messages = _strip_cache_control(messages)
-    return _strip_thinking(messages)
-
-
-def _strip_cache_control(messages: list[dict]) -> list[dict]:
-    """Remove cache_control markers before sending to OpenRouter — cross-vendor
-    models auto-cache and may reject Anthropic-specific block fields."""
-    cleaned: list[dict] = []
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, list):
-            content = [{k: v for k, v in block.items() if k != "cache_control"}
-                       if isinstance(block, dict) else block
-                       for block in content]
-            cleaned.append({**message, "content": content})
-        else:
-            cleaned.append(message)
-    return cleaned
-
-
-def _strip_thinking(messages: list[dict]) -> list[dict]:
-    """Drop thinking blocks from assistant turns for cross-vendor fallback requests
-    (non-Claude models can reject replayed thinking blocks with no thinking param)."""
-    cleaned: list[dict] = []
-    for message in messages:
-        content = message.get("content")
-        if message.get("role") == "assistant" and isinstance(content, list):
-            content = [block for block in content
-                       if getattr(block, "type", None) not in ("thinking", "redacted_thinking")
-                       and (not isinstance(block, dict)
-                            or block.get("type") not in ("thinking", "redacted_thinking"))]
-            cleaned.append({**message, "content": content})
-        else:
-            cleaned.append(message)
-    return cleaned
 
 
 class AIError(Exception):
@@ -249,6 +169,7 @@ class AIClient:
         self._debug_failed = False
         self._primary: AsyncAnthropic | None = None
         self._fallback: AsyncAnthropic | None = None
+        self.requests = RequestBuilder(cfg)
 
     def _model_for(self, tier: Tier) -> str:
         if self.overrides is not None:
@@ -305,18 +226,7 @@ class AIClient:
             )
         return self._fallback
 
-    # --- model params per tier ---
-
-    @staticmethod
-    def _record_agent_usage(tier: Tier, model: str, provider: str,
-                            total_in: int, total_out: int,
-                            total_cr: int, total_cc: int) -> None:
-        """Record accumulated agent-loop tokens — called on EVERY exit path;
-        a failed investigation's completed turns are still real spend."""
-        if total_in or total_out or total_cr or total_cc:
-            usage.record(tier=tier, model=model, provider=provider,
-                         input_tokens=total_in, output_tokens=total_out,
-                         cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
+    # --- prompt-cache monitoring ---
 
     async def _check_prompt_cache(self, tier: Tier, model: str, provider: str,
                                   iterations: int, total_in: int,
@@ -340,47 +250,17 @@ class AIClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("prompt cache alert not sent: %s", exc)
 
-    def _primary_params(self, tier: Tier, effort: str | None, model: str = "") -> dict:
-        """Thinking/effort config valid for the primary Claude model of this tier."""
-        params: dict[str, Any] = {}
-        if model.startswith("claude-haiku"):
-            # haiku (any tier, e.g. via runtime override): no thinking param,
-            # no effort — both 400 on it
-            return params
-        if tier == Tier.SMART:
-            # only the investigator thinks: on big-diff reviews adaptive thinking
-            # ate the entire max_tokens budget before emitting any text (prod,
-            # 2026-07-22) while the non-thinking fallback wrote a great review
-            params["thinking"] = {"type": "adaptive"}
-            if effort:
-                params["output_config"] = {"effort": effort}
-        # NB fast/main fall through to thinking=disabled with NO effort. On
-        # claude-opus-5 disabled thinking is a 400 at effort xhigh/max but fine
-        # at the default (high) — so effort must stay unset on those tiers.
-        elif tier == Tier.MAIN:
-            if model.startswith("claude-sonnet-5-5"):
-                # sonnet-5-5 400s on "disabled" (prod 2026-09-29, !127) — its
-                # thinking-off mode is "between_tools": no other field allowed,
-                # and legal only at effort high or below, so effort stays unset
-                params["thinking"] = {"type": "between_tools"}
-            elif model.startswith(_ALWAYS_THINKING_PREFIXES):
-                # thinking cannot be turned off at all — lowest effort is the
-                # only lever that keeps it from eating the output budget
-                params["thinking"] = {"type": "adaptive"}
-                params["output_config"] = {"effort": "low"}
-            else:
-                # sonnet-5 runs ADAPTIVE thinking when the param is omitted (changed
-                # from sonnet-4-6!) — disabling must be explicit for predictable cost
-                params["thinking"] = {"type": "disabled"}
-        # fast = haiku-4-5: omitted param = no thinking; no effort (400s on Haiku)
-        return params
-
     # --- cache (success-only, sha256 key, TTL) ---
 
-    def _cache_key(self, model: str, system: str, user_content: str) -> str:
+    def _cache_key(self, model: str, system: str, user_content: str,
+                   max_tokens: int = 4096, effort: str | None = None) -> str:
+        """Everything that changes the answer: a different output budget or
+        effort is a different request, never a cache hit (#22)."""
         digest = hashlib.sha256()
-        for part in (model, system, user_content):
+        for part in (model, system, user_content, f"max_tokens={max_tokens}",
+                     f"effort={effort or ''}"):
             digest.update(part.encode("utf-8", errors="replace"))
+            digest.update(b"\0")
         return digest.hexdigest()
 
     def _cache_get(self, key: str) -> str | None:
@@ -466,12 +346,10 @@ class AIClient:
     ) -> AIResult:
         """Single-shot completion with primary -> fallback failover."""
         self.guard_input_size(system, user_content)
-        model = self._model_for(tier)
-        via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
-        if via_openrouter:
-            model = openrouter_model(model, self.cfg.fallback_chain(tier))
+        route = self.requests.route(tier, self._model_for(tier))
+        model = route.model
 
-        cache_key = self._cache_key(model, system, user_content)
+        cache_key = self._cache_key(model, system, user_content, max_tokens, effort)
         if use_cache and not json_schema:
             cached = self._cache_get(cache_key)
             if cached is not None:
@@ -487,24 +365,16 @@ class AIClient:
                                f"user={user_content[:2000]}")
 
         started = time.monotonic()
-        if via_openrouter:
+        if route.via_openrouter:
             # AI_PROVIDER=openrouter, or a vendor-prefixed id the CF gateway
             # cannot serve. The tier chain rides along as OpenRouter failover.
-            chain = _routing_chain(model, self.cfg.fallback_chain(tier))
             result = await self._fallback_complete(
                 tier, system, messages, max_tokens, json_schema, timeout,
-                cause=None, chain=chain)
+                cause=None, chain=route.chain)
             return self._finish(tier, result, cache_key, use_cache, json_schema, started)
 
-        request: dict[str, Any] = {
-            "model": model, "system": system, "messages": messages,
-            "max_tokens": max_tokens, **self._primary_params(tier, effort, model),
-        }
-        if json_schema:
-            request["output_config"] = {
-                **request.get("output_config", {}),
-                "format": {"type": "json_schema", "schema": json_schema},
-            }
+        request = self.requests.gateway(tier, model, system, messages, max_tokens,
+                                        effort=effort, json_schema=json_schema)
 
         try:
             response = await self._call(self.primary, request, timeout)
@@ -559,16 +429,9 @@ class AIClient:
         if client is None:
             raise (self._wrap(cause) if cause is not None
                    else AIError("OpenRouter routing requires OPENROUTER_API_TOKEN"))
-        chain = _routing_chain("", chain or self.cfg.fallback_chain(tier))
-        if json_schema:
-            system = (f"{system}\n\nRespond with ONLY valid JSON matching this schema, "
-                      f"no prose:\n{json.dumps(json_schema)}")
-        request: dict[str, Any] = {
-            "model": chain[0], "system": system, "messages": messages,
-            "max_tokens": max_tokens,
-            # cross-vendor degradation in one request; billed for the model that serves
-            "extra_body": {"models": chain},
-        }
+        request = self.requests.openrouter(chain or self.requests.fallback_chain(tier),
+                                           system, messages, max_tokens,
+                                           json_schema=json_schema)
         try:
             response = await self._call(client, request, timeout)
             return self._to_result(response, "openrouter")
@@ -605,7 +468,7 @@ class AIClient:
             return AITimeoutError(str(exc))
         return AIError(f"{type(exc).__name__}: {exc}")
 
-    # --- agentic loop (investigator) ---
+    # --- agentic loop (investigator, tool-assisted review, dialogue) ---
 
     async def agent_loop(
         self,
@@ -624,126 +487,144 @@ class AIClient:
         with tool use). Tool handlers are async callables returning strings.
         """
         self.guard_input_size(system, user_content)
-        handlers = {tool.name: tool.handler for tool in tools}
-        api_tools = [tool.to_api() for tool in tools]
-        model = self._model_for(tier)
-        via_openrouter = uses_openrouter(self.cfg.llm.provider, model)
-        if via_openrouter:
-            model = openrouter_model(model, self.cfg.fallback_chain(tier))
+        route = self.requests.route(tier, self._model_for(tier))
+        loop = _AgentLoop(tier=tier, route=route, system=system, max_tokens=max_tokens,
+                          effort=effort, tools=[tool.to_api() for tool in tools],
+                          handlers={tool.name: tool.handler for tool in tools})
         # cache the static prefix (tools + system + the MR diff/context render
         # ahead of it): every iteration re-sends it, so without this the whole
         # investigation is billed at full input price on each turn
         first_turn: dict = {"type": "text", "text": user_content}
-        use_cache_control = wants_cache_control(via_openrouter, model)
-        if use_cache_control:
+        if route.cache_control:
             first_turn["cache_control"] = dict(CACHE_CONTROL)
-        messages: list[dict] = [{"role": "user", "content": [first_turn]}]
-        rolling_cache: dict | None = None  # ≤4 breakpoints/request: keep one
-        total_in = total_out = total_cr = total_cc = 0
-        last_text = ""
-        provider = "gateway"
+        loop.messages.append({"role": "user", "content": [first_turn]})
 
-        for iteration in range(max_iterations):
-            await self._rate_limit()
-            if via_openrouter:
-                if self.fallback is None:
-                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise AIError("OpenRouter routing requires OPENROUTER_API_TOKEN")
-                request = {"model": model, "system": system,
-                           "messages": _openrouter_messages(messages, model),
-                           "max_tokens": max_tokens, "tools": api_tools,
-                           "extra_body": {"models": _routing_chain(
-                               model, self.cfg.fallback_chain(tier))}}
-            else:
-                request = {
-                    "model": model, "system": system, "messages": messages,
-                    "max_tokens": max_tokens, "tools": api_tools,
-                    **self._primary_params(tier, effort, model),
-                }
-            try:
-                target = self.fallback if via_openrouter else self.primary
-                response = await self._call(target, request, self.cfg.llm.agent_timeout)
-                provider = "openrouter" if via_openrouter else "gateway"
-            except _RETRYABLE + (anthropic.APIStatusError,) as exc:
-                if not _should_fallback(exc):
-                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise self._wrap(exc) from exc
-                logger.warning("agent_loop primary failed (%s), trying openrouter",
-                               type(exc).__name__)
+        try:
+            for iteration in range(max_iterations):
+                await self._rate_limit()
+                response = await self._send_turn(loop)
+                loop.usage.add(getattr(response, "usage", None))
+                loop.last_text = "".join(block.text for block in response.content
+                                         if getattr(block, "type", "") == "text") or loop.last_text
+
+                if response.stop_reason == "pause_turn":
+                    # Resume a paused turn: keep the FULL history and echo the paused
+                    # assistant content verbatim (thinking blocks included) — truncating
+                    # to messages[:1] would drop all prior tool_use/tool_result context.
+                    loop.messages.append({"role": "assistant", "content": response.content})
+                    continue
+                if response.stop_reason == "refusal":
+                    raise AIError("model refused during investigation (stop_reason=refusal)")
+                if response.stop_reason != "tool_use":
+                    logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
+                                iteration + 1, response.stop_reason,
+                                loop.usage.input_tokens, loop.usage.output_tokens)
+                    return await self._finish_loop(loop, iteration + 1)
+
+                loop.messages.append({"role": "assistant", "content": response.content})
+                results = await self._run_tools(response, loop.handlers)
+                self._advance_cache_breakpoint(loop, results)
+                loop.messages.append({"role": "user", "content": results})
+
+            logger.warning("agent_loop hit max_iterations=%d", max_iterations)
+            return await self._finish_loop(loop, max_iterations)
+        finally:
+            # every exit path, errors included: completed turns are real spend
+            loop.usage.record(tier=tier, model=route.model, provider=loop.provider)
+
+    async def _send_turn(self, loop: _AgentLoop) -> Any:
+        """One Messages call on the loop's route; a gateway outage fails over to
+        the tier's OpenRouter chain for this turn. Sets `loop.provider`."""
+        route, timeout = loop.route, self.cfg.llm.agent_timeout
+        try:
+            if route.via_openrouter:
                 client = self.fallback
                 if client is None:
-                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise self._wrap(exc) from exc
-                chain = _routing_chain("", self.cfg.fallback_chain(tier))
-                request = {"model": chain[0], "system": system,
-                           "messages": _openrouter_messages(messages, chain[0]),
-                           "max_tokens": max_tokens, "tools": api_tools,
-                           "extra_body": {"models": chain}}
-                try:
-                    response = await self._call(client, request, self.cfg.llm.agent_timeout)
-                    provider = "openrouter"
-                except Exception as exc2:  # noqa: BLE001
-                    self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                    raise self._wrap(exc2) from exc
+                    raise AIError("OpenRouter routing requires OPENROUTER_API_TOKEN")
+                request = self.requests.openrouter(route.chain, loop.system, loop.messages,
+                                                   loop.max_tokens, tools=loop.tools)
+                response = await self._call(client, request, timeout)
+                loop.provider = "openrouter"
+            else:
+                request = self.requests.gateway(loop.tier, route.model, loop.system,
+                                                loop.messages, loop.max_tokens,
+                                                effort=loop.effort, tools=loop.tools)
+                response = await self._call(self.primary, request, timeout)
+                loop.provider = "gateway"
+            return response
+        except _RETRYABLE + (anthropic.APIStatusError,) as exc:
+            if not _should_fallback(exc):
+                raise self._wrap(exc) from exc
+            logger.warning("agent_loop primary failed (%s), trying openrouter",
+                           type(exc).__name__)
+            fallback = self.fallback
+            if fallback is None:
+                raise self._wrap(exc) from exc
+            request = self.requests.openrouter(self.requests.fallback_chain(loop.tier),
+                                               loop.system, loop.messages, loop.max_tokens,
+                                               tools=loop.tools)
+            try:
+                response = await self._call(fallback, request, timeout)
+            except Exception as exc2:  # noqa: BLE001
+                raise self._wrap(exc2) from exc
+            loop.provider = "openrouter"
+            return response
 
-            usage_info = getattr(response, "usage", None)
-            total_in += getattr(usage_info, "input_tokens", 0) or 0
-            total_out += getattr(usage_info, "output_tokens", 0) or 0
-            total_cr += getattr(usage_info, "cache_read_input_tokens", 0) or 0
-            total_cc += getattr(usage_info, "cache_creation_input_tokens", 0) or 0
-            last_text = "".join(block.text for block in response.content
-                                if getattr(block, "type", "") == "text") or last_text
-
-            if response.stop_reason == "pause_turn":
-                # Resume a paused turn: keep the FULL history and echo the paused
-                # assistant content verbatim (thinking blocks included) — truncating
-                # to messages[:1] would drop all prior tool_use/tool_result context.
-                messages.append({"role": "assistant", "content": response.content})
+    async def _run_tools(self, response: Any,
+                         handlers: dict[str, Callable[..., Awaitable[str]]]) -> list[dict]:
+        """Execute every tool_use block; errors go back to the model as results."""
+        results = []
+        for block in response.content:
+            if getattr(block, "type", "") != "tool_use":
                 continue
-            if response.stop_reason == "refusal":
-                self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                raise AIError("model refused during investigation (stop_reason=refusal)")
-            if response.stop_reason != "tool_use":
-                logger.info("agent_loop done after %d iterations stop=%s in=%d out=%d",
-                            iteration + 1, response.stop_reason, total_in, total_out)
-                self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-                await self._check_prompt_cache(tier, model, provider, iteration + 1,
-                                               total_in, total_cr, total_cc)
-                return AIResult(text=last_text.strip(), model=model, provider=provider,
-                                input_tokens=total_in, output_tokens=total_out,
-                                cache_read_tokens=total_cr,
-                                cache_creation_tokens=total_cc)
+            handler = handlers.get(block.name)
+            self._debug("tool_use", f"{block.name} {json.dumps(block.input)[:2000]}")
+            if handler is None:
+                output, is_error = f"Unknown tool: {block.name}", True
+            else:
+                try:
+                    output, is_error = await handler(**(block.input or {})), False
+                except Exception as exc:  # noqa: BLE001 — feed errors back to the model
+                    output, is_error = f"Tool error: {exc}", True
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(output)[:60_000], "is_error": is_error})
+        return results
 
-            messages.append({"role": "assistant", "content": response.content})
-            results = []
-            for block in response.content:
-                if getattr(block, "type", "") != "tool_use":
-                    continue
-                handler = handlers.get(block.name)
-                self._debug("tool_use", f"{block.name} {json.dumps(block.input)[:2000]}")
-                if handler is None:
-                    output, is_error = f"Unknown tool: {block.name}", True
-                else:
-                    try:
-                        output, is_error = await handler(**(block.input or {})), False
-                    except Exception as exc:  # noqa: BLE001 — feed errors back to the model
-                        output, is_error = f"Tool error: {exc}", True
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(output)[:60_000], "is_error": is_error})
-            if results and use_cache_control:
-                # roll the second breakpoint forward so each turn also reads the
-                # growing history; drop the previous one (max 4 per request)
-                if rolling_cache is not None:
-                    rolling_cache.pop("cache_control", None)
-                results[-1]["cache_control"] = dict(CACHE_CONTROL)
-                rolling_cache = results[-1]
-            messages.append({"role": "user", "content": results})
+    @staticmethod
+    def _advance_cache_breakpoint(loop: _AgentLoop, results: list[dict]) -> None:
+        """Roll the second breakpoint forward so each turn also reads the growing
+        history; drop the previous one (≤4 breakpoints per request)."""
+        if not results or not loop.route.cache_control:
+            return
+        if loop.rolling_cache is not None:
+            loop.rolling_cache.pop("cache_control", None)
+        results[-1]["cache_control"] = dict(CACHE_CONTROL)
+        loop.rolling_cache = results[-1]
 
-        logger.warning("agent_loop hit max_iterations=%d", max_iterations)
-        self._record_agent_usage(tier, model, provider, total_in, total_out, total_cr, total_cc)
-        await self._check_prompt_cache(tier, model, provider, max_iterations,
-                                       total_in, total_cr, total_cc)
-        return AIResult(text=last_text.strip(), model=model, provider=provider,
-                        input_tokens=total_in, output_tokens=total_out,
-                        cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
+    async def _finish_loop(self, loop: _AgentLoop, iterations: int) -> AIResult:
+        acc = loop.usage
+        await self._check_prompt_cache(loop.tier, loop.route.model, loop.provider, iterations,
+                                       acc.input_tokens, acc.cache_read_tokens,
+                                       acc.cache_creation_tokens)
+        return AIResult(text=loop.last_text.strip(), model=loop.route.model,
+                        provider=loop.provider, input_tokens=acc.input_tokens,
+                        output_tokens=acc.output_tokens,
+                        cache_read_tokens=acc.cache_read_tokens,
+                        cache_creation_tokens=acc.cache_creation_tokens)
 
+
+@dataclass
+class _AgentLoop:
+    """State of one agent_loop run."""
+    tier: Tier
+    route: Route
+    system: str
+    max_tokens: int
+    effort: str | None
+    tools: list[dict]
+    handlers: dict[str, Callable[..., Awaitable[str]]]
+    messages: list[dict] = field(default_factory=list)
+    usage: UsageAccumulator = field(default_factory=UsageAccumulator)
+    rolling_cache: dict | None = None  # the moving 2nd cache breakpoint
+    provider: str = "gateway"
+    last_text: str = ""

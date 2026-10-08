@@ -17,34 +17,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from .config import DEFAULT_MODELS, match_model_key
 from .domain.models import Job
 
 logger = logging.getLogger(__name__)
 
-# $ per MTok (input, output). Override/extend via MODEL_PRICES,
-# e.g. MODEL_PRICES="claude-sonnet-5=3/15,google/gemini-4-flash=2/8", or
-# config.yaml llm.prices
+# $ per MTok (input, output): the `price` column of the model table in config
+# (DEFAULT_MODELS); override/extend via MODEL_PRICES="claude-sonnet-5=3/15,..."
+# or config.yaml llm.prices / llm.models
 DEFAULT_PRICES: dict[str, tuple[float, float]] = {
-    "claude-haiku-4-5": (1.0, 5.0),
-    "claude-sonnet-5": (2.0, 10.0),      # intro pricing through 2026-08-31
-    "claude-sonnet-5-5": (2.0, 10.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-opus-5-5": (4.0, 20.0),
-    "claude-opus-4-8": (5.0, 25.0),
-    "claude-opus-5": (5.0, 25.0),        # same price as 4.8, released 2026-07-24
-    "claude-fable-5": (10.0, 50.0),
-    "anthropic/claude-haiku-4.5": (1.0, 5.0),
-    "anthropic/claude-sonnet-5": (2.0, 10.0),
-    "anthropic/claude-sonnet-5.5": (2.0, 10.0),
-    "anthropic/claude-opus-4.8": (5.0, 25.0),
-    "anthropic/claude-opus-5": (5.0, 25.0),
-    "google/gemini-3.6-flash": (1.5, 7.5),
-    "google/gemini-3.5-flash-lite": (0.3, 2.5),
-    "deepseek/deepseek-v4-flash": (0.1, 0.2),
-    "deepseek/deepseek-v4-pro": (0.43, 0.87),
-    "openai/gpt-5.6-terra": (2.5, 15.0),
-    "moonshotai/kimi-k3": (3.0, 15.0),
-}
+    key: spec["price"] for key, spec in DEFAULT_MODELS.items() if spec.get("price")}
 
 
 # cache pricing vs the model's input price (Anthropic ratios: reads 0.1x,
@@ -70,12 +52,7 @@ class Pricing:
 
     def model_key(self, model: str) -> str:
         """Normalize dated model ids (claude-haiku-4-5-20251001 -> claude-haiku-4-5)."""
-        if model in self.prices:
-            return model
-        for known in self.prices:
-            if model.startswith(known + "-"):
-                return known
-        return model
+        return match_model_key(model, self.prices) or model
 
     def price_of(self, model: str) -> tuple[float, float]:
         key = self.model_key(model)
@@ -176,6 +153,37 @@ class UsageTracker:
             segs.append(f"{name}: →{stats['input_tokens']} ←{stats['output_tokens']}")
         segs.append(f"💰${self.total_cost:.2f}")
         return " | ".join(segs)
+
+
+@dataclass
+class UsageAccumulator:
+    """Token totals across the turns of one agent loop. Prompt-cache tokens are
+    reported SEPARATELY from input_tokens on the wire (auto-caching models via
+    OpenRouter put nearly the whole prompt there), so they are kept apart."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+    def add(self, usage_info: object) -> None:
+        """Fold in one response's `usage` (absent fields count as 0)."""
+        self.input_tokens += getattr(usage_info, "input_tokens", 0) or 0
+        self.output_tokens += getattr(usage_info, "output_tokens", 0) or 0
+        self.cache_read_tokens += getattr(usage_info, "cache_read_input_tokens", 0) or 0
+        self.cache_creation_tokens += getattr(usage_info, "cache_creation_input_tokens", 0) or 0
+
+    def __bool__(self) -> bool:
+        return bool(self.input_tokens or self.output_tokens
+                    or self.cache_read_tokens or self.cache_creation_tokens)
+
+    def record(self, *, tier: str, model: str, provider: str) -> None:
+        """Into the active review's tracker — once per loop, on EVERY exit path:
+        a failed investigation's completed turns are still real spend."""
+        if self:
+            record(tier=tier, model=model, provider=provider,
+                   input_tokens=self.input_tokens, output_tokens=self.output_tokens,
+                   cache_read_tokens=self.cache_read_tokens,
+                   cache_creation_tokens=self.cache_creation_tokens)
 
 
 current_tracker: contextvars.ContextVar[UsageTracker | None] = contextvars.ContextVar(

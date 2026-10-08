@@ -126,6 +126,74 @@ class TiersSection(_Section):
         return getattr(self, Tier(tier).value)
 
 
+class ModelSpec(_Section):
+    """What one model accepts — decides the thinking/effort params per tier
+    (ai_client.RequestBuilder), so a new model is a config entry, not a code
+    release. Keys of `llm.models` are model ids or id prefixes; the longest key
+    that equals the id or prefixes it at a "-" wins (claude-sonnet-5-5 beats
+    claude-sonnet-5; dated ids like claude-haiku-4-5-20251001 match their alias)."""
+    # False: the `thinking` param itself is a 400 (haiku) — nothing is sent
+    supports_thinking: bool = True
+    # how the main tier turns thinking off: "disabled" | "between_tools" (sonnet-5-5:
+    # no other thinking field allowed) | "none" (no off mode at all: adaptive at
+    # effort low is the only lever that keeps it from eating the output budget)
+    thinking_off: Literal["disabled", "between_tools", "none"] = "disabled"
+    supports_effort: bool = True
+    # highest effort legal alongside the thinking-off mode; None = never send
+    # effort with thinking off (the main tier's policy — and opus-5's disabled
+    # mode is a 400 at xhigh/max, sonnet-5-5's between_tools at xhigh/max)
+    max_effort_with_thinking_off: Literal["low", "medium", "high"] | None = None
+    price: tuple[float, float] | None = None  # $/MTok (input, output), list price
+
+
+def _spec(**kw: Any) -> dict[str, Any]:
+    return kw
+
+
+# Hard-won (CLAUDE.md "Model & thinking policy"); yaml `llm.models` entries
+# override or extend these per key. OpenRouter ids only carry prices: thinking
+# params are sent on the gateway path only.
+DEFAULT_MODELS: dict[str, dict[str, Any]] = {
+    # haiku: any thinking param or effort is a 400
+    "claude-haiku": _spec(supports_thinking=False, supports_effort=False),
+    "claude-haiku-4-5": _spec(supports_thinking=False, supports_effort=False, price=(1.0, 5.0)),
+    # sonnet-5 runs ADAPTIVE thinking when the param is omitted (unlike 4-6):
+    # disabling must be explicit, else thinking eats max_tokens on big diffs
+    "claude-sonnet-5": _spec(thinking_off="disabled", price=(2.0, 10.0)),  # intro price to 2026-08-31
+    # sonnet-5-5 400s on "disabled" (prod 2026-09-29, !127)
+    "claude-sonnet-5-5": _spec(thinking_off="between_tools", price=(2.0, 10.0)),
+    "claude-sonnet-4-6": _spec(thinking_off="disabled", price=(3.0, 15.0)),
+    "claude-opus-4-8": _spec(thinking_off="disabled", price=(5.0, 25.0)),
+    # disabled thinking is a 400 at effort xhigh/max (fine without effort)
+    "claude-opus-5": _spec(thinking_off="disabled", price=(5.0, 25.0)),
+    # no thinking-off mode at all
+    "claude-opus-5-5": _spec(thinking_off="none", price=(4.0, 20.0)),
+    "claude-fable": _spec(thinking_off="none"),
+    "claude-fable-5": _spec(thinking_off="none", price=(10.0, 50.0)),
+    "claude-mythos": _spec(thinking_off="none"),
+    "anthropic/claude-haiku-4.5": _spec(price=(1.0, 5.0)),
+    "anthropic/claude-sonnet-5": _spec(price=(2.0, 10.0)),
+    "anthropic/claude-sonnet-5.5": _spec(price=(2.0, 10.0)),
+    "anthropic/claude-opus-4.8": _spec(price=(5.0, 25.0)),
+    "anthropic/claude-opus-5": _spec(price=(5.0, 25.0)),
+    "google/gemini-3.6-flash": _spec(price=(1.5, 7.5)),
+    "google/gemini-3.5-flash-lite": _spec(price=(0.3, 2.5)),
+    "deepseek/deepseek-v4-flash": _spec(price=(0.1, 0.2)),
+    "deepseek/deepseek-v4-pro": _spec(price=(0.43, 0.87)),
+    "openai/gpt-5.6-terra": _spec(price=(2.5, 15.0)),
+    "moonshotai/kimi-k3": _spec(price=(3.0, 15.0)),
+}
+
+
+def match_model_key(model: str, keys: Any) -> str | None:
+    """Longest key equal to `model` or prefixing it at a "-" boundary."""
+    best = None
+    for key in keys:
+        if (model == key or model.startswith(key + "-")) and len(key) > len(best or ""):
+            best = key
+    return best
+
+
 class AnthropicSection(_Section):
     api_url: str = ""  # CF AI Gateway /anthropic route
     api_key: str = ""  # real key, x-api-key
@@ -141,7 +209,10 @@ class LLMSection(_Section):
     anthropic: AnthropicSection = AnthropicSection()
     openrouter: OpenRouterSection = OpenRouterSection()
     tiers: TiersSection = TiersSection()
-    # $/MTok (input, output) overrides on top of usage.DEFAULT_PRICES
+    # model capability + price table (DEFAULT_MODELS, extended by config.yaml)
+    models: dict[str, ModelSpec] = Field(default_factory=lambda: {
+        k: ModelSpec(**v) for k, v in DEFAULT_MODELS.items()})
+    # $/MTok (input, output) overrides on top of the table's prices (MODEL_PRICES)
     prices: dict[str, tuple[float, float]] = {}
     cache_ttl: int = Field(default=3600, ge=0)
     # agent loops reading at least this many input tokens with zero cache reads
@@ -160,6 +231,25 @@ class LLMSection(_Section):
     @classmethod
     def _lower(cls, value: Any) -> Any:
         return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def _merge_models(cls, value: Any) -> Any:
+        """config.yaml entries override/extend the built-in table per key."""
+        if not isinstance(value, dict):
+            return value
+        return {**DEFAULT_MODELS, **value}
+
+    def model_spec(self, model: str) -> ModelSpec:
+        """Capabilities for a model id; unknown ids get ModelSpec() — thinking
+        disabled explicitly on the main tier, as for any recent Claude."""
+        key = match_model_key(model, self.models)
+        return self.models[key] if key is not None else ModelSpec()
+
+    def price_table(self) -> dict[str, tuple[float, float]]:
+        """Table prices with MODEL_PRICES / llm.prices on top."""
+        table = {k: spec.price for k, spec in self.models.items() if spec.price}
+        return {**table, **self.prices}
 
     @field_validator("prices", mode="before")
     @classmethod

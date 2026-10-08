@@ -1,2 +1,1 @@
 reviewer/repo_cache.py:0: error: Argument 1 to "Popen" has incompatible type "list[str | None]"; expected "str | bytes | PathLike[str] | PathLike[bytes] | Sequence[str | bytes | PathLike[str] | PathLike[bytes]]"  [arg-type]
-reviewer/ai_client.py:0: error: Argument 1 to "_call" of "AIClient" has incompatible type "AsyncAnthropic | None"; expected "AsyncAnthropic"  [arg-type]

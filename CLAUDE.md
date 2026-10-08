@@ -63,7 +63,12 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   still has them)
 - **reviewer/ai_client.py** — Anthropic SDK via Cloudflare AI Gateway with OpenRouter
   fallback (Anthropic-compatible `/api/v1/messages`, `models` array failover); response
-  cache, rate limiting, agent tool loop, empty-response retry, usage recording
+  cache (key includes `max_tokens` + effort), rate limiting, empty-response retry, agent
+  tool loop (`_send_turn` / `_run_tools` / `_advance_cache_breakpoint`, one
+  `usage.UsageAccumulator` recorded in `finally` on every exit path)
+- **reviewer/llm_requests.py** — `RequestBuilder`: routing (gateway vs OpenRouter chain),
+  the per-tier thinking/effort policy driven by the model table, request bodies for
+  both routes (cache_control kept/stripped, thinking blocks stripped for OpenRouter)
 - **reviewer/repo_cache.py** — lazy bare-clone cache (`refs/merge-requests/<iid>/head`,
   detached worktrees, LRU eviction via `REPO_CACHE_MAX_GB`; `REPO_CACHE_EPHEMERAL=true`
   = clone→investigate→remove) + sandboxed read-only repo tools (review/investigator/
@@ -106,7 +111,7 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
 
 - **Sonnet 5 runs ADAPTIVE thinking when the `thinking` param is omitted** (changed from
   Sonnet 4.6). Disabling must be explicit, else thinking silently consumes the whole
-  output budget on big diffs (zero visible text). See `_primary_params` in ai_client.
+  output budget on big diffs (zero visible text). See `RequestBuilder.thinking_params`.
 - Thinking tokens bill against `max_tokens` — that's why smart tier gets 32k.
 - **claude-opus-5** (2026-07-24) is the smart default: same $5/$25 as opus-4-8, 1M ctx.
   Two behaviour changes to respect — thinking is ON by default (omitting the param
@@ -119,7 +124,12 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   Its thinking-off mode is `{"type":"between_tools"}` — no other field alongside it,
   legal only at effort `high` or below (so still no `effort` on main). Models with no
   off mode at all (opus-5-5, fable, mythos) get adaptive + effort `low` on the main
-  tier. `_primary_params` picks per model; new models need a branch there.
+  tier. **Per-model capabilities are config, not code**: `config.DEFAULT_MODELS`
+  (`supports_thinking`, `thinking_off: disabled|between_tools|none`, `supports_effort`,
+  `max_effort_with_thinking_off`, `price`), keyed by id/prefix (longest match at a `-`
+  boundary), extendable via `config.yaml llm.models` — a new model is an entry there.
+  Unknown ids get explicit `disabled` on main. `test_thinking_params_per_model` pins
+  every known model's request.
 - **Anthropic prompt caching is OPT-IN** — the investigator's `agent_loop` sets
   `cache_control` breakpoints on the gateway path (static prefix = tools+system+diff,
   plus one rolling breakpoint on the latest tool-result turn; ≤4 per request is the
@@ -138,7 +148,8 @@ and validates the config BEFORE uvicorn starts. `w-server.py` is only an import 
   routes via OpenRouter with the tier's fallback chain behind it. The dashboard offers
   the **entire** OpenRouter catalog (`reviewer/openrouter_models.py`, `GET /models`,
   6h-cached, fail-open) as a free-text combo, and prices unknown models from that
-  catalog (`usage.price_of`: curated MODEL_PRICES win → live catalog → $0). Handy: the
+  catalog (`Pricing.price_of`: model-table prices + MODEL_PRICES win → live catalog →
+  $0). Handy: the
   smart tier on `openai/gpt-5.6-terra` runs a full investigation for ~$0.54 vs Opus
   ~$1.00 and Sonnet-as-smart ~$2.00 (no CF caching), and OpenRouter auto-caches repo
   context (0.1× reads), so agentic loops are far cheaper there than list price implies.
