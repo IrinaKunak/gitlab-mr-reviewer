@@ -80,7 +80,7 @@ class World:
         queue = server.review_queue.queue
         while not queue.empty():
             job = queue.get_nowait()
-            if job.get("kind") == "note":
+            if job.kind == "dialogue":
                 asyncio.run(pipeline_mod.pipeline.process_note(job))
             else:
                 asyncio.run(pipeline_mod.pipeline.process(job))
@@ -102,6 +102,7 @@ def world(monkeypatch, tmp_path):
     from reviewer import gitlab_io, server, telegram_io
     from reviewer import pipeline as pipeline_mod
     from reviewer.config import settings
+    from reviewer.domain.models import InstanceRef
     from tests.fakes import FakeBridge, FakeGitLab, FakeRepoCache, FakeTelegram, ScriptedLLM
 
     gitlab, llm, telegram, bridge = FakeGitLab(), ScriptedLLM(), FakeTelegram(), FakeBridge()
@@ -122,11 +123,11 @@ def world(monkeypatch, tmp_path):
         "notify.telegram.chat_ids": ["chat-1"],
         "storage.state_dir": str(tmp_path / "state"), "storage.log_dir": str(log_dir),
         "storage.ai_cache_dir": str(tmp_path / "cache"),
-        "gitlab.routes": {WEBHOOK_TOKEN: {
-            "name": "primary", "url": "https://gitlab.test", "token": "t",
-            "bot_username": gitlab.bot_username}},
+        "gitlab.routes": {WEBHOOK_TOKEN: InstanceRef("primary", "https://gitlab.test", "t")},
     }.items():
         set_setting(monkeypatch, settings, path, value)
+    # what the startup instance check learns from GET /user
+    monkeypatch.setattr(server, "bot_usernames", {"primary": gitlab.bot_username})
 
     monkeypatch.setattr(gitlab_io, "get_gitlab_client", gitlab.client)
     monkeypatch.setattr(telegram_io, "send_message", telegram.send_message)

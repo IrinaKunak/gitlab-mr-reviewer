@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import openrouter_models
 from .config import settings
+from .domain.models import Job
 
 logger = logging.getLogger(__name__)
 
@@ -186,16 +187,16 @@ def _usage_path() -> Path:
     return Path(settings.storage.log_dir) / "usage.jsonl"
 
 
-def persist(tracker: UsageTracker, mr_data: dict) -> None:
+def persist(tracker: UsageTracker, job: Job) -> None:
     """Append one per-review entry; never let accounting break a review."""
     if not tracker.calls:
         return
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "kind": mr_data.get("kind") or "review",  # review | dialogue
-        "instance": (mr_data.get("gitlab_config") or {}).get("name"),
-        "project": mr_data.get("project_path"),
-        "mr_iid": mr_data.get("mr_iid"),
+        "kind": str(job.kind),  # review | dialogue
+        "instance": job.ref.instance.name,
+        "project": job.ref.project_path,
+        "mr_iid": job.ref.mr_iid,
         "input_tokens": tracker.total_input,
         "cached_tokens": sum(c.get("cached_tokens", 0) for c in tracker.calls),
         "cache_savings_usd": tracker.cache_savings(),

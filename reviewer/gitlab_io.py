@@ -9,13 +9,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from fnmatch import fnmatch
 from typing import Any
 
 import gitlab
 import requests
 
 from .config import settings
+from .domain.models import (
+    ChangeSet,
+    DialogueJob,
+    FileChange,
+    InstanceRef,
+    MergeRequestRef,
+    ReviewJob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,59 +32,36 @@ MAX_LISTED_SKIPPED_FILES = 40
 MAX_MANIFEST_FILES = 600
 
 
-def _change_status(change: dict) -> str:
-    if change.get("new_file"):
-        return "added"
-    if change.get("deleted_file"):
-        return "deleted"
-    if change.get("renamed_file"):
-        return "renamed"
-    return "modified"
+def to_changeset(raw: Any) -> ChangeSet:
+    """GitLab `changes` / `compare` payload -> ChangeSet.
+
+    Accepts the MR-changes dict ({"changes": [...]}) or a bare diff list
+    (repository_compare's "diffs")."""
+    items = raw.get("changes", []) if isinstance(raw, dict) else (raw or [])
+    return ChangeSet(tuple(
+        FileChange(
+            old_path=c.get("old_path") or "",
+            new_path=c.get("new_path") or "",
+            diff=c.get("diff") or "",
+            new_file=bool(c.get("new_file")),
+            deleted_file=bool(c.get("deleted_file")),
+            renamed_file=bool(c.get("renamed_file")),
+            collapsed=bool(c.get("collapsed") or c.get("too_large")),
+        ) for c in items if isinstance(c, dict)))
 
 
-def file_manifest(changes: dict[str, Any]) -> str:
+def file_manifest(changes: ChangeSet) -> str:
     """Path + status + diff size for every changed file.
 
     Cheap enough to hand the triage model so IT decides which files carry no
     review value (assets, generated output, vendored code) — a hardcoded
     extension list can't know a given project's conventions."""
-    rows = []
-    for change in changes.get("changes", [])[:MAX_MANIFEST_FILES]:
-        path = change.get("new_path") or change.get("old_path") or "unknown"
-        size = len(change.get("diff") or "")
-        rows.append(f"{_change_status(change)}\t{size}\t{path}")
-    total = len(changes.get("changes", []))
+    rows = [f"{f.status}\t{len(f.diff)}\t{f.path or 'unknown'}"
+            for f in changes.files[:MAX_MANIFEST_FILES]]
+    total = len(changes)
     if total > MAX_MANIFEST_FILES:
         rows.append(f"... and {total - MAX_MANIFEST_FILES} more files")
     return "\n".join(rows)
-
-
-MAX_SKIP_GLOBS = 40
-MAX_SKIP_SHARE = 0.98  # a pattern set that eats the whole MR is a bad verdict
-
-
-def resolve_skip(changes: dict[str, Any], globs: Any) -> set[str]:
-    """Expand triage's glob patterns into concrete paths.
-
-    The model picks the rule, this applies it — deterministically, and with
-    guards: catch-alls are dropped, and a verdict that would swallow the entire
-    MR is discarded so a bad triage can never silence the review."""
-    if not isinstance(globs, list):
-        return set()
-    patterns = [g.strip() for g in globs[:MAX_SKIP_GLOBS]
-                if isinstance(g, str) and g.strip()
-                and g.strip().strip("*/") not in ("", ".")]
-    if not patterns:
-        return set()
-    paths = [c.get("new_path") or c.get("old_path") or ""
-             for c in changes.get("changes", [])]
-    matched = {p for p in paths if p and any(
-        fnmatch(p, g) or fnmatch(p, g.rstrip("/") + "/*") for g in patterns)}
-    if paths and len(matched) > MAX_SKIP_SHARE * len(paths):
-        logger.warning("triage skip_globs %s matched %d/%d files — ignoring",
-                       patterns, len(matched), len(paths))
-        return set()
-    return matched
 
 
 def summarize_skipped(entries: list[str]) -> str:
@@ -93,18 +77,18 @@ def summarize_skipped(entries: list[str]) -> str:
             f"no review value; contents not shown\n{'=' * 80}\n{body}\n")
 
 
-def get_gitlab_client(gitlab_config: dict) -> gitlab.Gitlab:
+def get_gitlab_client(instance: InstanceRef) -> gitlab.Gitlab:
     session = requests.Session()
     proxies = settings.network.requests_proxies
     if proxies:
         session.proxies = proxies
-    gl = gitlab.Gitlab(
-        gitlab_config["url"], private_token=gitlab_config["token"], session=session)
+    gl = gitlab.Gitlab(instance.url, private_token=instance.token, session=session)
     gl.auth()
     return gl
 
 
-def parse_merge_request_webhook(payload: dict[str, Any]) -> dict[str, Any] | None:
+def parse_merge_request_webhook(payload: dict[str, Any],
+                                instance: InstanceRef) -> ReviewJob | None:
     """Parse the MR webhook payload. Contract preserved from v1 (incl. URL typo fix)."""
     try:
         action = payload.get("object_attributes", {}).get("action")
@@ -127,30 +111,28 @@ def parse_merge_request_webhook(payload: dict[str, Any]) -> dict[str, Any] | Non
         if "/-/mergerequests/" in url:
             url = url.replace("/-/mergerequests/", "/-/merge_requests/")
 
-        return {
-            "project_id": project["id"],
-            "project_path": project["path_with_namespace"],
-            "mr_iid": attrs["iid"],
-            "mr_id": attrs["id"],
-            "source_branch": attrs["source_branch"],
-            "target_branch": attrs["target_branch"],
-            "title": attrs["title"],
-            "description": attrs.get("description", ""),
-            "author": payload["user"]["username"],
-            "action": action,
-            "url": url,
-            "last_commit": attrs.get("last_commit", {}).get("id"),
+        return ReviewJob(
+            ref=MergeRequestRef(instance, project["id"], project["path_with_namespace"],
+                                attrs["iid"], url),
+            mr_id=attrs["id"],
+            source_branch=attrs["source_branch"],
+            target_branch=attrs["target_branch"],
+            title=attrs["title"],
+            description=attrs.get("description") or "",
+            author=payload["user"]["username"],
+            action=action,
+            last_commit=(attrs.get("last_commit") or {}).get("id"),
             # opt-in: force a full fresh review (skips incremental delta and
             # same-sha suppression) — e.g. to regenerate the tester report
-            "force_full": "[re-review]" in marker_text or "re-review" in labels,
-        }
+            force_full="[re-review]" in marker_text or "re-review" in labels,
+        )
     except KeyError as exc:
         logger.error("Missing required field in webhook payload: %s", exc)
         return None
 
 
-def parse_note_webhook(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Comment ('Note Hook') on a merge request -> dialogue job dict, or None.
+def parse_note_webhook(payload: dict[str, Any], instance: InstanceRef) -> DialogueJob | None:
+    """Comment ('Note Hook') on a merge request -> dialogue job, or None.
 
     Filters out system notes, non-MR comments and empty bodies. The bot's own
     notes are dropped by the caller (it knows the instance's bot username)."""
@@ -174,19 +156,16 @@ def parse_note_webhook(payload: dict[str, Any]) -> dict[str, Any] | None:
             line = position.get("new_line") or position.get("old_line")
             if path:
                 pos = f"{path}:{line}" if line else str(path)
-        return {
-            "kind": "note",
-            "project_id": project["id"],
-            "project_path": project["path_with_namespace"],
-            "mr_iid": mr["iid"],
-            "note_id": attrs.get("id"),
-            "discussion_id": attrs.get("discussion_id") or "",
-            "note_body": body,
-            "note_author": (payload.get("user") or {}).get("username", ""),
-            "note_position": pos,
-            "last_commit": (mr.get("last_commit") or {}).get("id"),
-            "url": mr.get("url", ""),
-        }
+        return DialogueJob(
+            ref=MergeRequestRef(instance, project["id"], project["path_with_namespace"],
+                                mr["iid"], mr.get("url", "")),
+            note_id=attrs.get("id"),
+            discussion_id=attrs.get("discussion_id") or "",
+            note_body=body,
+            note_author=(payload.get("user") or {}).get("username", ""),
+            note_position=pos,
+            last_commit=(mr.get("last_commit") or {}).get("id"),
+        )
     except KeyError as exc:
         logger.error("Missing required field in note webhook payload: %s", exc)
         return None
@@ -269,10 +248,10 @@ async def post_discussion_reply(mr, discussion_id: str, body: str) -> None:
     await asyncio.to_thread(_post)
 
 
-def extract_jira_keys(mr_data: dict) -> list[str]:
-    """Cheap regex extraction from branch/title/description (triage may add more)."""
-    haystack = " ".join(
-        str(mr_data.get(key, "")) for key in ("source_branch", "title", "description"))
+def extract_jira_keys(job: ReviewJob) -> list[str]:
+    """Cheap regex extraction from branch/title/description (triage may add more).
+    Never from diff content: docs and fixtures contain example keys."""
+    haystack = " ".join((job.source_branch, job.title, job.description))
     seen: list[str] = []
     for key in JIRA_KEY_RE.findall(haystack):
         if key not in seen:
@@ -298,7 +277,7 @@ def check_merge_conflicts(mr) -> bool:
         return False
 
 
-def extract_review_content(project, mr, changes: dict[str, Any],
+def extract_review_content(project, mr, changes: ChangeSet,
                            skip: set[str] | None = None) -> str:
     """Diffs + current file contents (first 200 lines) — same format as v1.
 
@@ -308,14 +287,14 @@ def extract_review_content(project, mr, changes: dict[str, Any],
     skipped: list[str] = []
     file_count = 0
 
-    for change in changes.get("changes", []):
-        file_path = change.get("new_path", change.get("old_path", "unknown"))
-        diff = change.get("diff", "")
-        collapsed = not diff and (change.get("collapsed") or change.get("too_large"))
+    for change in changes.files:
+        file_path = change.path or "unknown"
+        diff = change.diff
+        collapsed = not diff and change.collapsed
         if not diff and not collapsed:
             continue
         if skip and file_path in skip:
-            skipped.append(f"{_change_status(change)}: {file_path}")
+            skipped.append(f"{change.status}: {file_path}")
             continue
 
         file_count += 1
@@ -327,7 +306,7 @@ def extract_review_content(project, mr, changes: dict[str, Any],
             review_parts.append(
                 "\n[DIFF UNAVAILABLE — GitLab collapsed it (file too large); "
                 "current content below]\n")
-            if change.get("deleted_file"):
+            if change.deleted_file:
                 review_parts.append("[FILE DELETED]\n")
                 continue
             try:
@@ -348,12 +327,12 @@ def extract_review_content(project, mr, changes: dict[str, Any],
                 review_parts.append(f"[Unable to fetch content: {exc}]\n")
             continue
 
-        if change.get("deleted_file"):
+        if change.deleted_file:
             review_parts.append("\n[FILE DELETED]\n\n--- DIFF ---\n")
             review_parts.append(diff)
             continue
 
-        if change.get("new_file"):
+        if change.new_file:
             review_parts.append("\n[NEW FILE]\n\n--- DIFF ---\n")
             review_parts.append(diff)
             continue
@@ -393,7 +372,7 @@ def fetch_review_guidelines(project, ref: str) -> str:
         return ""
 
 
-def fetch_delta_changes(project, prev_sha: str, head_sha: str) -> dict[str, Any] | None:
+def fetch_delta_changes(project, prev_sha: str, head_sha: str) -> ChangeSet | None:
     """Changes-shaped dict with only the diffs between two SHAs (incremental
     re-review). None = can't compare (force-push, GC'd sha) -> full review."""
     try:
@@ -401,14 +380,14 @@ def fetch_delta_changes(project, prev_sha: str, head_sha: str) -> dict[str, Any]
         diffs = comp.get("diffs") if isinstance(comp, dict) else getattr(comp, "diffs", None)
         if not diffs:
             return None
-        return {"changes": diffs}
+        return to_changeset(diffs)
     except Exception as exc:  # noqa: BLE001
         logger.warning("compare %s..%s failed (%s) — falling back to full review",
                        prev_sha[:8], head_sha[:8], exc)
         return None
 
 
-def extract_diff_only(changes: dict[str, Any], max_chars: int | None = None,
+def extract_diff_only(changes: ChangeSet, max_chars: int | None = None,
                       skip: set[str] | None = None) -> str:
     """Compact diff for the triage stage (no file contents).
 
@@ -417,14 +396,13 @@ def extract_diff_only(changes: dict[str, Any], max_chars: int | None = None,
     parts: list[str] = []
     skipped: list[str] = []
     used = omitted = 0
-    for change in changes.get("changes", []):
-        file_path = change.get("new_path", change.get("old_path", "unknown"))
-        diff = change.get("diff", "")
-        collapsed = change.get("collapsed") or change.get("too_large")
-        if not diff and not collapsed:
+    for change in changes.files:
+        file_path = change.path or "unknown"
+        diff = change.diff
+        if not change.readable:
             continue
         if skip and file_path in skip:
-            skipped.append(f"{_change_status(change)}: {file_path}")
+            skipped.append(f"{change.status}: {file_path}")
             continue
         block = (f"\n--- {file_path} ---\n{diff}" if diff else
                  f"\n--- {file_path} ---\n[diff unavailable: file too large]")
@@ -483,12 +461,12 @@ def fetch_mr_comments(mr, bot_username: str = "", max_chars: int = 6000) -> str:
     return text
 
 
-def mr_header(mr_data: dict) -> str:
+def mr_header(title: str, author: str, source_branch: str, target_branch: str) -> str:
     return (
-        f"Merge Request: {mr_data['title']}\n"
-        f"Author: {mr_data['author']}\n"
-        f"Source Branch: {mr_data['source_branch']}\n"
-        f"Target Branch: {mr_data['target_branch']}"
+        f"Merge Request: {title}\n"
+        f"Author: {author}\n"
+        f"Source Branch: {source_branch}\n"
+        f"Target Branch: {target_branch}"
     )
 
 

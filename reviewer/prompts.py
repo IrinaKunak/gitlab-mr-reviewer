@@ -4,6 +4,10 @@ Final deliverables are translated to Russian by the translation stage
 (see TRANSLATE_SYSTEM). Do not add Russian prompt variants here.
 """
 
+from __future__ import annotations
+
+from .domain.models import Complexity, ReviewJob, TriageResult
+
 TRIAGE_SYSTEM = """You are a merge-request triage classifier for an automated code-review service.
 You receive MR metadata and the diff. Classify it quickly and precisely. Respond with JSON only.
 
@@ -34,7 +38,7 @@ reviewer; only their contents are withheld. Return [] when unsure."""
 TRIAGE_SCHEMA = {
     "type": "object",
     "properties": {
-        "complexity": {"type": "string", "enum": ["trivial", "normal", "complex"]},
+        "complexity": {"type": "string", "enum": [c.value for c in Complexity]},
         "risk_areas": {"type": "array", "items": {"type": "string"}},
         "jira_keys": {"type": "array", "items": {"type": "string"}},
         "needs_investigation": {"type": "boolean"},
@@ -268,12 +272,12 @@ def review_user_prompt(mr_header: str, review_content: str) -> str:
     )
 
 
-def triage_user_prompt(mr_data: dict, diff_summary: str, manifest: str = "") -> str:
+def triage_user_prompt(job: ReviewJob, diff_summary: str, manifest: str = "") -> str:
     parts = [
-        f"MR title: {mr_data.get('title', '')}",
-        f"Source branch: {mr_data.get('source_branch', '')}",
-        f"Target branch: {mr_data.get('target_branch', '')}",
-        f"Description:\n{(mr_data.get('description') or '')[:2000]}",
+        f"MR title: {job.title}",
+        f"Source branch: {job.source_branch}",
+        f"Target branch: {job.target_branch}",
+        f"Description:\n{job.description[:2000]}",
     ]
     if manifest:
         parts.append("===== CHANGED FILES (status, diff bytes, path) =====\n"
@@ -282,16 +286,16 @@ def triage_user_prompt(mr_data: dict, diff_summary: str, manifest: str = "") -> 
     return "\n\n".join(parts)
 
 
-def investigator_user_prompt(mr_data: dict, review_content: str, triage: dict,
+def investigator_user_prompt(job: ReviewJob, review_content: str, triage: TriageResult,
                              review_text: str) -> str:
-    jira = ", ".join(triage.get("jira_keys", [])) or "none found"
+    jira = ", ".join(triage.jira_keys) or "none found"
     return (
-        f"MR: {mr_data.get('title', '')} "
-        f"({mr_data.get('source_branch', '')} -> {mr_data.get('target_branch', '')})\n"
-        f"Project: {mr_data.get('project_path', '')}\n"
+        f"MR: {job.title} "
+        f"({job.source_branch} -> {job.target_branch})\n"
+        f"Project: {job.ref.project_path}\n"
         f"Jira keys: {jira}\n"
-        f"Triage summary: {triage.get('summary', '')}\n"
-        f"Risk areas: {', '.join(triage.get('risk_areas', []))}\n\n"
+        f"Triage summary: {triage.summary}\n"
+        f"Risk areas: {', '.join(triage.risk_areas)}\n\n"
         f"Code review already produced (for reference):\n{review_text}\n\n"
         f"===== MR DIFF AND FILE CONTEXT =====\n{review_content}"
     )

@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +26,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from . import __version__, gitlab_io, openrouter_models, overrides, state_layout, telegram_io, usage
 from .bridge import bridge
 from .config import deprecated_env_vars_in_use, retired_env_vars_in_use, settings
+from .domain.dedupe import DedupePolicy
+from .domain.models import DialogueJob, Job, ReviewJob, Tier
 from .pipeline import new_job_id, pipeline
 
 logging.basicConfig(
@@ -37,68 +40,20 @@ class ReviewQueue:
     """Bounded-concurrency MR processing with webhook-retry dedupe."""
 
     def __init__(self, workers: int, dedupe_ttl: int, burst_window: int = 30):
-        self.queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.workers = workers
-        self.dedupe_ttl = dedupe_ttl
-        self.burst_window = burst_window
-        self._seen: dict[tuple, float] = {}
-        self._mr_seen: dict[tuple, float] = {}
+        self.dedupe = DedupePolicy(dedupe_ttl, burst_window)
         self._tasks: list[asyncio.Task] = []
 
-    def dedupe_key(self, mr_data: dict) -> tuple:
-        return (mr_data["gitlab_config"]["name"], mr_data["project_id"],
-                mr_data["mr_iid"], mr_data.get("last_commit"))
-
-    def submit(self, mr_data: dict) -> bool:
-        """Returns False if this exact MR state was queued recently (webhook retry)."""
+    def submit(self, job: Job) -> bool:
+        """False if this exact MR state was queued recently (webhook retry / burst)."""
+        if not self.dedupe.admit(job, time.monotonic()):
+            return False
         # one id per queued job: log lines, TG alerts and the neutral MR
         # error note all carry it, so a user report maps back to the log
-        mr_data["job_id"] = new_job_id()
-        accepted = self._submit(mr_data)
-        if accepted:
-            logger.info("job %s: queued %s for MR !%s", mr_data["job_id"],
-                        mr_data.get("kind") or "review", mr_data.get("mr_iid"))
-        return accepted
-
-    def _submit(self, mr_data: dict) -> bool:
-        now = time.monotonic()
-        self._seen = {key: stamp for key, stamp in self._seen.items()
-                      if now - stamp < self.dedupe_ttl}
-        key = self.dedupe_key(mr_data)
-        if mr_data.get("kind") == "note":
-            # dialogue job: dedupe purely by note id (webhook retries) — the
-            # per-MR burst window must NOT apply, a reply right after a review
-            # event is exactly the case we want to serve
-            note_key = ("note", key[0], key[1], mr_data.get("note_id"))
-            if note_key in self._seen:
-                logger.info("Duplicate note webhook for %s — skipped", note_key)
-                return False
-            self._seen[note_key] = now
-            self.queue.put_nowait(mr_data)
-            return True
-        if mr_data.get("force_full"):
-            # explicit re-review request — bypass dedupe (the triggering label
-            # event carries the same sha the TTL window would swallow)
-            self._seen[key] = now
-            self._mr_seen[key[:3]] = now
-            self.queue.put_nowait(mr_data)
-            return True
-        if key in self._seen:
-            logger.info("Duplicate webhook for %s — skipped", key)
-            return False
-        # one user action can emit several events with different shas (e.g.
-        # reopen + update after new commits) — collapse the burst per MR; the
-        # queued review reads live MR state anyway, so nothing is lost
-        mr_key = key[:3]
-        last = self._mr_seen.get(mr_key)
-        if last is not None and now - last < self.burst_window:
-            logger.info("Burst duplicate for %s — skipped", mr_key)
-            return False
-        self._mr_seen = {k: s for k, s in self._mr_seen.items()
-                         if now - s < self.burst_window}
-        self._seen[key] = now
-        self._mr_seen[mr_key] = now
-        self.queue.put_nowait(mr_data)
+        job = replace(job, job_id=new_job_id())
+        self.queue.put_nowait(job)
+        logger.info("job %s: queued %s for MR !%s", job.job_id, job.kind, job.ref.mr_iid)
         return True
 
     async def start(self) -> None:
@@ -113,12 +68,12 @@ class ReviewQueue:
     async def _worker(self, idx: int) -> None:
         logger.info("review worker %d started", idx)
         while True:
-            mr_data = await self.queue.get()
+            job = await self.queue.get()
             try:
-                if mr_data.get("kind") == "note":
-                    await pipeline.process_note(mr_data)
-                else:
-                    await pipeline.process(mr_data)
+                if isinstance(job, DialogueJob):
+                    await pipeline.process_note(job)
+                elif isinstance(job, ReviewJob):
+                    await pipeline.process(job)
             except Exception:  # noqa: BLE001 — workers must survive anything
                 logger.exception("worker %d: unhandled pipeline error", idx)
             finally:
@@ -127,6 +82,11 @@ class ReviewQueue:
 
 review_queue = ReviewQueue(settings.server.workers, settings.dedupe.ttl,
                            settings.dedupe.burst_seconds)
+
+# instance name -> the bot's own GitLab username, learned at startup so note
+# webhooks from the bot itself are dropped at the door instead of queueing a
+# job (every review post fires one). Runtime state, kept out of the config.
+bot_usernames: dict[str, str] = {}
 
 _last_unknown_token_alert = 0.0
 _UNKNOWN_TOKEN_ALERT_INTERVAL = 900  # unauthenticated requests must not drive TG spam
@@ -145,26 +105,24 @@ async def _alert_unknown_token(event_type: str | None, token: str | None) -> Non
 
 async def _verify_instances() -> None:
     """Startup connectivity check (non-fatal, v1 behavior)."""
-    for config in settings.gitlab.routes.values():
+    for instance in settings.gitlab.routes.values():
         try:
-            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, config)
-            # remembered so note webhooks from the bot itself are dropped at
-            # the door instead of queueing a job (every review post fires one)
-            config["bot_username"] = getattr(
+            gl = await asyncio.to_thread(gitlab_io.get_gitlab_client, instance)
+            bot_usernames[instance.name] = getattr(
                 getattr(gl, "user", None), "username", "") or ""
-            logger.info("GitLab instance OK: %s (%s), bot=%s", config["name"],
-                        config["url"], config["bot_username"] or "?")
+            logger.info("GitLab instance OK: %s (%s), bot=%s", instance.name,
+                        instance.url, bot_usernames[instance.name] or "?")
         except Exception as exc:  # noqa: BLE001
-            logger.error("GitLab instance %s connection failed: %s", config["name"], exc)
+            logger.error("GitLab instance %s connection failed: %s", instance.name, exc)
             await telegram_io.notify_error(
                 "gitlab_api_error", f"Startup connection failed: {exc}",
-                {"gitlab_instance": config["name"]})
+                {"gitlab_instance": instance.name})
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("GitLab MR Reviewer v%s starting", __version__)
-    logger.info("Instances: %s", [c["name"] for c in settings.gitlab.routes.values()])
+    logger.info("Instances: %s", [i.name for i in settings.gitlab.routes.values()])
     logger.info("Flags: investigator=%s bridge=%s tester_report=%s "
                 "review_repo_tools=%s dialogue=%s provider=%s",
                 settings.pipeline.stages.investigator,
@@ -272,8 +230,7 @@ async def get_models(request: Request) -> dict[str, Any]:
     vendor-prefixed ids route via OpenRouter, priced from the live catalog)."""
     _dash_guard(request)
     ov = overrides.load()
-    defaults = {"fast": settings.llm.tiers.fast.model, "main": settings.llm.tiers.main.model,
-                "smart": settings.llm.tiers.smart.model}
+    defaults = {tier.value: settings.model_for_tier(tier) for tier in Tier}
     catalog = await asyncio.to_thread(openrouter_models.refresh)
     or_models = [{"id": mid, "in": price[0], "out": price[1]}
                  for mid, price in sorted(catalog.items())]
@@ -307,8 +264,8 @@ async def handle_gitlab_webhook(request: Request):
     event_type = request.headers.get("X-Gitlab-Event")
     gitlab_token = request.headers.get("X-Gitlab-Token")
 
-    gitlab_config = settings.gitlab.routes.get(gitlab_token or "")
-    if not gitlab_config:
+    instance = settings.gitlab.routes.get(gitlab_token or "")
+    if not instance:
         logger.warning("No GitLab instance found for webhook token: %s",
                        (gitlab_token or "")[:10])
         await _alert_unknown_token(event_type, gitlab_token)
@@ -324,22 +281,20 @@ async def handle_gitlab_webhook(request: Request):
     if event_type == "Note Hook":
         if not settings.pipeline.stages.dialogue:
             return {"status": "ignored", "reason": "dialogue disabled"}
-        note_data = gitlab_io.parse_note_webhook(payload)
-        if not note_data:
+        note_job = gitlab_io.parse_note_webhook(payload, instance)
+        if not note_job:
             return {"status": "ignored", "reason": "not an MR comment"}
-        bot = gitlab_config.get("bot_username", "")
-        if bot and note_data.get("note_author") == bot:
+        bot = bot_usernames.get(instance.name, "")
+        if bot and note_job.note_author == bot:
             return {"status": "ignored", "reason": "own note"}
-        note_data["gitlab_config"] = gitlab_config
-        accepted = review_queue.submit(note_data)
+        queued = review_queue.submit(note_job)
         logger.info("%s dialogue for note %s on MR !%s in project %s on %s",
-                    "Queued" if accepted else "Deduped", note_data["note_id"],
-                    note_data["mr_iid"], note_data["project_id"],
-                    gitlab_config["name"])
+                    "Queued" if queued else "Deduped", note_job.note_id,
+                    note_job.ref.mr_iid, note_job.ref.project_id, instance.name)
         return {
-            "status": "accepted" if accepted else "duplicate",
-            "merge_request": note_data["mr_iid"],
-            "instance": gitlab_config["name"],
+            "status": "accepted" if queued else "duplicate",
+            "merge_request": note_job.ref.mr_iid,
+            "instance": instance.name,
         }
 
     if event_type != "Merge Request Hook":
@@ -347,7 +302,7 @@ async def handle_gitlab_webhook(request: Request):
         return {"status": "ignored", "reason": f"Not a merge request event: {event_type}"}
 
     try:
-        mr_data = gitlab_io.parse_merge_request_webhook(payload)
+        review_job = gitlab_io.parse_merge_request_webhook(payload, instance)
     except Exception as exc:  # noqa: BLE001
         # the caller is GitLab (its hook log is visible to project maintainers):
         # exception text stays in our log/alert, the response carries only an id
@@ -359,16 +314,15 @@ async def handle_gitlab_webhook(request: Request):
         return JSONResponse(status_code=500,
                             content={"detail": "internal error", "job_id": job_id})
 
-    if not mr_data:
+    if not review_job:
         return {"status": "ignored", "reason": "Invalid or unsupported MR action"}
 
-    mr_data["gitlab_config"] = gitlab_config
-    accepted = review_queue.submit(mr_data)
+    queued = review_queue.submit(review_job)
     logger.info("%s quality check for MR !%s in project %s on %s",
-                "Queued" if accepted else "Deduped", mr_data["mr_iid"],
-                mr_data["project_id"], gitlab_config["name"])
+                "Queued" if queued else "Deduped", review_job.ref.mr_iid,
+                review_job.ref.project_id, instance.name)
     return {
-        "status": "accepted" if accepted else "duplicate",
-        "merge_request": mr_data["mr_iid"],
-        "instance": gitlab_config["name"],
+        "status": "accepted" if queued else "duplicate",
+        "merge_request": review_job.ref.mr_iid,
+        "instance": instance.name,
     }

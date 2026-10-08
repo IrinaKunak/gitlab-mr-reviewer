@@ -31,9 +31,11 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from .domain.models import InstanceRef, Tier
+
 load_dotenv()
 
-TIERS = ("fast", "main", "smart")
+TIERS = tuple(Tier)
 LEGACY_INSTANCE_SLOTS = ("", *(f"_{i}" for i in range(2, 11)))  # "" = primary
 LEGACY_CHAT_SLOTS = ("", *(f"_{i}" for i in range(1, 11)))
 
@@ -64,9 +66,9 @@ class GitLabSection(_Section):
     instances: list[GitLabInstance] = []
     # GITLAB_URL[_N] trios; used only when `instances` is empty (config.yaml wins)
     legacy_instances: list[GitLabInstance] = Field(default=[], exclude=True)
-    # webhook token -> instance dict, the shape the pipeline consumes until the
-    # domain models of stage 9 (startup still writes bot_username into it)
-    routes: dict[str, dict] = Field(default={}, exclude=True)
+    # webhook token -> instance (X-Gitlab-Token routing); immutable — the
+    # bot's username per instance is runtime state kept by the server
+    routes: dict[str, InstanceRef] = Field(default={}, exclude=True)
 
     @model_validator(mode="after")
     def _build_routes(self) -> GitLabSection:
@@ -78,7 +80,7 @@ class GitLabSection(_Section):
             raise ValueError(f"duplicate GitLab instance names: {names}")
         if len(set(hooks)) != len(hooks):
             raise ValueError("two GitLab instances share a webhook token")
-        self.routes = {i.webhook_token: {"name": i.name, "url": i.url, "token": i.token}
+        self.routes = {i.webhook_token: InstanceRef(i.name, i.url, i.token)
                        for i in self.instances}
         return self
 
@@ -93,13 +95,13 @@ class TierConfig(_Section):
 
 
 DEFAULT_TIERS: dict[str, dict[str, Any]] = {
-    "fast": {"model": "claude-haiku-4-5",
+    Tier.FAST: {"model": "claude-haiku-4-5",
              "fallback": ["anthropic/claude-haiku-4.5", "google/gemini-3.5-flash-lite",
                           "deepseek/deepseek-v4-flash"]},
-    "main": {"model": "claude-sonnet-5",
+    Tier.MAIN: {"model": "claude-sonnet-5",
              "fallback": ["anthropic/claude-sonnet-5", "google/gemini-3.6-flash",
                           "deepseek/deepseek-v4-pro"]},
-    "smart": {"model": "claude-opus-5",
+    Tier.SMART: {"model": "claude-opus-5",
               "fallback": ["anthropic/claude-opus-5", "openai/gpt-5.6-terra",
                            "moonshotai/kimi-k3"]},
 }
@@ -120,10 +122,11 @@ class TiersSection(_Section):
                            for tier, value in data.items()
                            if tier in DEFAULT_TIERS and isinstance(value, dict)}}
 
-    def get(self, tier: str) -> TierConfig:
+    def get(self, tier: Tier | str) -> TierConfig:
         if tier not in TIERS:
-            raise ValueError(f"unknown tier {tier!r} (expected one of {TIERS})")
-        return getattr(self, tier)
+            raise ValueError(f"unknown tier {tier!r} (expected one of "
+                             f"{[t.value for t in TIERS]})")
+        return getattr(self, Tier(tier).value)
 
 
 class AnthropicSection(_Section):
@@ -461,10 +464,10 @@ class Settings(BaseSettings):
         # BRIDGE=on as the whole `bridge` section and fail on it
         return init_settings, FlatEnvSource(settings_cls), YamlFileSource(settings_cls)
 
-    def model_for_tier(self, tier: str) -> str:
+    def model_for_tier(self, tier: Tier | str) -> str:
         return self.llm.tiers.get(tier).model
 
-    def fallback_chain(self, tier: str) -> list[str]:
+    def fallback_chain(self, tier: Tier | str) -> list[str]:
         return self.llm.tiers.get(tier).fallback
 
 

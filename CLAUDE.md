@@ -20,10 +20,19 @@ Entry point: `python -m reviewer` (`reviewer/__main__.py`, the Dockerfile CMD).
 - **reviewer/server.py** — FastAPI app: `POST /webhook` (MR events, contract unchanged
   from v1, **plus Note Hook** → dialogue jobs on the same queue, deduped by note id and
   exempt from the burst window), `GET /` (health + flags), `GET /stats` (token/cost
-  aggregates); asyncio queue with N workers; webhook dedupe (exact-SHA TTL + per-MR
-  burst window); lifespan starts the bridge listener and GitLab startup checks (which
-  also capture each instance's `bot_username` so the bot's own notes are dropped at
-  the door)
+  aggregates); asyncio queue of `Job`s with N workers; webhook dedupe via
+  `domain.dedupe.DedupePolicy` (exact-SHA TTL + per-MR burst window); lifespan starts
+  the bridge listener and GitLab startup checks (which fill `server.bot_usernames`,
+  instance name → bot login, so the bot's own notes are dropped at the door — the
+  instance config itself is immutable)
+- **reviewer/domain/** — pure layer, no I/O/settings: `models.py` (frozen
+  `InstanceRef`, `MergeRequestRef`, `ReviewJob`/`DialogueJob`, `ChangeSet`/`FileChange`,
+  `TriageResult`, `ReviewResult`, `Investigation`; StrEnums `Tier`, `Complexity`,
+  `JobKind` that compare equal to the plain strings in config/overrides/usage.jsonl),
+  `skip.py` (`resolve_skip`), `budget.py` (the big-MR degradation ladder),
+  `dedupe.py`, `investigation.py`. Adapters build models at the edge:
+  `gitlab_io.parse_*_webhook(payload, instance)` → jobs, `gitlab_io.to_changeset`
+  for GitLab `changes`/`compare` payloads
 - **reviewer/pipeline.py** — stage orchestrator: triage (fast) → review (main,
   **agentic with repo tools** — see below) → investigator (smart, agentic, complex MRs
   only) → translate EN→RU → deliver review (+impact analysis) and tester report; one
@@ -259,7 +268,9 @@ bridge question fails the test. State stores
 it at the scenario's temp dir is enough — no module caches to reset; use
 `<module>._store.invalidate()` to simulate a cold start.
 
-Every bug fix gets a regression test in `tests/test_unit.py`. When checking pytest results
+Pure-function tests live in `tests/test_domain.py` (no fakes); `tests/factories.py`
+builds jobs/refs with defaults (`review_job(mr_iid=7, last_commit="abc")`).
+Every bug fix gets a regression test in `tests/test_unit.py` (or `test_domain.py`). When checking pytest results
 in a shell chain, test `${PIPESTATUS[0]}`, not the pipe's exit code.
 
 ## Deployment (production: r.smysl.pro)

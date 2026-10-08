@@ -33,6 +33,7 @@ from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 from . import overrides, telegram_io, usage
 from .config import Settings
 from .config import settings as default_settings
+from .domain.models import Tier
 from .json_store import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -299,7 +300,7 @@ class AIClient:
     # --- model params per tier ---
 
     @staticmethod
-    def _record_agent_usage(tier: str, model: str, provider: str,
+    def _record_agent_usage(tier: Tier, model: str, provider: str,
                             total_in: int, total_out: int,
                             total_cr: int, total_cc: int) -> None:
         """Record accumulated agent-loop tokens — called on EVERY exit path;
@@ -309,7 +310,7 @@ class AIClient:
                          input_tokens=total_in, output_tokens=total_out,
                          cache_read_tokens=total_cr, cache_creation_tokens=total_cc)
 
-    async def _check_prompt_cache(self, tier: str, model: str, provider: str,
+    async def _check_prompt_cache(self, tier: Tier, model: str, provider: str,
                                   iterations: int, total_in: int,
                                   total_cr: int, total_cc: int) -> None:
         """Warn (and alert once per review) when an agent loop paid full price
@@ -331,14 +332,14 @@ class AIClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("prompt cache alert not sent: %s", exc)
 
-    def _primary_params(self, tier: str, effort: str | None, model: str = "") -> dict:
+    def _primary_params(self, tier: Tier, effort: str | None, model: str = "") -> dict:
         """Thinking/effort config valid for the primary Claude model of this tier."""
         params: dict[str, Any] = {}
         if model.startswith("claude-haiku"):
             # haiku (any tier, e.g. via runtime override): no thinking param,
             # no effort — both 400 on it
             return params
-        if tier == "smart":
+        if tier == Tier.SMART:
             # only the investigator thinks: on big-diff reviews adaptive thinking
             # ate the entire max_tokens budget before emitting any text (prod,
             # 2026-07-22) while the non-thinking fallback wrote a great review
@@ -348,7 +349,7 @@ class AIClient:
         # NB fast/main fall through to thinking=disabled with NO effort. On
         # claude-opus-5 disabled thinking is a 400 at effort xhigh/max but fine
         # at the default (high) — so effort must stay unset on those tiers.
-        elif tier == "main":
+        elif tier == Tier.MAIN:
             if model.startswith("claude-sonnet-5-5"):
                 # sonnet-5-5 400s on "disabled" (prod 2026-09-29, !127) — its
                 # thinking-off mode is "between_tools": no other field allowed,
@@ -445,7 +446,7 @@ class AIClient:
 
     async def complete(
         self,
-        tier: str,
+        tier: Tier,
         system: str,
         user_content: str,
         *,
@@ -517,7 +518,7 @@ class AIClient:
 
         return self._finish(tier, result, cache_key, use_cache, json_schema, started)
 
-    def _finish(self, tier: str, result: AIResult, cache_key: str,
+    def _finish(self, tier: Tier, result: AIResult, cache_key: str,
                 use_cache: bool, json_schema: dict | None, started: float) -> AIResult:
         logger.info(
             "ai ok tier=%s model=%s provider=%s in=%d cached=%d out=%d %.1fs",
@@ -535,14 +536,14 @@ class AIClient:
             self._cache_put(cache_key, result.text)
         return result
 
-    async def complete_json(self, tier: str, system: str, user_content: str,
+    async def complete_json(self, tier: Tier, system: str, user_content: str,
                             schema: dict, *, max_tokens: int = 2048) -> dict | None:
         """Structured completion: schema-enforced on primary, lenient parse on fallback."""
         result = await self.complete(tier, system, user_content, max_tokens=max_tokens,
                                      json_schema=schema, use_cache=False)
         return extract_json(result.text)
 
-    async def _fallback_complete(self, tier: str, system: str, messages: list,
+    async def _fallback_complete(self, tier: Tier, system: str, messages: list,
                                  max_tokens: int, json_schema: dict | None,
                                  timeout: float | None, cause: Exception | None,
                                  chain: list[str] | None = None) -> AIResult:
@@ -600,7 +601,7 @@ class AIClient:
 
     async def agent_loop(
         self,
-        tier: str,
+        tier: Tier,
         system: str,
         user_content: str,
         tools: list[ToolDef],

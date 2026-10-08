@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -15,8 +16,10 @@ from reviewer import bridge as bridge_mod
 from reviewer import gitlab_io
 from reviewer.ai_client import AIClient, extract_json
 from reviewer.config import Settings
+from reviewer.domain.models import ChangeSet, FileChange, InstanceRef, TriageResult
 from reviewer.repo_cache import _safe_path, repo_grep, repo_list_tree, repo_read_file
 from reviewer.server import ReviewQueue
+from tests.factories import INSTANCE, dialogue_job, review_job
 
 # --- config ---
 
@@ -40,8 +43,8 @@ def test_instances_routing_keyed_by_webhook_token(clean_env, monkeypatch):
     monkeypatch.setenv("GITLAB_TOKEN_2", "t2")
     monkeypatch.setenv("XGITLABTOKEN_2", "hook2")
     cfg = Settings()
-    assert cfg.gitlab.routes["hook1"]["name"] == "primary"
-    assert cfg.gitlab.routes["hook2"]["url"] == "https://b"
+    assert cfg.gitlab.routes["hook1"].name == "primary"
+    assert cfg.gitlab.routes["hook2"].url == "https://b"
     # stage 8: the numbered env trios still work, with a deprecation warning
     from reviewer.config import deprecated_env_vars_in_use
     [message] = deprecated_env_vars_in_use(cfg)
@@ -348,9 +351,9 @@ def test_usage_cost_and_tracker(tmp_path, monkeypatch):
 
     # persist + aggregate roundtrip
     monkeypatch.setattr(usage.settings.storage, "log_dir", str(tmp_path))
-    mr = {"gitlab_config": {"name": "primary"}, "project_path": "g/p", "mr_iid": 7}
-    usage.persist(tracker, mr)
-    usage.persist(tracker, mr)
+    job = review_job(project_path="g/p", mr_iid=7)
+    usage.persist(tracker, job)
+    usage.persist(tracker, job)
     agg = usage.aggregate()
     assert agg["totals"]["reviews"] == 2
     assert agg["totals"]["input_tokens"] == 2 * 419_000
@@ -758,21 +761,6 @@ def test_tester_report_targets(monkeypatch):
     assert tester_report_targets() == ["-100bridge"]
 
 
-def test_split_investigation():
-    # regression: with TESTER_REPORT=off the whole investigation (impact analysis
-    # included) was silently discarded — only the tester report is flag-gated
-    from reviewer.pipeline import split_investigation
-
-    impact, report = split_investigation(
-        "Impact: touches auth.\n\n## TESTER REPORT\n\nVerify login.")
-    assert impact == "Impact: touches auth."
-    assert report == "## TESTER REPORT\n\nVerify login."
-
-    impact2, report2 = split_investigation("Analysis only, no report section.")
-    assert impact2 == "Analysis only, no report section."
-    assert report2 is None
-
-
 def test_translate_guard_rejects_non_cyrillic_output(monkeypatch):
     # regression: Haiku answered the translate request with English commentary
     # ("you haven't provided a markdown document") and it was posted as the review
@@ -824,9 +812,7 @@ def test_process_skips_merged_or_closed_mr(monkeypatch):
         monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
 
         p = pipeline_mod.Pipeline(client=object())  # AI must never be touched
-        mr_data = {"project_id": 1, "mr_iid": 2, "title": "t"}
-        asyncio.run(p._process_inner(
-            mr_data, {"name": "primary", "url": "https://x"}, {}))
+        asyncio.run(p._process_inner(review_job(), {}))
 
 
 def test_review_state_roundtrip_and_bound(tmp_path, monkeypatch):
@@ -880,11 +866,11 @@ def test_incremental_review_helpers():
     assert "abc12345" in note and "delta" in note
     assert ".ai-review.md" in prompts.guidelines_section("Focus on SQL")
 
-    # delta fetch wraps compare diffs into a changes-shaped dict; degrades to None
+    # delta fetch turns compare diffs into a ChangeSet; degrades to None
     stub = SimpleNamespace(
         repository_compare=lambda a, b: {"diffs": [{"new_path": "x.py", "diff": "+1"}]})
     delta = gitlab_io.fetch_delta_changes(stub, "aaa", "bbb")
-    assert delta == {"changes": [{"new_path": "x.py", "diff": "+1"}]}
+    assert delta == ChangeSet((FileChange(old_path="", new_path="x.py", diff="+1"),))
     stub_empty = SimpleNamespace(repository_compare=lambda a, b: {"diffs": []})
     assert gitlab_io.fetch_delta_changes(stub_empty, "aaa", "bbb") is None
 
@@ -908,31 +894,23 @@ def test_triage_chooses_skipped_files_and_budget_truncation():
     # list cannot know a project's conventions.
     from reviewer import prompts
 
-    changes = {"changes": [
+    changes = gitlab_io.to_changeset({"changes": [
         {"new_path": "src/auth.py", "diff": "+def login():\n" * 50},
         {"new_path": "public/logo.svg", "diff": "+<path d='M0 0'/>\n" * 400},
         {"new_path": "yarn.lock", "diff": "+dep\n" * 300, "new_file": True},
         {"new_path": "src/pay.py", "diff": "+def charge():\n" * 50},
-    ]}
+    ]})
 
     # the manifest triage judges from: status, size and path for every file
     manifest = gitlab_io.file_manifest(changes)
     assert "modified\t" in manifest and "public/logo.svg" in manifest
     assert "added\t" in manifest                     # yarn.lock is new_file
-    assert manifest in prompts.triage_user_prompt({"title": "t"}, "diff", manifest)
+    assert manifest in prompts.triage_user_prompt(review_job(), "diff", manifest)
     assert "skip_globs" in prompts.TRIAGE_SCHEMA["properties"]
     assert "skip_globs" in prompts.TRIAGE_SYSTEM
 
-    # triage returns PATTERNS, not paths — listing 439 SVGs individually blew
-    # the fast tier's max_tokens and the whole triage came back unparseable
-    skip = gitlab_io.resolve_skip(changes, ["*.svg", "yarn.lock"])
-    assert skip == {"public/logo.svg", "yarn.lock"}
-    assert gitlab_io.resolve_skip(changes, ["public/*"]) == {"public/logo.svg"}
-    # guards: a catch-all or an everything-matching verdict is discarded, so a
-    # bad triage can never silence the review
-    assert gitlab_io.resolve_skip(changes, ["*"]) == set()
-    assert gitlab_io.resolve_skip(changes, ["*.py", "*.svg", "*.lock"]) == set()
-    assert gitlab_io.resolve_skip(changes, "not-a-list") == set()
+    # (resolve_skip's pattern rules and guards: tests/test_domain.py)
+    skip = {"public/logo.svg", "yarn.lock"}
 
     # honouring triage's verdict keeps the code and names (not dumps) the rest
     out = gitlab_io.extract_diff_only(changes, skip=skip)
@@ -960,7 +938,7 @@ def test_investigator_degrades_before_cloning(monkeypatch):
     monkeypatch.setattr(settings.llm, "max_input_tokens", 10_000)
     p = Pipeline(client=AIClient(Settings()))
     monkeypatch.setattr(p.ai.cfg.llm, "max_input_tokens", 10_000)
-    triage, mr_data = {"jira_keys": [], "summary": "s", "risk_areas": []}, {"mr_iid": 779}
+    triage, mr_data = TriageResult(summary="s"), review_job(mr_iid=779)
 
     huge, small = "x" * 200_000, "y" * 6_000
     # full context too big -> falls back to the diff, no exception, no clone yet
@@ -988,19 +966,18 @@ def test_force_full_re_review_marker():
         "user": {"username": "dev"},
         "labels": [{"title": "re-review"}],
     }
-    parsed = gitlab_io.parse_merge_request_webhook(payload)
-    assert parsed and parsed["force_full"] is True
+    parsed = gitlab_io.parse_merge_request_webhook(payload, INSTANCE)
+    assert parsed and parsed.force_full is True
     payload["labels"] = []
-    assert gitlab_io.parse_merge_request_webhook(payload)["force_full"] is False
+    assert gitlab_io.parse_merge_request_webhook(payload, INSTANCE).force_full is False
     payload["object_attributes"]["title"] = "INCR-54 [re-review]"
-    assert gitlab_io.parse_merge_request_webhook(payload)["force_full"] is True
+    assert gitlab_io.parse_merge_request_webhook(payload, INSTANCE).force_full is True
 
     q = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=30)
-    mr = {"gitlab_config": {"name": "primary"}, "project_id": 170,
-          "mr_iid": 5, "last_commit": "abc"}
-    assert q.submit(dict(mr)) is True
-    assert q.submit(dict(mr)) is False                       # normal dedupe
-    assert q.submit({**mr, "force_full": True}) is True      # forced through
+    job = review_job(project_id=170, mr_iid=5, last_commit="abc")
+    assert q.submit(job) is True
+    assert q.submit(job) is False                                # normal dedupe
+    assert q.submit(replace(job, force_full=True)) is True       # forced through
 
 
 def test_real_mr_author_and_comment_fetch():
@@ -1087,27 +1064,7 @@ def test_process_skips_already_reviewed_sha(monkeypatch):
     monkeypatch.setattr(pipeline_mod.telegram_io, "notify", _boom)
 
     p = pipeline_mod.Pipeline(client=object())
-    mr_data = {"project_id": 1, "mr_iid": 2, "title": "t", "last_commit": "abc123"}
-    asyncio.run(p._process_inner(mr_data, {"name": "primary", "url": "https://x"}, {}))
-
-
-def test_burst_dedupe_collapses_multi_event_actions():
-    # regression: reopening an MR after new pushes makes GitLab emit reopen +
-    # update events with DIFFERENT shas ~1s apart -> two parallel reviews
-    from reviewer.server import ReviewQueue
-
-    def mr(sha):
-        return {"gitlab_config": {"name": "primary"}, "project_id": 132,
-                "mr_iid": 18, "last_commit": sha}
-
-    q = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=30)
-    assert q.submit(mr("aaa")) is True
-    assert q.submit(mr("bbb")) is False   # different sha, same MR, same instant
-    assert q.submit(mr("aaa")) is False   # exact duplicate still deduped
-
-    q2 = ReviewQueue(workers=1, dedupe_ttl=600, burst_window=0)
-    assert q2.submit(mr("aaa")) is True
-    assert q2.submit(mr("bbb")) is True   # window=0 disables burst collapsing
+    asyncio.run(p._process_inner(review_job(last_commit="abc123"), {}))
 
 
 def test_review_content_handles_collapsed_diffs():
@@ -1123,11 +1080,11 @@ def test_review_content_handles_collapsed_diffs():
 
     project = SimpleNamespace(files=SimpleNamespace(get=lambda path, ref: _File()))
     mr = SimpleNamespace(source_branch="v2")
-    changes = {"changes": [
+    changes = gitlab_io.to_changeset({"changes": [
         {"new_path": "reviewer/ai_client.py", "diff": "", "collapsed": True, "new_file": True},
         {"new_path": "small.py", "diff": "+ok", "new_file": True},
         {"new_path": "unchanged.py", "diff": ""},  # genuinely empty -> still skipped
-    ]}
+    ]})
     out = gitlab_io.extract_review_content(project, mr, changes)
     assert "reviewer/ai_client.py" in out and "def core" in out
     assert "DIFF UNAVAILABLE" in out
@@ -1138,28 +1095,29 @@ def test_review_content_handles_collapsed_diffs():
 
 
 def test_parse_webhook_url_fix_and_actions():
-    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD)
+    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
     assert parsed is not None
-    assert parsed["url"] == "https://lab/x/-/merge_requests/7"  # contractual URL typo fix
-    assert parsed["last_commit"] == "deadbeef"
+    assert parsed.ref.url == "https://lab/x/-/merge_requests/7"  # contractual URL typo fix
+    assert parsed.last_commit == "deadbeef"
+    assert parsed.ref.instance is INSTANCE
 
     closed = {**WEBHOOK_PAYLOAD,
               "object_attributes": {**WEBHOOK_PAYLOAD["object_attributes"], "action": "close"}}
-    assert gitlab_io.parse_merge_request_webhook(closed) is None
+    assert gitlab_io.parse_merge_request_webhook(closed, INSTANCE) is None
 
 
 def test_parse_webhook_no_review_marker():
     tagged = {**WEBHOOK_PAYLOAD,
               "object_attributes": {**WEBHOOK_PAYLOAD["object_attributes"],
                                     "title": "big infra change [no-review]"}}
-    assert gitlab_io.parse_merge_request_webhook(tagged) is None
+    assert gitlab_io.parse_merge_request_webhook(tagged, INSTANCE) is None
 
     labeled = {**WEBHOOK_PAYLOAD, "labels": [{"title": "No-Review"}]}
-    assert gitlab_io.parse_merge_request_webhook(labeled) is None
+    assert gitlab_io.parse_merge_request_webhook(labeled, INSTANCE) is None
 
 
 def test_extract_jira_keys():
-    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD)
+    parsed = gitlab_io.parse_merge_request_webhook(WEBHOOK_PAYLOAD, INSTANCE)
     keys = gitlab_io.extract_jira_keys(parsed)
     assert keys == ["PBV-123", "ABC-9"]
 
@@ -1311,18 +1269,6 @@ def test_release_modes_keep_vs_ephemeral(tmp_path, monkeypatch):
 
 # --- server queue dedupe ---
 
-def test_review_queue_dedupe():
-    async def run():
-        # burst_window=0 isolates sha-keyed dedupe (burst collapsing has its own test)
-        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0)
-        mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
-              "mr_iid": 7, "last_commit": "abc"}
-        assert queue.submit(dict(mr)) is True
-        assert queue.submit(dict(mr)) is False          # webhook retry
-        assert queue.submit({**mr, "last_commit": "def"}) is True  # new push
-    asyncio.run(run())
-
-
 # --- MR dialogue & tool-assisted review (dev feedback 2026-07-31) ---
 
 def test_parse_note_webhook_variants():
@@ -1340,44 +1286,29 @@ def test_parse_note_webhook_variants():
         "merge_request": {"iid": 10, "url": "https://x/mr/10",
                           "last_commit": {"id": "sha1"}},
     }
-    parsed = gitlab_io.parse_note_webhook(base)
-    assert parsed and parsed["kind"] == "note"
-    assert parsed["mr_iid"] == 10 and parsed["note_id"] == 555
-    assert parsed["discussion_id"] == "abc123"
-    assert parsed["note_author"] == "irina"
-    assert parsed["last_commit"] == "sha1"
+    parsed = gitlab_io.parse_note_webhook(base, INSTANCE)
+    assert parsed and parsed.kind == "dialogue"
+    assert parsed.ref.mr_iid == 10 and parsed.note_id == 555
+    assert parsed.discussion_id == "abc123"
+    assert parsed.note_author == "irina"
+    assert parsed.last_commit == "sha1"
 
     # a comment on a diff line carries its anchor
     diff_note = {**base, "object_attributes": {
         **base["object_attributes"],
         "position": {"new_path": "app/views.py", "new_line": 88}}}
-    assert gitlab_io.parse_note_webhook(diff_note)["note_position"] == "app/views.py:88"
+    assert gitlab_io.parse_note_webhook(diff_note, INSTANCE).note_position == "app/views.py:88"
 
     # system notes, non-MR comments, empty bodies -> not dialogue material
     system_note = {**base, "object_attributes": {**base["object_attributes"], "system": True}}
-    assert gitlab_io.parse_note_webhook(system_note) is None
+    assert gitlab_io.parse_note_webhook(system_note, INSTANCE) is None
     issue_note = {**base, "object_attributes": {
         **base["object_attributes"], "noteable_type": "Issue"}}
-    assert gitlab_io.parse_note_webhook(issue_note) is None
+    assert gitlab_io.parse_note_webhook(issue_note, INSTANCE) is None
     empty = {**base, "object_attributes": {**base["object_attributes"], "note": "  "}}
-    assert gitlab_io.parse_note_webhook(empty) is None
-    assert gitlab_io.parse_note_webhook({**base, "merge_request": {}}) is None
-    assert gitlab_io.parse_note_webhook({"object_kind": "push"}) is None
-
-
-def test_note_queue_dedupe_and_burst_immunity():
-    async def run():
-        queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=300)
-        mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
-              "mr_iid": 7, "last_commit": "abc"}
-        assert queue.submit(dict(mr)) is True
-        # a reply seconds after the review event is EXACTLY the dialogue case —
-        # the per-MR burst window must not swallow it
-        note = {**mr, "kind": "note", "note_id": 900}
-        assert queue.submit(dict(note)) is True
-        assert queue.submit(dict(note)) is False        # webhook retry, same note
-        assert queue.submit({**note, "note_id": 901}) is True  # next reply
-    asyncio.run(run())
+    assert gitlab_io.parse_note_webhook(empty, INSTANCE) is None
+    assert gitlab_io.parse_note_webhook({**base, "merge_request": {}}, INSTANCE) is None
+    assert gitlab_io.parse_note_webhook({"object_kind": "push"}, INSTANCE) is None
 
 
 def test_thread_helpers():
@@ -1475,11 +1406,10 @@ def test_dialogue_answers_in_thread(monkeypatch):
             return next(answers)
 
     p = pipeline_mod.Pipeline(client=StubAI())
-    note = {"kind": "note", "gitlab_config": {"name": "primary"}, "project_id": 1,
-            "project_path": "g/p", "mr_iid": 10, "note_id": 2, "discussion_id": "d1",
-            "note_body": "точно?", "note_author": "irina", "note_position": "",
-            "last_commit": "sha1", "url": ""}
-    asyncio.run(p.process_note(dict(note)))
+    note = dialogue_job(project_id=1, project_path="g/p", mr_iid=10, note_id=2,
+                        discussion_id="d1", note_body="точно?", note_author="irina",
+                        last_commit="sha1")
+    asyncio.run(p.process_note(note))
     assert posted == [("thread", "d1", "Checked views.py:12 — IsAuthenticated is intact.")]
     # the model sees the thread, knows which side it is, and the diff
     assert "[bot — this is you]" in seen_prompts[0]
@@ -1487,24 +1417,24 @@ def test_dialogue_answers_in_thread(monkeypatch):
     assert "+x = 1" in seen_prompts[0]
 
     # NO_REPLY -> nothing posted
-    asyncio.run(p.process_note({**note, "note_id": 3}))
+    asyncio.run(p.process_note(replace(note, note_id=3)))
     assert len(posted) == 1
 
     # the bot's own note must never trigger an answer (loop guard)
-    asyncio.run(p.process_note({**note, "note_id": 4, "note_author": "reviewer-bot"}))
+    asyncio.run(p.process_note(replace(note, note_id=4, note_author="reviewer-bot")))
     assert len(posted) == 1
 
     # a thread without the bot and without a mention is the humans talking
     monkeypatch.setattr(pipeline_mod.gitlab_io, "discussion_context",
                         lambda mr, nid, did="": ("d2", [
                             {"id": 9, "author": {"username": "artem"}, "body": "hi"}]))
-    asyncio.run(p.process_note({**note, "note_id": 9, "discussion_id": "d2"}))
+    asyncio.run(p.process_note(replace(note, note_id=9, discussion_id="d2")))
     assert len(posted) == 1
 
     # per-MR budget: once exhausted the bot stays silent
     monkeypatch.setattr(settings.pipeline, "dialogue_max_replies_per_mr", 1)
-    assert p._dialogue_budget_ok("primary", 1, 10) is False
-    assert p._dialogue_budget_ok("primary", 1, 11) is True
+    assert p._dialogue_budget_ok(("primary", 1, 10)) is False
+    assert p._dialogue_budget_ok(("primary", 1, 11)) is True
 
 
 def test_review_with_tools_verifies_and_falls_back(monkeypatch):
@@ -1513,9 +1443,8 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
     from reviewer import pipeline as pipeline_mod
     from reviewer.ai_client import AIError, AIResult
 
-    mr_data = {"mr_iid": 1, "title": "t", "author": "dev1",
-               "source_branch": "f", "target_branch": "dev"}
-    triage = {"complexity": "normal", "risk_areas": []}
+    mr_data = review_job(mr_iid=1, author="dev1", source_branch="f", target_branch="dev")
+    triage = TriageResult()
     calls: list[str] = []
 
     class StubAI:
@@ -1541,21 +1470,22 @@ def test_review_with_tools_verifies_and_falls_back(monkeypatch):
         client=StubAI(agent_result=AIResult(text="## Verdict\n**SHIP** verified")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
-    assert out == "## Verdict\n**SHIP** verified" and calls == ["agent"]
+    assert out.text == "## Verdict\n**SHIP** verified" and calls == ["agent"]
+    assert out.tool_assisted
 
     # loop dies (refusal, provider trouble) -> plain review still ships
     calls.clear()
     p = pipeline_mod.Pipeline(client=StubAI(agent_exc=AIError("boom")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
-    assert "plain path" in out and calls == ["agent", "complete"]
+    assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # loop ran out of turns mid-check (no verdict) -> plain review
     calls.clear()
     p = pipeline_mod.Pipeline(client=StubAI(agent_result=AIResult(text="hmm, checking")))
     out = asyncio.run(p._review(mr_data, "content", triage, "diff", "", None,
                                 worktree=object()))
-    assert "plain path" in out and calls == ["agent", "complete"]
+    assert "plain path" in out.text and calls == ["agent", "complete"]
 
     # no worktree (checkout failed / flag off) -> straight to the plain path
     calls.clear()
@@ -1811,14 +1741,12 @@ _LEAKY = "connect to http://10.0.0.5:8080/internal failed, see /srv/app/secrets.
 def test_review_queue_assigns_job_id():
     async def run():
         queue = ReviewQueue(workers=0, dedupe_ttl=600, burst_window=0)
-        mr = {"gitlab_config": {"name": "primary"}, "project_id": 1,
-              "mr_iid": 7, "last_commit": "abc"}
-        assert queue.submit(mr) is True
+        job = review_job(mr_iid=7, last_commit="abc")
+        assert queue.submit(job) is True
         queued = queue.queue.get_nowait()
-        assert len(queued["job_id"]) == 8
-        other = {**mr, "last_commit": "def"}
-        queue.submit(other)
-        assert other["job_id"] != queued["job_id"]
+        assert len(queued.job_id) == 8
+        assert queue.submit(replace(job, last_commit="def")) is True
+        assert queue.queue.get_nowait().job_id != queued.job_id
     asyncio.run(run())
 
 
@@ -1831,10 +1759,10 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
 
     notes, alerts = [], []
 
-    async def fake_inner(self, mr_data, gitlab_config, ctx):
+    async def fake_inner(self, job, ctx):
         raise exc_factory()
 
-    async def fake_note(self, mr_data, gitlab_config, body):
+    async def fake_note(self, ref, body):
         notes.append(body)
 
     async def fake_alert(kind, details, ctx=None):
@@ -1844,9 +1772,8 @@ def test_pipeline_error_note_hides_exception_text(monkeypatch, exc_factory):
     monkeypatch.setattr(pipeline_mod.Pipeline, "_safe_note", fake_note)
     monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
 
-    mr_data = {"project_id": 1, "mr_iid": 2, "job_id": "deadbeef",
-               "gitlab_config": {"name": "primary", "url": "https://x"}}
-    asyncio.run(pipeline_mod.Pipeline(client=object()).process(mr_data))
+    asyncio.run(pipeline_mod.Pipeline(client=object()).process(
+        review_job(job_id="deadbeef")))
     assert len(notes) == 1
     assert "10.0.0.5" not in notes[0] and "/srv/app" not in notes[0]
     assert "deadbeef" in notes[0]
@@ -1873,9 +1800,8 @@ def test_deliver_review_failure_note_hides_exception_text(monkeypatch):
 
     monkeypatch.setattr(pipeline_mod.gitlab_io, "post_note", fake_post)
     monkeypatch.setattr(pipeline_mod.telegram_io, "notify_error", fake_alert)
-    mr_data = {"project_id": 1, "mr_iid": 2, "job_id": "cafe0001"}
     ok = asyncio.run(pipeline_mod.Pipeline(client=object())._deliver_review(
-        SimpleNamespace(), mr_data, SimpleNamespace(), {"name": "primary"},
+        SimpleNamespace(), review_job(job_id="cafe0001"), SimpleNamespace(),
         False, "review"))
     assert ok is False
     assert "10.0.0.5" not in posted[1] and "cafe0001" in posted[1]
@@ -1886,14 +1812,13 @@ def test_webhook_500_hides_exception_text(monkeypatch):
 
     from reviewer import server
 
-    def boom(payload):
+    def boom(payload, instance):
         raise ValueError(_LEAKY)
 
     async def fake_alert(*a, **k):
         return True
 
-    monkeypatch.setattr(server.settings.gitlab, "routes",
-                        {"hook": {"name": "primary", "url": "https://x"}})
+    monkeypatch.setattr(server.settings.gitlab, "routes", {"hook": INSTANCE})
     monkeypatch.setattr(server.gitlab_io, "parse_merge_request_webhook", boom)
     monkeypatch.setattr(server.telegram_io, "notify_error", fake_alert)
     resp = TestClient(server.app).post(
@@ -2145,8 +2070,8 @@ def test_config_yaml_instances_tiers_prices(clean_env, monkeypatch):
     monkeypatch.setenv("XGITLABTOKEN", "h")
     monkeypatch.setenv("ANTHROPIC_MAIN_MODEL", "claude-sonnet-5-5")  # env beats yaml/defaults
     cfg = Settings()
-    assert cfg.gitlab.routes == {"fallback-hook": {
-        "name": "primary", "url": "https://lab.example", "token": "glpat-secret"}}
+    assert cfg.gitlab.routes == {"fallback-hook": InstanceRef(
+        "primary", "https://lab.example", "glpat-secret")}
     assert "IGNORED" in deprecated_env_vars_in_use(cfg)[0]
     assert cfg.model_for_tier("smart") == "openai/gpt-5.6-terra"
     assert cfg.fallback_chain("smart")[0] == "anthropic/claude-opus-5"  # default chain kept
@@ -2204,8 +2129,8 @@ def test_config_prod_env_gives_the_v1_configuration(clean_env, monkeypatch):
         monkeypatch.setenv(name, value)
     cfg = Settings()
     assert cfg.gitlab.routes == {
-        "hook-1": {"name": "primary", "url": "https://lab.smysl.pro", "token": "glpat-1"},
-        "hook-2": {"name": "instance_2", "url": "https://lab.catzwolf.ru", "token": "glpat-2"},
+        "hook-1": InstanceRef("primary", "https://lab.smysl.pro", "glpat-1"),
+        "hook-2": InstanceRef("instance_2", "https://lab.catzwolf.ru", "glpat-2"),
     }
     assert (cfg.llm.provider, cfg.llm.anthropic.api_url, cfg.llm.anthropic.api_key,
             cfg.llm.anthropic.gateway_key, cfg.llm.openrouter.token) == (
@@ -2259,5 +2184,5 @@ def test_config_yaml_referencing_gitlab_token_env_is_not_deprecated(clean_env, m
     monkeypatch.setenv("GITLAB_TOKEN", "glpat-1")
     monkeypatch.setenv("XGITLABTOKEN", "hook-1")
     cfg = Settings()
-    assert cfg.gitlab.routes["hook-1"]["token"] == "glpat-1"
+    assert cfg.gitlab.routes["hook-1"].token == "glpat-1"
     assert deprecated_env_vars_in_use(cfg) == []

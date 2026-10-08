@@ -35,6 +35,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import settings
+from .domain.models import InstanceRef
 
 logger = logging.getLogger(__name__)
 
@@ -98,23 +99,23 @@ class RepoCache:
         parts = urlsplit(instance_url)
         return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
 
-    async def checkout_mr(self, gitlab_config: dict, project_path: str,
+    async def checkout_mr(self, instance: InstanceRef, project_path: str,
                           mr_iid: int, sha: str | None) -> Path:
         """Ensure the repo is cloned/fetched; return a detached worktree at the MR head."""
-        repo_dir = self._repo_dir(gitlab_config["url"], project_path)
+        repo_dir = self._repo_dir(instance.url, project_path)
         key = str(repo_dir)
         async with self._locks[key]:
             await asyncio.to_thread(
-                self._sync_repo, repo_dir, gitlab_config, project_path, mr_iid)
+                self._sync_repo, repo_dir, instance, project_path, mr_iid)
             worktree = await asyncio.to_thread(
-                self._add_worktree, repo_dir, mr_iid, sha, gitlab_config["token"])
+                self._add_worktree, repo_dir, mr_iid, sha, instance.token)
         asyncio.get_running_loop().run_in_executor(None, self._evict)
         return worktree
 
-    def _sync_repo(self, repo_dir: Path, gitlab_config: dict,
+    def _sync_repo(self, repo_dir: Path, instance: InstanceRef,
                    project_path: str, mr_iid: int) -> None:
-        url = self._clone_url(gitlab_config["url"], project_path)
-        token = gitlab_config["token"]
+        url = self._clone_url(instance.url, project_path)
+        token = instance.token
         if not repo_dir.is_dir():
             repo_dir.parent.mkdir(parents=True, exist_ok=True)
             logger.info("Cloning %s (first MR for this project)", project_path)

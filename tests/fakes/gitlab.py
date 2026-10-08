@@ -175,9 +175,9 @@ class FakeGitLab:
         self.projects = SimpleNamespace(get=self._get_project)
         self.user = SimpleNamespace(username=self.bot_username)
 
-    def client(self, gitlab_config: dict) -> FakeGitLab:
+    def client(self, instance) -> FakeGitLab:
         """Drop-in for gitlab_io.get_gitlab_client."""
-        self.calls.append(("auth", gitlab_config.get("name")))
+        self.calls.append(("auth", instance.name))
         return self
 
     def _get_project(self, project_id: int) -> FakeProject:

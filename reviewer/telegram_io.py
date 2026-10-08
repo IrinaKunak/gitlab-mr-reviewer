@@ -14,6 +14,7 @@ import httpx
 
 from . import usage
 from .config import settings
+from .domain.models import ReviewJob
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ async def notify_error(error_type: str, error_details: str,
     return await notify("\n".join(parts), is_error=True)
 
 
-def format_mr_message(mr_data: dict, project_name: str, has_conflicts: bool = False,
+def format_mr_message(job: ReviewJob, project_name: str, has_conflicts: bool = False,
                       review_content: str | None = None,
                       gitlab_instance: str | None = None) -> str:
     """v1 notification format, preserved verbatim."""
@@ -147,10 +148,10 @@ def format_mr_message(mr_data: dict, project_name: str, has_conflicts: bool = Fa
     parts = [
         f"{status_emoji} **{status_text}{instance_info}**",
         f"**Project:** `{project_name}`",
-        f"**Author:** {mr_data['author']}",
-        f"**Title:** {mr_data['title']}",
-        f"**Branch:** `{mr_data['source_branch']}` → `{mr_data['target_branch']}`",
-        f"**Link:** [!{mr_data['mr_iid']}]({mr_data['url']})",
+        f"**Author:** {job.author}",
+        f"**Title:** {job.title}",
+        f"**Branch:** `{job.source_branch}` → `{job.target_branch}`",
+        f"**Link:** [!{job.ref.mr_iid}]({job.ref.url})",
     ]
 
     if has_conflicts:

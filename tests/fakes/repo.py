@@ -15,7 +15,7 @@ class FakeRepoCache:
         self.checkouts: list[tuple[str, int, str | None]] = []
         self.released: list[Path] = []
 
-    async def checkout_mr(self, gitlab_config: dict, project_path: str, mr_iid: int,
+    async def checkout_mr(self, instance, project_path: str, mr_iid: int,
                           sha: str | None = None) -> Path:
         self.checkouts.append((project_path, mr_iid, sha))
         project = next(p for p in self._gitlab.projects_by_id.values()

@@ -13,15 +13,16 @@ import logging
 from pathlib import Path
 
 from .config import settings
+from .domain.models import Tier
 from .json_store import JsonStore
 
 logger = logging.getLogger(__name__)
 
-TIERS = ("fast", "main", "smart")
+TIERS = tuple(Tier)
 
 
 def _clean(data) -> dict[str, str]:
-    return {t: str((data or {}).get(t) or "").strip() for t in TIERS}
+    return {t.value: str((data or {}).get(t) or "").strip() for t in TIERS}
 
 
 _store: JsonStore[dict[str, str]] = JsonStore(
@@ -40,6 +41,6 @@ def save(new: dict) -> dict[str, str]:
     return dict(clean)
 
 
-def model_for_tier(tier: str, cfg) -> str:
+def model_for_tier(tier: Tier, cfg) -> str:
     """Override if set, else the .env default from config."""
     return load().get(tier, "") or cfg.model_for_tier(tier)
