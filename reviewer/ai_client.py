@@ -249,7 +249,7 @@ class AIClient:
             return None
         if self._fallback is None:
             self._fallback = AsyncAnthropic(
-                base_url="https://openrouter.ai/api",
+                base_url="https://caila.ai/api",
                 auth_token=self.cfg.openrouter_token,
                 http_client=self._http_client(self.cfg.ai_timeout),
                 max_retries=1,

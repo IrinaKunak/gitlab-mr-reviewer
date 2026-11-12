@@ -24,7 +24,7 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-CATALOG_URL = "https://openrouter.ai/api/v1/models"
+CATALOG_URL = "https://caila.ai/api/v1/models"
 TTL_SECONDS = 6 * 3600
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, float]] | None = None
